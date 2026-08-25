@@ -37,6 +37,7 @@ from molcascade.assets import (
     asset_status,
     default_asset_root,
     iter_assets,
+    preflight_assets,
     resolve_reference,
 )
 from molcascade.assets.fetch import fetch_asset, render_manifest
@@ -612,11 +613,24 @@ def _validate(config_path: Path, *, as_json: bool) -> int:
         assert screening.pipeline is not None  # ScreeningConfig always carries one kind
         config = screening.pipeline
     compiled = PipelineCompiler(registry).compile(config)
+    # Reported, never fatal.  A configuration is valid or not on its own terms;
+    # whether *this* machine holds the weights is a property of the machine, and
+    # authoring a cascade on a laptop to run on the GPU box has to keep working.
+    # Saying which assets it will need is still worth a line, because the answer
+    # is otherwise found only by starting the run.
+    try:
+        provisioned = preflight_assets(compiled.stages)
+        asset_note: str | None = None
+    except AssetError as error:
+        provisioned = ()
+        asset_note = error.hint or str(error)
     payload = {
         "valid": True,
         "kind": screening.kind,
         "name": config.name,
         "library_required": placeholder_library,
+        "assets_ready": list(provisioned),
+        "assets_note": asset_note,
         "revision_id": compiled.revision_id,
         "stages": [
             {
@@ -645,6 +659,10 @@ def _validate(config_path: Path, *, as_json: bool) -> int:
         print(f"Enabled stages: {len(compiled.stages)}")
         if placeholder_library:
             print("This cascade names no library; pass one with: molcascade screen --library PATH")
+        if provisioned:
+            print(f"Vendored assets ready: {', '.join(provisioned)}")
+        if asset_note is not None:
+            print(f"Not runnable here yet: {asset_note}")
     return 0
 
 
@@ -1242,12 +1260,18 @@ def _screen(
     )
     compiled = PipelineCompiler(registry).compile(pipeline)
 
+    # Before the first molecule is read, not when execution reaches the stage
+    # that opens the file.  An adapter discovering its weights are missing
+    # halfway down the funnel has already spent the expensive part of the run.
+    provisioned = preflight_assets(compiled.stages)
+
     if dry_run:
         payload = {
             "config_kind": screening.kind,
             "library": str(library),
             "revision_id": compiled.revision_id,
             "stages": [stage.stage_id for stage in compiled.stages],
+            "assets": list(provisioned),
         }
         if as_json:
             _json_dump(payload, sys.stdout)
@@ -1256,6 +1280,8 @@ def _screen(
             print(f"Library: {library}")
             print(f"Revision: {compiled.revision_id}")
             _print_planned_funnel(lowered, screening)
+            if provisioned:
+                print(f"Vendored assets ready: {', '.join(provisioned)}")
         return 0
 
     runner = LocalRunner(workspace, plugins=registry)

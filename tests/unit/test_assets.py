@@ -20,6 +20,7 @@ import os
 import re
 import urllib.error
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -39,6 +40,7 @@ from molcascade.assets.models import (
     Citation,
     PayloadTrust,
 )
+from molcascade.assets.preflight import preflight_assets, required_asset_references
 from molcascade.assets.store import (
     asset_status,
     default_asset_root,
@@ -777,3 +779,130 @@ def test_scscore_names_the_plugin_that_reads_it() -> None:
     assert spec.trust is PayloadTrust.DATA
     assert "synthesis.scscore@0.1.0" in spec.used_by
     assert any(c.doi == "10.1021/acs.jcim.7b00622" for c in spec.citations)
+
+
+# ------------------------------------------------------------------- preflight
+
+
+def _stage(stage_id: str, config: dict[str, object]) -> object:
+    """A CompiledStage carrying only what the preflight reads.
+
+    Building a real one means compiling a pipeline, which needs a registry, a
+    contract graph and plugins that exist -- none of which this check touches.
+    It reads ``stage_id`` and ``config`` and nothing else, so a stand-in with
+    those two attributes exercises the same code the runner would.
+    """
+
+    return SimpleNamespace(stage_id=stage_id, config=config)
+
+
+def test_the_preflight_finds_a_reference_however_deeply_it_is_nested() -> None:
+    """Settings are free-form JSON, so a reference can be anywhere in them."""
+
+    stages = [
+        _stage("flat", {"weights_path": "asset:fictional/weights.bin"}),
+        _stage("listed", {"models": ["asset:fictional/a.bin", "/local/b.bin"]}),
+        _stage("nested", {"heads": {"ames": {"path": "asset:other/c.bin"}}}),
+        _stage("none", {"threshold": 0.5, "label": "not an asset"}),
+    ]
+
+    found = required_asset_references(stages)  # type: ignore[arg-type]
+
+    assert found == (
+        ("flat", "asset:fictional/weights.bin"),
+        ("listed", "asset:fictional/a.bin"),
+        ("nested", "asset:other/c.bin"),
+    )
+
+
+def test_a_ready_asset_passes_the_preflight_and_is_reported_once(
+    tmp_path: Path, catalogued: AssetSpec
+) -> None:
+    _install(catalogued, tmp_path, {"weights.bin": _PAYLOAD})
+    stages = [
+        _stage("first", {"weights_path": "asset:fictional/weights.bin"}),
+        _stage("second", {"weights_path": "asset:fictional/weights.bin"}),
+    ]
+
+    assert preflight_assets(stages, root=tmp_path) == ("fictional",)  # type: ignore[arg-type]
+
+
+def test_an_unfetched_asset_stops_the_run_before_it_starts(
+    tmp_path: Path, catalogued: AssetSpec
+) -> None:
+    """The message must name the stage, the asset, and the command that fixes it."""
+
+    stages = [_stage("synthesis_scscore", {"weights_path": "asset:fictional/weights.bin"})]
+
+    with pytest.raises(AssetError) as caught:
+        preflight_assets(stages, root=tmp_path)  # type: ignore[arg-type]
+
+    error = caught.value
+    assert error.code == "ASSET_PREFLIGHT_FAILED"
+    assert "synthesis_scscore" in str(error)
+    assert error.hint is not None
+    assert "molcascade assets fetch fictional" in error.hint
+
+
+def test_every_missing_asset_is_reported_in_one_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Otherwise provisioning becomes fetch, restart, discover the next one.
+
+    That loop is the reason this check exists at all, so failing on the first
+    reference would reintroduce it one level up.
+    """
+
+    first = _spec(id="alpha")
+    second = _spec(id="beta")
+    table = {spec.id: spec for spec in (first, second)}
+
+    def lookup(asset_id: str) -> AssetSpec:
+        return table[asset_id]
+
+    monkeypatch.setattr(store_module, "asset_spec", lookup)
+    monkeypatch.setattr(store_module, "iter_assets", lambda: tuple(table.values()))
+    stages = [
+        _stage("one", {"weights_path": "asset:alpha/weights.bin"}),
+        _stage("two", {"weights_path": "asset:beta/weights.bin"}),
+    ]
+
+    with pytest.raises(AssetError) as caught:
+        preflight_assets(stages, root=tmp_path)  # type: ignore[arg-type]
+
+    assert caught.value.hint is not None
+    assert "molcascade assets fetch alpha beta" in caught.value.hint
+
+
+def test_a_corrupt_asset_fails_the_preflight_just_like_a_missing_one(
+    tmp_path: Path, catalogued: AssetSpec
+) -> None:
+    """Right size, wrong bytes -- the case a presence check would wave through."""
+
+    _install(catalogued, tmp_path, {"weights.bin": b"x" * len(_PAYLOAD)})
+    stages = [_stage("one", {"weights_path": "asset:fictional/weights.bin"})]
+
+    with pytest.raises(AssetError, match=r"ASSET_PREFLIGHT_FAILED|not usable"):
+        preflight_assets(stages, root=tmp_path)  # type: ignore[arg-type]
+
+
+def test_a_malformed_reference_is_reported_without_a_fetch_command(
+    tmp_path: Path,
+) -> None:
+    """No download fixes a typo, so offering one would send the user nowhere."""
+
+    stages = [_stage("one", {"weights_path": "asset:no-member-here"})]
+
+    with pytest.raises(AssetError) as caught:
+        preflight_assets(stages, root=tmp_path)  # type: ignore[arg-type]
+
+    assert caught.value.hint is not None
+    assert "assets fetch" not in caught.value.hint
+
+
+def test_a_cascade_with_no_vendored_assets_needs_no_provisioning(
+    tmp_path: Path,
+) -> None:
+    stages = [_stage("rdkit_only", {"max_molecular_weight": 500})]
+
+    assert preflight_assets(stages, root=tmp_path) == ()  # type: ignore[arg-type]

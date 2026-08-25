@@ -1,5 +1,10 @@
 # Large MOL2 ingestion: loose files, manifests, and packing
 
+Date: 2026-08-23
+Status: Follow-up to [0004](0004-large-input-ingestion.md), which chose to accept a
+directory of MOL2 files as one input. This record covers what that costs at
+multi-million-file scale and how a library would be packed to avoid it.
+
 ## Implemented loose-file path
 
 `source.mol2_directory@0.1.0` treats a directory tree as an immutable input

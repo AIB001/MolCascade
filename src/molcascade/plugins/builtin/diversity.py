@@ -74,7 +74,11 @@ class ScaffoldClusterConfig(StrictFrozenModel):
 
 class HashBudgetConfig(StrictFrozenModel):
     schema_version: int = Field(default=1, ge=1, le=1)
-    target_count: int = Field(default=15_000, ge=1, le=10_000_000)
+    # Lowering always writes the cascade's own target over this, so it is only
+    # reached by a hand-written flat pipeline that omits the setting.  Matching
+    # the shipped cascade keeps that path from silently producing a third of
+    # the shortlist the rest of the project is sized for.
+    target_count: int = Field(default=45_000, ge=1, le=10_000_000)
     seed: int = Field(default=20_260_823, ge=0, le=2**63 - 1)
     batch_size: int = Field(default=16_384, ge=1, le=250_000)
 

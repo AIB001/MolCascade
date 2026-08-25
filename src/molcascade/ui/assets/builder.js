@@ -2025,7 +2025,7 @@
     ensureBuilderMetadata();
     pipeline.stages.forEach((stage) => { stage.inputs = stage.inputs || []; });
     nameInput.value = pipeline.name || "";
-    targetInput.value = pipeline.metadata.final_parent_target || 15000;
+    targetInput.value = pipeline.metadata.final_parent_target || 45000;
     renderPalette();
     renderScene();
     renderInspector();

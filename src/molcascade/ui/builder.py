@@ -302,12 +302,12 @@ _CURATED_DEFAULTS: dict[str, dict[str, Any]] = {
         "max_clusters": 250_000,
     },
     "select.native_hash_budget@0.1.0": {
-        "target_count": 15_000,
+        "target_count": 45_000,
         "seed": 20_260_823,
         "batch_size": 25_000,
     },
     "select.native_scaffold_round_robin@0.1.0": {
-        "target_count": 15_000,
+        "target_count": 45_000,
         "max_per_scaffold": 25,
         "include_chirality": False,
         "seed": 20_260_823,
@@ -635,7 +635,7 @@ def _default_pipeline(plugin_rows: list[dict[str, Any]]) -> PipelineConfig:
             "stages": stages,
             "metadata": {
                 "created_by": f"MolCascade {__version__} offline builder",
-                "final_parent_target": 15_000,
+                "final_parent_target": 45_000,
                 "random_seed": 20_260_823,
                 "docking_included": False,
                 "builder_view": "node_canvas/v2",

@@ -94,6 +94,7 @@ from molcascade.cascade.availability import option_availability
 from molcascade.cascade.catalog import CRITERIA_BY_ID, BackendOption, CriterionSpec
 from molcascade.cascade.introspect import with_schema_version
 from molcascade.cascade.models import (
+    DEFAULT_TARGET_COUNT,
     CascadeConfig,
     CriterionConfig,
     FinalizeConfig,
@@ -104,7 +105,6 @@ from molcascade.cascade.models import (
 )
 from molcascade.plugins.registry import PluginRegistry, create_builtin_registry
 
-DEFAULT_TARGET_COUNT = 20_000
 DEFAULT_SEED = 20_260_823
 
 #: Which SCScore variant the default uses when the asset has been provisioned.

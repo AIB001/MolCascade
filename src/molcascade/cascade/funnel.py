@@ -12,6 +12,8 @@ guessed when a producer does not declare one.
 
 from __future__ import annotations
 
+import math
+import textwrap
 from dataclasses import dataclass
 from typing import Any
 
@@ -93,6 +95,16 @@ class FunnelReport:
     preparation: tuple[FunnelStep, ...]
     tiers: tuple[FunnelTier, ...]
     finalize: tuple[FunnelStep, ...]
+    #: What the cascade asked the budget selector for.
+    target_count: int | None = None
+    #: How many molecules reached that selector.  The selector is a ``LIMIT``:
+    #: it can only ever cut, so this is the largest shortlist that was available
+    #: and the number that says whether a short shortlist is the tiers' doing.
+    selected_from: int | None = None
+    #: The per-scaffold cap, when the selector is the scaffold round-robin.  It
+    #: bounds the shortlist at ``cap x distinct scaffolds`` independently of the
+    #: target, which is the one way a run can fall short with survivors to spare.
+    max_per_scaffold: int | None = None
 
     @property
     def ingested(self) -> int | None:
@@ -108,12 +120,23 @@ class FunnelReport:
                 return tier.surviving
         return None
 
+    @property
+    def met_target(self) -> bool | None:
+        """Whether the run delivered the shortlist size it was configured for."""
+
+        if self.target_count is None or self.shortlisted is None:
+            return None
+        return self.shortlisted >= self.target_count
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "run_id": self.run_id,
             "status": self.status,
             "ingested": self.ingested,
             "shortlisted": self.shortlisted,
+            "target_count": self.target_count,
+            "selected_from": self.selected_from,
+            "met_target": self.met_target,
             "ingest": self.ingest.as_dict() if self.ingest is not None else None,
             "preparation": [step.as_dict() for step in self.preparation],
             "tiers": [tier.as_dict() for tier in self.tiers],
@@ -243,6 +266,72 @@ def _render_lines(report: FunnelReport) -> list[str]:
     if kept is not None and started:
         share = kept / started * 100.0
         lines.append(f"  {started:,} molecules in → {kept:,} shortlisted ({share:.2f}% kept)")
+        for sentence in _target_verdict(report, kept, started):
+            # The counted rows are columnar and self-limiting; these are prose
+            # and would otherwise run past the width the rest of the report was
+            # laid out for, wrapping wherever the terminal happens to end.
+            lines.extend(
+                textwrap.wrap(
+                    sentence,
+                    width=76,
+                    initial_indent="  ",
+                    subsequent_indent="  ",
+                )
+            )
+    return lines
+
+
+def _target_verdict(report: FunnelReport, kept: int, started: int) -> list[str]:
+    """Say whether the shortlist is the size the cascade was configured for.
+
+    Without this the run ends on a bare count, and a count carries no verdict:
+    12,000 molecules is a fine result from a 20,000-molecule library and a bad
+    one from two million.  The user set a target precisely because the number
+    matters to whatever comes next, so the report should answer against it.
+
+    The two ways to fall short need different fixes and are indistinguishable
+    from the shortlist alone, so they are diagnosed separately:
+
+    * fewer molecules survived the tiers than were asked for -- feed more, or
+      loosen a tier;
+    * enough survived, but the per-scaffold cap bound first -- the library is
+      concentrated in too few scaffolds, and raising the target will not help.
+    """
+
+    target = report.target_count
+    if target is None:
+        return []
+    survivors = report.selected_from
+    if kept >= target:
+        if survivors is not None and survivors > kept:
+            return [f"At the {target:,} target; the budget selected from {survivors:,} survivors."]
+        return [f"At the {target:,} target."]
+
+    short = target - kept
+    cap = report.max_per_scaffold
+    if survivors is not None and cap is not None and survivors >= target:
+        return [
+            f"Short of the {target:,} target by {short:,}: {survivors:,} molecules "
+            f"survived, but no more than {cap} per scaffold may be taken, so the "
+            "library does not hold enough distinct scaffolds to fill the budget.",
+            "Raise max_per_scaffold on the budget step, or screen a library that "
+            "spans more scaffolds.",
+        ]
+
+    lines = [
+        f"Short of the {target:,} target by {short:,}: only {kept:,} molecules "
+        "came through the tiers, and the budget step can cut a population but "
+        "never enlarge one."
+    ]
+    if kept:
+        # The end-to-end rate, not any single tier's: it already includes the
+        # per-scaffold trim, so scaling by it answers the question actually
+        # being asked -- how big an input produces the requested shortlist.
+        needed = math.ceil(started * target / kept)
+        lines.append(
+            f"At this run's {kept / started * 100.0:.2f}% retention, reaching "
+            f"{target:,} needs roughly {needed:,} molecules in."
+        )
     return lines
 
 
@@ -338,6 +427,20 @@ def build_funnel(
             )
         )
 
+    # The budget step is the one that was handed the target, which is how
+    # lowering identifies it too -- by the setting rather than by a hardcoded
+    # stage id, so a different selector plugged in later is still found.
+    budget_entering: int | None = None
+    max_per_scaffold: int | None = None
+    for stage in lowered.pipeline.stages:
+        settings = stage.config
+        if "target_count" not in settings:
+            continue
+        parent = _parent_stage(stage)
+        budget_entering = rows.get(parent) if parent else None
+        cap = settings.get("max_per_scaffold")
+        max_per_scaffold = cap if isinstance(cap, int) else None
+
     return FunnelReport(
         run_id=state.run_id,
         status=getattr(state.status, "value", str(state.status)),
@@ -345,6 +448,9 @@ def build_funnel(
         preparation=tuple(preparation),
         tiers=tuple(tiers),
         finalize=tuple(finalize),
+        target_count=cascade.finalize.target_count,
+        selected_from=budget_entering,
+        max_per_scaffold=max_per_scaffold,
     )
 
 

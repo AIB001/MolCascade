@@ -318,11 +318,6 @@ class ArtifactDatasetRef(_StrictModel):
             )
         return self
 
-    def as_artifact_ref(self) -> ArtifactRef:
-        """Return the containing bundle reference without losing the explicit distinction."""
-
-        return ArtifactRef(artifact_id=self.artifact_id, kind=self.artifact_kind)
-
 
 def normalize_artifact_outputs(
     outputs: Mapping[str, Any] | Sequence[ArtifactOutput] | None,

@@ -16,57 +16,70 @@ Python 3.11 or newer is required.
 
 ```bash
 python -m pip install .
-molcascade --generate config --output molcascade-builder.html
+molcascade generate config --output molcascade-builder.html
 ```
 
 Open `molcascade-builder.html` in a modern browser. The builder is one offline file: it
 loads no CDN resources, sends no network requests, and does not execute screening code.
 
-The interface has three working areas:
+You assemble a cascade by dragging blocks from the left tray into tiers. Each tier is one
+level of the funnel and can hold several blocks, combined in series or put to a vote. Every
+block names both the *question* it answers and the *tool* answering it, so swapping RDKit
+for `medchem`, `rd_filters`, or your own model is a change of block, not a rebuild. Tools
+whose package or weights are not installed here are shown greyed out, with the exact command
+that would provide them.
 
-- the left palette contains reviewed local adapters and clearly disabled research options;
-- the central canvas accepts draggable modules and explicit port-to-port connections;
-- the right inspector edits the selected module, connections, and validated parameters.
-
-Tier frames are structural lanes, not decorative labels. They are kept separate as nodes
-move. Primary parent flow may remain inside a Serial tier or enter only the next occupied
-tier. Same-tier decisions feed an explicit policy join. Exact typed evidence uses a distinct
-side connection; an invalid connection is rejected with an English explanation.
-
-Export the pipeline JSON from the builder, then validate and run it:
+Download the configuration from the builder, then screen a library with it:
 
 ```bash
-molcascade validate molcascade-pipeline.json
-molcascade --vs \
-  --config molcascade-pipeline.json \
-  --molecules molecules.csv \
-  --workspace .molcascade \
-  --run-id screen-001
+molcascade validate cascade.json
+molcascade screen --config cascade.json --library molecules.csv \
+  --workspace .molcascade --run-id screen-001
 ```
 
-The canonical spelling is equivalent:
-
-```bash
-molcascade run molcascade-pipeline.json \
-  --molecules molecules.csv \
-  --workspace .molcascade \
-  --run-id screen-001
-```
+A configuration is a reusable screening *policy*; the library is supplied per run, so one
+cascade can screen many generated batches without being edited. The run prints its funnel —
+what each tier removed, and whether the shortlist reached the size the cascade was
+configured for.
 
 Inspect or resume the durable run and materialize its outputs:
 
 ```bash
 molcascade status screen-001 --workspace .molcascade --events
-molcascade run molcascade-pipeline.json --workspace .molcascade \
-  --run-id screen-001 --resume
+molcascade screen --config cascade.json --library molecules.csv \
+  --workspace .molcascade --run-id screen-001 --resume
 molcascade report screen-001 --workspace .molcascade --output screen-001.html
 molcascade export screen-001 --workspace .molcascade --output shortlist
 ```
 
+### External weights and rule tables
+
+Some tools need data files that are not shipped in the package: they are large, and they
+carry their own licences. They are fetched once, into a local folder, and verified against a
+pinned SHA-256:
+
+```bash
+molcascade assets status          # what is needed, what is present
+molcascade assets fetch --all     # download and verify everything missing
+```
+
+Downloads only ever happen here. A screening run never reaches the network, and it checks
+every asset it will need *before* reading the first molecule rather than failing halfway
+down the funnel. `molcascade doctor` reports the same readiness for backends and hardware.
+
+### Authoring a flat pipeline directly
+
+`molcascade generate config --pipeline` emits the older node-and-port graph editor, which
+writes a schema-1 pipeline instead of a cascade. It exposes stage wiring the tier builder
+deliberately hides — explicit port-to-port connections, side evidence channels, and manual
+policy joins — and is the right surface when you need a graph the funnel shape cannot
+express. `molcascade run` executes what it produces.
+
 ## Input libraries
 
-`--molecules` can replace the source path stored in a generated configuration. Automatic
-format detection supports:
+`molcascade screen --library` supplies the molecules for one run, replacing any source path
+stored in the configuration. (`molcascade run` spells the same thing `--molecules`, since a
+flat pipeline names its source stage explicitly.) Automatic format detection supports:
 
 | Input | CLI format | Large-library behavior |
 |---|---|---|
@@ -76,7 +89,7 @@ format detection supports:
 | Raw molecule Parquet | `parquet` | Arrow row-group batches |
 | A directory containing many MOL2 files | `mol2-directory` | disk-backed SQLite inventory; files opened one at a time |
 
-Use `--molecule-format` when a path is ambiguous. Multi-million-file MOL2 collections
+Pass `--format` when a path is ambiguous. Multi-million-file MOL2 collections
 should live on a fast local filesystem; the inventory avoids holding every pathname or
 molecule in Python memory, but filesystem traversal and structure parsing remain real
 costs.

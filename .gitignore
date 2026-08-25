@@ -18,7 +18,7 @@ workspace/
 workspace*/
 
 # Generated build products.  The builder is emitted by
-# ``molcascade --generate config``, so a copy in version control is a snapshot
+# ``molcascade generate config``, so a copy in version control is a snapshot
 # that silently goes stale against the catalogue it was generated from.
 molcascade-builder*.html
 molcascade-builder*.png
@@ -35,6 +35,21 @@ vendor/*/models/
 # because publishing someone's internal planning document is their decision to
 # make, not a side effect of pushing the code.  Delete this line to include it.
 plan/
+
+# Development process notes: one file per working round, recording what was
+# built and what was found wrong.  They are about how the project was made, not
+# about how it works, and they go stale the moment the code moves past them.
+# The decision records in docs/research/ stay tracked -- those justify choices a
+# reader of the code will question, and the README links to them.
+docs/iterations/
+
+# Scratch verification artefacts.  Screenshots taken to check a rendering, CSVs
+# extracted from a test library, one-off probe scripts.  Every one of them is a
+# by-product of checking something, never an input to it.
+shot*.png
+screenshot*.png
+scratch/
+*.scratch.*
 
 # Local verification stamps.  A cache of (size, mtime) per verified file, so a
 # repeat check does not re-hash gigabytes.  Machine-local by construction.

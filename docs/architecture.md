@@ -11,11 +11,26 @@ artifact and can be handed to PRISM or another downstream application later.
 No PRISM module is imported by MolCascade. This separation keeps screening revisions,
 simulation workflows, environments, and failure domains independently reproducible.
 
-## Configuration graph and execution order
+## Authoring surface and execution order
 
-The user edits a directed acyclic graph (DAG) in a self-contained offline HTML builder.
-The file is a configuration editor, not an execution engine: it exports strict JSON or
-YAML, and the Python CLI validates and runs that configuration locally.
+A screening cascade is naturally a funnel of *tiers*; a runtime needs a flat, topologically
+ordered stage list. Those are different shapes, and the package keeps them as two layers
+rather than making one serve both jobs.
+
+- A **cascade** (schema 2, `molcascade.cascade.models`) is what a scientist edits. It holds
+  tiers, each with several criteria, a combination mode, and per-criterion thresholds. Each
+  criterion names the *question* separately from the *tool* answering it, which is what makes
+  a backend swappable without rebuilding the cascade.
+- **Lowering** (`molcascade.cascade.lower`) derives a pipeline from it. Nothing in the
+  runtime, artifact, cache, or provenance layer knows about tiers, because lowering emits
+  exactly the ordered stage list those layers already validate.
+- A **pipeline** (schema 1, `molcascade.config.models`) is the executable form, and remains
+  directly authorable for graphs the funnel shape cannot express.
+
+Both are edited in a self-contained offline HTML builder, and both files are configuration,
+not an execution engine: the builder exports strict JSON or YAML, and the Python CLI
+validates and runs it locally. `molcascade.cascade.funnel` inverts the lowering to report a
+finished run under the tiers that were authored, rather than as fourteen succeeded stages.
 
 Stages remain listed in topological order so a configuration can be reviewed as text.
 Each input binding can retain a named output port from any earlier enabled stage. This
@@ -119,8 +134,16 @@ Each entry fixes its files' SHA-256 digests, sizes, and upstream URLs, and separ
 records whether loading the payload executes foreign code — a distinction a digest cannot
 make. Acquisition and use are different commands with different permissions: only
 `molcascade assets fetch` may reach the network, and a screening run may only locate,
-verify, and read. A run that needs an absent asset stops and names the command that would
-supply it.
+verify, and read.
+
+A run that needs an absent asset stops before it reads its first molecule, not when
+execution reaches the stage that opens the file. The compiled stage configurations are
+scanned for `asset:` references and every one is resolved up front, so a missing weight
+file costs nothing rather than being discovered after the expensive part of the funnel has
+already run. All of them are reported in one message, with a single `fetch` command that
+supplies the lot. Because the check reads references out of compiled configuration rather
+than asking adapters what they need, a custom plugin is covered without registering
+anything.
 
 Configurations name assets by `asset:<id>/<path>` reference rather than absolute path, so a
 configuration means the same thing on every machine; resolution verifies the digest before

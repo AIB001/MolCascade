@@ -184,6 +184,13 @@ code {
   align-items: center;
   gap: 12px;
   margin-right: auto;
+
+  /* The topbar aligns to flex-end so that every field sits on one baseline with
+   * its own label stacked above it.  The wordmark has no label above and no
+   * field below, so that rule pinned it to the bottom of the bar with a label
+   * row's worth of empty night above it.  Centring this one item lifts it back
+   * into the bar without moving a single field. */
+  align-self: center;
 }
 
 /* Three tilted planes stacked into a small impossible column. */
@@ -683,25 +690,98 @@ input[type="checkbox"] {
   outline: none;
 }
 
+/* Connectors.
+ *
+ * Three of them exist -- between the fixed endpoints, between two blocks inside
+ * a tier, and between two tiers -- and all three say the same thing: a
+ * population is moving downward.  They are drawn from one set of rules so they
+ * read as one continuous flow rather than three unrelated pieces of furniture,
+ * and each one only overrides the few variables that differ.
+ *
+ * The drawing is a solid rail with brighter marks travelling along it.  The
+ * marks ride on top of the rail rather than being cut out of it: a gapped rail
+ * looks broken, because half the time its lower end is a gap and the arrowhead
+ * floats detached from the stem.
+ *
+ * The gradient repeats on its own period, so shifting the background by exactly
+ * one --flow-tile returns it to where it started.  That makes the loop seamless
+ * at any height, which matters because these run from 12px to 26px. */
+@keyframes flow-drift {
+  from {
+    background-position-y: 0;
+  }
+
+  to {
+    background-position-y: var(--flow-tile);
+  }
+}
+
+/* Declared on the elements, not on the ::before that draws the rail, because
+ * the arrowhead is a second pseudo-element and a pseudo inherits only from its
+ * originating element -- never from its sibling pseudo. */
+.flow-arrow,
+.chain,
+.tier-gap {
+  --flow-tile: 13px;
+  --flow-mark-length: 5px;
+  /* --accent-deep is declared on the elements that receive --accent, so it does
+   * not resolve out here between them; these two are page-level by necessity. */
+  --flow-rail: var(--ink-faint);
+  --flow-mark: var(--periwinkle-deep);
+}
+
+.flow-arrow::before,
+.chain,
+.tier-gap::before {
+  background-color: var(--flow-rail);
+  background-image: repeating-linear-gradient(
+    180deg,
+    var(--flow-mark) 0,
+    var(--flow-mark) var(--flow-mark-length),
+    transparent var(--flow-mark-length),
+    transparent var(--flow-tile)
+  );
+  background-repeat: repeat-y;
+  border-radius: 2px;
+  animation: flow-drift 900ms linear infinite;
+}
+
+/* The rail is a pseudo-element rather than the box's own background so it can
+ * stop above the head.  Painted on the box it runs the full height and the
+ * grey stub shows through the open V of the chevron. */
 .flow-arrow {
   align-self: center;
   width: 3px;
   height: 26px;
-  background: var(--ink-faint);
   position: relative;
 }
 
-.flow-arrow::after {
+.flow-arrow::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 8px;
+}
+
+/* The head is a square rotated onto its corner with two edges drawn, which is
+ * the only way to get a chevron without an image.  Rounding the joint keeps it
+ * from ending in the one hairline-sharp point in an interface built entirely
+ * out of soft-cornered planes. */
+.flow-arrow::after,
+.tier-gap::after {
   content: "";
   position: absolute;
   left: 50%;
-  bottom: -1px;
-  width: 8px;
-  height: 8px;
-  margin-left: -4px;
-  border-right: 3px solid var(--ink-faint);
-  border-bottom: 3px solid var(--ink-faint);
+  width: 9px;
+  height: 9px;
+  margin-left: -4.5px;
+  border-right: 2.5px solid var(--flow-mark);
+  border-bottom: 2.5px solid var(--flow-mark);
+  border-bottom-right-radius: 3px;
   transform: rotate(45deg);
+}
+
+.flow-arrow::after {
+  bottom: -2px;
 }
 
 /* Fixed endpoints -- library, standardization, shortlist -- are drawn as flat
@@ -1189,12 +1269,19 @@ input[type="checkbox"] {
   color: #fffaf2;
 }
 
-/* Serial chain connector between consecutive blocks. */
+/* Serial chain connector between consecutive blocks.  This one sits inside a
+ * tier, so it can take the tier's own hue instead of the page default -- and it
+ * has only 12px to say it in, so the marks run at half the pitch to keep more
+ * than one of them on the rail at a time. */
 .chain {
+  --flow-tile: 7px;
+  --flow-mark-length: 3px;
+  --flow-rail: color-mix(in srgb, var(--accent-deep) 34%, transparent);
+  --flow-mark: var(--accent-deep);
+
   align-self: center;
   width: 2.5px;
   height: 12px;
-  background: var(--accent-deep);
   flex: none;
 }
 
@@ -1217,17 +1304,24 @@ input[type="checkbox"] {
   position: absolute;
   left: 50%;
   top: 3px;
-  bottom: 3px;
+  /* Stops short of the bottom so the rail meets the back of the arrowhead
+   * rather than running through it and out the point. */
+  bottom: 9px;
   width: 3px;
   margin-left: -1.5px;
-  background: var(--ink-faint);
+}
+
+.tier-gap::after {
+  bottom: 2px;
 }
 
 /* The outermost gaps are still drop targets, but they connect nothing: above
  * the first tier the arrow out of the library already draws the flow, and below
  * the last one comes the "add tier" button, which is not part of it. */
 .tier-gap.edge::before,
-.tier-gap.is-over::before {
+.tier-gap.edge::after,
+.tier-gap.is-over::before,
+.tier-gap.is-over::after {
   display: none;
 }
 
@@ -1590,5 +1684,9 @@ input[type="checkbox"] {
 @media (prefers-reduced-motion: reduce) {
   * {
     transition: none !important;
+    /* The connectors are the only animation on the page, and stopping them
+     * costs nothing: the marks freeze mid-rail and read as a dashed line, which
+     * still points the same way it did while it was moving. */
+    animation: none !important;
   }
 }

@@ -25,6 +25,18 @@ from molcascade.config.models import StrictFrozenModel, _freeze_json_mapping
 
 CASCADE_SCHEMA_VERSION = 2
 
+#: Molecules handed to the next stage -- docking, or a finer screen such as
+#: PRISM.  The number is set by what receives it, not by what produces it: a
+#: shortlist this size is one overnight docking campaign on a single modern GPU,
+#: which is the unit of work the handoff is designed around.  Going lower throws
+#: away recall for no gain in the downstream schedule; going much higher stops
+#: fitting in the night.
+#:
+#: It lives here, at the bottom of the cascade layer, because the field default
+#: and the starter cascade must not be able to disagree -- they did, at 20,000
+#: and 15,000, for as long as each carried its own literal.
+DEFAULT_TARGET_COUNT = 45_000
+
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,127}$")
 _PLUGIN_REF_RE = re.compile(r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*@\d+\.\d+\.\d+[0-9A-Za-z.+-]*$")
 
@@ -284,7 +296,7 @@ class FinalizeConfig(StrictFrozenModel):
     exactly one place.
     """
 
-    target_count: int = Field(default=20_000, ge=1, le=100_000_000)
+    target_count: int = Field(default=DEFAULT_TARGET_COUNT, ge=1, le=100_000_000)
     seed: int = Field(default=20_260_823, ge=0, le=2**63 - 1)
     steps: tuple[StepConfig, ...] = ()
 
@@ -381,6 +393,7 @@ class CascadeConfig(StrictFrozenModel):
 
 __all__ = [
     "CASCADE_SCHEMA_VERSION",
+    "DEFAULT_TARGET_COUNT",
     "CascadeConfig",
     "CriterionConfig",
     "FinalizeConfig",

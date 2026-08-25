@@ -12,6 +12,7 @@ from molcascade.assets.models import (
     Citation,
     PayloadTrust,
 )
+from molcascade.assets.preflight import preflight_assets, required_asset_references
 from molcascade.assets.store import (
     ASSET_REFERENCE_PREFIX,
     asset_directory,
@@ -41,6 +42,8 @@ __all__ = [
     "default_asset_root",
     "is_asset_reference",
     "iter_assets",
+    "preflight_assets",
+    "required_asset_references",
     "resolve_path_or_reference",
     "resolve_reference",
     "split_reference",

@@ -320,15 +320,6 @@ class LocalArtifactStore:
             return self._reuse_existing(stage, manifest)
         return manifest
 
-    def has_artifact(self, artifact_id: str) -> bool:
-        """Return true only when a syntactically valid committed manifest is visible."""
-
-        try:
-            self.get_manifest(artifact_id)
-        except (ArtifactNotFoundError, ArtifactIntegrityError, ValueError):
-            return False
-        return True
-
     def get_manifest(self, artifact_id: str) -> ArtifactManifest:
         """Load and validate the manifest for an artifact without hashing data files."""
 

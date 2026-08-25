@@ -339,12 +339,37 @@ _RD_FILTERS_SETS: tuple[tuple[str, str, str], ...] = (
 # lists, and the builder has no list widget, so each preset is one comma-
 # separated string the adapter splits.  Presets rather than free text because a
 # name that matches nothing would silently stop filtering.
+#
+# Ordered narrow to wide, because that is the order someone picks in: a single
+# collection they can defend in a methods section first, then the combinations.
+# medchem carries fifteen collections that rd_filters does not -- the assay
+# interference and toxicophore families below -- and those are the reason to
+# reach for this option over the other two rather than a second opinion on the
+# same patterns.
 _MEDCHEM_ALERT_PRESETS: tuple[tuple[str, str], ...] = (
     ("BMS", "BMS only (180 patterns)"),
+    ("Glaxo", "Glaxo only - reactive and unstable chemistry"),
+    ("Dundee", "Dundee (Brenk) only - broad; better as a warning than a reject"),
+    ("PAINS", "PAINS only (Baell and Holloway)"),
+    ("SureChEMBL", "SureChEMBL only - patent-literature curation"),
     ("BMS,Dundee,Glaxo", "BMS + Dundee + Glaxo (340 patterns)"),
     (
         "BMS,Dundee,Glaxo,PAINS,SureChEMBL",
         "Industry standard + PAINS + SureChEMBL (987 patterns)",
+    ),
+    ("Inpharmatica,LINT,MLSMR", "Screening-deck collections: Inpharmatica + LINT + MLSMR"),
+    (
+        "Reactive-Unstable-Toxic,Electrophilic",
+        "Reactive, unstable and electrophilic chemistry",
+    ),
+    (
+        "Frequent-Hitter,AlphaScreen-Hitters,LuciferaseInhibitor,GST-Hitters,"
+        "HIS-Hitters,DNABinder,Alarm-NMR,Chelator",
+        "Assay interference - frequent hitters and readout artefacts",
+    ),
+    (
+        "Genotoxic-Carcinogenicity,Non-Genotoxic-Carcinogenicity,LD50-Oral,Skin,Toxicophore",
+        "Toxicophores - carcinogenicity, acute oral, skin sensitisation",
     ),
     (
         "BMS,Dundee,Glaxo,PAINS,SureChEMBL,Inpharmatica,MLSMR,LINT,"
@@ -353,22 +378,53 @@ _MEDCHEM_ALERT_PRESETS: tuple[tuple[str, str], ...] = (
     ),
 )
 
-# Rule sets published as named filters.  The presets pair rules that are
-# normally cited together; a project wanting a different mix can write the
-# comma-separated list straight into the configuration file.
+# Rule sets published as named filters.  Every drug-likeness rule medchem ships
+# is offered, plus the combinations that are normally cited together, because
+# "drug-like" is a different window in a fragment campaign, a PPI campaign and a
+# CNS campaign, and the right one is a project decision rather than a default.
+# A project wanting a mix that is not here can write the comma-separated list
+# straight into the configuration file.
+#
+# The bounds in each label are the rule's own, so the choice can be made from
+# the list instead of from the medchem documentation.
 _MEDCHEM_RULE_PRESETS: tuple[tuple[str, str], ...] = (
-    ("rule_of_five", "Lipinski rule of five"),
+    # Oral small molecules -- the mainstream of the collection.
+    ("rule_of_five", "Lipinski rule of five: MW<=500, logP<=5, HBD<=5, HBA<=10"),
     ("rule_of_five,rule_of_veber", "Lipinski + Veber (oral bioavailability)"),
     (
         "rule_of_five,rule_of_veber,rule_of_egan,rule_of_ghose",
         "Lipinski + Veber + Egan + Ghose",
     ),
+    ("rule_of_veber", "Veber alone: rotors <=10, TPSA <140"),
+    ("rule_of_ghose", "Ghose: MW 160-480, logP -0.4 to 5.6, 20-70 atoms"),
+    ("rule_of_druglike_soft", "Drug-like (soft): a wide fifteen-property window"),
+    (
+        "rule_of_chemaxon_druglikeness",
+        "ChemAxon drug-likeness: MW <400, rotors <5, at least one ring",
+    ),
+    ("rule_of_zinc", "ZINC drug-like: the bounds the ZINC subsets are cut on"),
+    ("rule_of_xu", "Xu: ring, rotor and heavy-atom counts, with no MW or logP term"),
+    ("rule_of_reos", "REOS: the HTS deck-cleanup window, formal charge included"),
+    # Lead-like and fragment starting points.
     ("rule_of_leadlike_soft", "Lead-like (soft), for hit-to-lead starting points"),
+    ("rule_of_oprea", "Oprea lead-like: donor, acceptor, rotor and ring counts"),
     ("rule_of_three", "Rule of three, for fragment libraries"),
+    ("rule_of_three_extended", "Rule of three, extended: adds a logP floor and a TPSA cap"),
+    ("rule_of_two", "Rule of two: reagents and building blocks"),
+    # Deliberately outside the small-molecule window.
+    ("rule_of_five_beyond", "Beyond rule of five (bRo5): MW to 1000, rotors to 20"),
+    ("rule_of_four", "Rule of four: protein-protein interaction inhibitors"),
+    # Route- and compartment-specific.
     ("rule_of_cns", "CNS penetration"),
+    ("rule_of_respiratory", "Respiratory / inhaled route"),
+    # Machine-generated libraries.
+    (
+        "rule_of_generative_design",
+        "Generative-design rules (permissive), for machine-generated libraries",
+    ),
     (
         "rule_of_generative_design_strict",
-        "Generative-design rules (strict), for machine-generated libraries",
+        "Generative-design rules (strict), adds stereocentre and side-chain limits",
     ),
 )
 
@@ -392,11 +448,19 @@ _MEDCHEM_RULE_PRESETS: tuple[tuple[str, str], ...] = (
 _MEDCHEM_ADMET_PRESETS: tuple[tuple[str, str], ...] = (
     ("rule_of_egan", "Egan egg (passive intestinal absorption)"),
     (
+        "rule_of_egan,rule_of_veber",
+        "Egan absorption + Veber oral bioavailability",
+    ),
+    (
         "rule_of_egan,rule_of_pfizer_3_75",
         "Egan absorption + Pfizer 3/75 toxicity risk",
     ),
     ("rule_of_pfizer_3_75", "Pfizer 3/75 only (in vivo toleration risk)"),
     ("rule_of_gsk_4_400", "GSK 4/400 (ADMET rules of thumb)"),
+    (
+        "rule_of_gsk_4_400,rule_of_pfizer_3_75",
+        "GSK 4/400 + Pfizer 3/75",
+    ),
     (
         "rule_of_egan,rule_of_pfizer_3_75,rule_of_gsk_4_400",
         "All three property-based ADMET rule sets",
