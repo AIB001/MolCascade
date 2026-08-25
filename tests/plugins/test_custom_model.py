@@ -143,7 +143,14 @@ class _FakeSession:
 
 
 def _install(monkeypatch: pytest.MonkeyPatch, session: Any) -> None:
-    monkeypatch.setattr(module, "_load_onnx_session", lambda _path: session)
+    # ``device`` is the execution-provider choice the shard runner's lane
+    # decides; the fake ignores it but has to accept it, because that is how the
+    # adapter now calls the seam.
+    monkeypatch.setattr(module, "_load_onnx_session", lambda _path, *, device="cpu": session)
+    # Sessions are memoised per worker process so a shard does not reload the
+    # graph.  Tests share one process and reuse bundle paths, so the memo has to
+    # be dropped or the second test would score against the first one's fake.
+    module._loaded_session.cache_clear()
 
 
 def _run(

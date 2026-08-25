@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import math
 import re
+from functools import cache
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, Self
 
@@ -40,17 +41,19 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from pydantic import Field, ValidationError, field_validator, model_validator
 
-from molcascade.chemistry.datasets import iter_contract_batches, require_single_input
+from molcascade.chemistry.datasets import require_single_input
 from molcascade.chemistry.featurizers import (
     FEATURIZER_IMPLEMENTATION_VERSION,
     Featurizer,
     RepresentationSpec,
 )
+from molcascade.chemistry.sharding import shard_stage
 from molcascade.config.canonical import canonical_sha256
 from molcascade.config.load import load_yaml
 from molcascade.config.models import StrictFrozenModel
 from molcascade.contracts import PARENT_V1, PREDICTION_V1
 from molcascade.errors import PluginError
+from molcascade.parallel import ShardOutcome, ShardTask, iter_shard_batches
 from molcascade.plugins.api import PendingOutput, StageContext, StageRequest, StageResponse
 from molcascade.plugins.builtin._bundles import BundleCodes, bundle_files, bundle_root
 from molcascade.plugins.manifest import (
@@ -225,6 +228,11 @@ class CustomModelConfig(StrictFrozenModel):
 #: Bundle-reading failures reported under this plugin's own error vocabulary.
 _CODES = BundleCodes("CUSTOM_MODEL")
 
+#: What the parent verified and a shard cannot: which directory holds the
+#: bundle whose digest was just checked, and the identity read out of it.
+#: Popped before the strict config model sees the mapping.
+_RUNTIME_KEY = "molcascade.runtime"
+
 
 def inspect_model_bundle(
     bundle_dir: str | Path,
@@ -353,11 +361,23 @@ def _model_id(manifest: ModelBundleManifest, files: list[dict[str, Any]]) -> str
 # --------------------------------------------------------------------------
 
 
-def _load_onnx_session(model_path: Path) -> Any:
-    """Open an ONNX Runtime session pinned to deterministic CPU execution.
+def _load_onnx_session(model_path: Path, *, device: str = "cpu") -> Any:
+    """Open an ONNX Runtime session on the lane this process was given.
 
     No custom operator library is registered, so a graph that needs one fails
     to load rather than pulling native code in from the bundle's directory.
+
+    A GPU lane asks for ``CUDAExecutionProvider`` with ``CPUExecutionProvider``
+    behind it, which is ONNX Runtime's own fallback: an operator the CUDA
+    provider does not implement runs on the CPU instead of failing the graph.
+    The device *index* is not passed, because the shard runner has already
+    pinned ``CUDA_VISIBLE_DEVICES`` in this process -- the assigned card is the
+    only one visible, and it is numbered zero.
+
+    Asking for CUDA on a build that has no such provider is a configuration
+    error rather than something to work around silently: an eight-hour screen
+    that quietly fell back to one CPU core is the failure worth refusing, and
+    ``--device auto`` never reaches this branch on a CPU-only install.
     """
 
     try:
@@ -372,24 +392,39 @@ def _load_onnx_session(model_path: Path) -> Any:
             ),
         ) from error
     options = onnxruntime.SessionOptions()
-    # Screening is already parallel across stages, and single-threaded
-    # execution is the only setting that reproduces run to run.
+    # One shard already owns a whole lane, and single-threaded execution is the
+    # only setting that reproduces run to run.  Parallelism comes from the
+    # shards, which is why it can stay off here.
     options.intra_op_num_threads = 1
     options.inter_op_num_threads = 1
     options.graph_optimization_level = (
         onnxruntime.GraphOptimizationLevel.ORT_ENABLE_BASIC
     )
+    providers = ["CPUExecutionProvider"]
+    if device.startswith("cuda"):
+        available = set(onnxruntime.get_available_providers())
+        if "CUDAExecutionProvider" not in available:
+            raise PluginError(
+                "this ONNX Runtime build has no CUDA execution provider",
+                code="CUSTOM_MODEL_CUDA_UNAVAILABLE",
+                hint=(
+                    "Install onnxruntime-gpu, or run this stage on CPU lanes with "
+                    "--device cpu."
+                ),
+                context={"device": device, "providers": sorted(available)},
+            )
+        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
     try:
         return onnxruntime.InferenceSession(
             str(model_path),
             sess_options=options,
-            providers=["CPUExecutionProvider"],
+            providers=providers,
         )
     except Exception as error:
         raise PluginError(
             "the bundled ONNX graph could not be loaded",
             code="CUSTOM_MODEL_LOAD_FAILED",
-            context={"error_type": type(error).__name__},
+            context={"error_type": type(error).__name__, "device": device},
         ) from error
 
 
@@ -506,6 +541,168 @@ def _as_column(value: Any, *, column: int | None, label: str) -> np.ndarray:
         ) from error
 
 
+def _score(
+    session: Any,
+    *,
+    featurizer: Featurizer,
+    manifest: ModelBundleManifest,
+    model_id: str,
+    input_name: str,
+    output_names: list[str],
+    parent_ids: list[str],
+    smiles: list[str],
+) -> tuple[list[dict[str, Any]], int, int]:
+    matrix, failed = featurizer.transform(smiles, dtype=manifest.model.dtype)
+    skipped = set(failed)
+    kept = [pid for index, pid in enumerate(parent_ids) if index not in skipped]
+    if not kept:
+        return [], len(failed), 0
+    try:
+        raw = session.run(output_names, {input_name: matrix})
+    except PluginError:
+        raise
+    except Exception as error:
+        raise PluginError(
+            "custom model inference failed",
+            code="CUSTOM_MODEL_INFERENCE_FAILED",
+            context={"batch_size": len(kept), "error_type": type(error).__name__},
+        ) from error
+
+    values = _as_column(raw[0], column=manifest.model.output_column, label="prediction")
+    if values.shape[0] != len(kept):
+        raise PluginError(
+            "the custom model returned a different number of rows than it was given",
+            code="CUSTOM_MODEL_OUTPUT_COUNT_MISMATCH",
+            context={"input_count": len(kept), "output_count": int(values.shape[0])},
+        )
+    spread: np.ndarray | None = None
+    if manifest.uncertainty is not None:
+        spread = _as_column(
+            raw[1], column=manifest.uncertainty.output_column, label="uncertainty"
+        )
+        if spread.shape[0] != len(kept):
+            raise PluginError(
+                "the custom model uncertainty output has a different row count",
+                code="CUSTOM_MODEL_OUTPUT_COUNT_MISMATCH",
+                context={"input_count": len(kept), "output_count": int(spread.shape[0])},
+            )
+        if manifest.uncertainty.scale == "variance":
+            spread = np.sqrt(np.clip(spread, 0.0, None))
+
+    rows: list[dict[str, Any]] = []
+    dropped = 0
+    for index, parent_id in enumerate(kept):
+        mean = float(values[index])
+        if not math.isfinite(mean):
+            # One odd molecule should not abort a two-million-row screen,
+            # but it must not be scored either.  No row means no evidence,
+            # which the gate turns into an explicit reject.
+            dropped += 1
+            continue
+        if manifest.task == "binary_probability" and not 0.0 <= mean <= 1.0:
+            raise PluginError(
+                "a binary_probability model returned a value outside [0, 1]",
+                code="CUSTOM_MODEL_PROBABILITY_OUT_OF_RANGE",
+                hint=(
+                    "This usually means output_name or output_column points at "
+                    "the predicted label instead of the probability tensor."
+                ),
+                context={"value": mean},
+            )
+        deviation: float | None = None
+        if spread is not None:
+            candidate = float(spread[index])
+            deviation = candidate if math.isfinite(candidate) and candidate >= 0 else None
+        rows.append(
+            {
+                "parent_id": parent_id,
+                "endpoint_id": manifest.endpoint_id,
+                "model_id": model_id,
+                "prediction_mean": mean,
+                "prediction_std": deviation,
+                "interval_lower": None,
+                "interval_upper": None,
+                "calibration_id": None,
+            }
+        )
+    return rows, len(failed), dropped
+
+
+@cache
+def _loaded_session(
+    bundle_dir: str, bundle_sha256: str, device: str
+) -> tuple[ModelBundleManifest, Any, str, tuple[str, ...]]:
+    """Read the manifest and open the ONNX session once per worker process.
+
+    ``device`` is part of the key because it decides which execution provider
+    the session was built on; ``bundle_sha256`` is, because the parent has
+    already proved those bytes and two stages pinning different bundles must
+    never share one session.
+    """
+
+    root = Path(bundle_dir)
+    manifest = _parse_manifest((root / MANIFEST_FILENAME).read_bytes())
+    session = _load_onnx_session(root / manifest.model.file, device=device)
+    input_name, output_names = _resolve_io(session, manifest)
+    return manifest, session, input_name, tuple(output_names)
+
+
+def _run_shard(task: ShardTask) -> ShardOutcome:
+    """Score one contiguous range of parents on whichever lane owns it."""
+
+    settings = dict(task.config)
+    runtime = dict(settings.pop(_RUNTIME_KEY))
+    config = CustomModelConfig.model_validate(settings)
+    model_id = str(runtime["model_id"])
+    manifest, session, input_name, output_names = _loaded_session(
+        str(runtime["bundle_dir"]), str(runtime["bundle_sha256"]), task.device or "cpu"
+    )
+    featurizer = Featurizer(manifest.representation)
+
+    input_count = 0
+    prediction_count = 0
+    unfeaturizable = 0
+    non_finite = 0
+    with (
+        pq.ParquetWriter(
+            task.output_paths["primary"], PARENT_V1.schema, compression="zstd"
+        ) as parent_writer,
+        pq.ParquetWriter(
+            task.output_paths["predictions"], PREDICTION_V1.schema, compression="zstd"
+        ) as prediction_writer,
+    ):
+        for batch in iter_shard_batches(task, batch_size=config.batch_size):
+            parent_ids = [str(value) for value in batch.column("parent_id").to_pylist()]
+            smiles = [str(value) for value in batch.column("parent_smiles").to_pylist()]
+            rows, skipped, dropped = _score(
+                session,
+                featurizer=featurizer,
+                manifest=manifest,
+                model_id=model_id,
+                input_name=input_name,
+                output_names=list(output_names),
+                parent_ids=parent_ids,
+                smiles=smiles,
+            )
+            parent_writer.write_batch(batch)
+            if rows:
+                prediction_writer.write_table(
+                    pa.Table.from_pylist(rows, schema=PREDICTION_V1.schema)
+                )
+            input_count += batch.num_rows
+            prediction_count += len(rows)
+            unfeaturizable += skipped
+            non_finite += dropped
+    return ShardOutcome(
+        rows_in=input_count,
+        rows_out={"primary": input_count, "predictions": prediction_count},
+        metadata={
+            "unfeaturizable_count": unfeaturizable,
+            "non_finite_prediction_count": non_finite,
+        },
+    )
+
+
 class CustomModelPredictorPlugin:
     """Score molecules with a user-supplied, hash-pinned ONNX model bundle."""
 
@@ -559,69 +756,31 @@ class CustomModelPredictorPlugin:
         model_id = str(inspected["model_id"])
         featurizer = Featurizer(manifest.representation)
 
-        context.staging_root.mkdir(parents=True, exist_ok=True)
-        parent_destination = context.staging_root / _PARENT_PATH
-        prediction_destination = context.staging_root / _PREDICTION_PATH
-        for relative, destination in (
-            (_PARENT_PATH, parent_destination),
-            (_PREDICTION_PATH, prediction_destination),
-        ):
-            if destination.exists() or destination.is_symlink():
-                raise PluginError(
-                    "custom model output already exists in staging",
-                    code="PLUGIN_STAGING_NOT_EMPTY",
-                    context={"path": relative.as_posix()},
-                )
-            destination.parent.mkdir(parents=True, exist_ok=True)
-
-        session = _load_onnx_session(root / manifest.model.file)
-        input_name, output_names = _resolve_io(session, manifest)
-        input_count = 0
-        prediction_count = 0
-        unfeaturizable = 0
-        non_finite = 0
-        try:
-            with pq.ParquetWriter(
-                parent_destination, PARENT_V1.schema, compression="zstd"
-            ) as parent_writer, pq.ParquetWriter(
-                prediction_destination, PREDICTION_V1.schema, compression="zstd"
-            ) as prediction_writer:
-                for batch in iter_contract_batches(
-                    stage_input, PARENT_V1, batch_size=config.batch_size
-                ):
-                    parent_ids = [
-                        str(value) for value in batch.column("parent_id").to_pylist()
-                    ]
-                    smiles = [
-                        str(value) for value in batch.column("parent_smiles").to_pylist()
-                    ]
-                    rows, skipped, dropped = self._score(
-                        session,
-                        featurizer=featurizer,
-                        manifest=manifest,
-                        model_id=model_id,
-                        input_name=input_name,
-                        output_names=output_names,
-                        parent_ids=parent_ids,
-                        smiles=smiles,
-                    )
-                    parent_writer.write_batch(batch)
-                    if rows:
-                        prediction_writer.write_table(
-                            pa.Table.from_pylist(rows, schema=PREDICTION_V1.schema)
-                        )
-                    input_count += batch.num_rows
-                    prediction_count += len(rows)
-                    unfeaturizable += skipped
-                    non_finite += dropped
-        except BaseException:
-            parent_destination.unlink(missing_ok=True)
-            prediction_destination.unlink(missing_ok=True)
-            raise
+        sharded = shard_stage(
+            worker=_run_shard,
+            stage_input=stage_input,
+            contract=PARENT_V1,
+            output_paths={
+                "primary": _PARENT_PATH.as_posix(),
+                "predictions": _PREDICTION_PATH.as_posix(),
+            },
+            context=context,
+            stage_id=request.stage_id,
+            config={
+                **config.model_dump(mode="json"),
+                _RUNTIME_KEY: {
+                    "bundle_dir": str(root),
+                    "bundle_sha256": str(inspected["bundle_sha256"]),
+                    "model_id": model_id,
+                },
+            },
+        )
+        input_count = sharded.rows_in
+        prediction_count = sharded.rows_out.get("predictions", 0)
+        unfeaturizable = sharded.total("unfeaturizable_count")
+        non_finite = sharded.total("non_finite_prediction_count")
 
         if input_count == 0:
-            parent_destination.unlink(missing_ok=True)
-            prediction_destination.unlink(missing_ok=True)
             raise PluginError(
                 "custom model input contains no parents",
                 code="CUSTOM_MODEL_EMPTY_INPUT",
@@ -630,11 +789,11 @@ class CustomModelPredictorPlugin:
         return StageResponse(
             outputs={
                 "primary": PendingOutput(
-                    PARENT_V1.id, (_PARENT_PATH.as_posix(),), {"row_count": input_count}
+                    PARENT_V1.id, sharded.file_paths["primary"], {"row_count": input_count}
                 ),
                 "predictions": PendingOutput(
                     PREDICTION_V1.id,
-                    (_PREDICTION_PATH.as_posix(),),
+                    sharded.file_paths["predictions"],
                     {"row_count": prediction_count, "model_id": model_id},
                 ),
             },
@@ -661,95 +820,9 @@ class CustomModelPredictorPlugin:
                 "calibration_available": False,
                 "model_deserialization_trust_acknowledged": False,
                 "network_or_download_invoked_by_adapter": False,
+                **sharded.response_metadata(),
             },
         )
-
-    def _score(
-        self,
-        session: Any,
-        *,
-        featurizer: Featurizer,
-        manifest: ModelBundleManifest,
-        model_id: str,
-        input_name: str,
-        output_names: list[str],
-        parent_ids: list[str],
-        smiles: list[str],
-    ) -> tuple[list[dict[str, Any]], int, int]:
-        matrix, failed = featurizer.transform(smiles, dtype=manifest.model.dtype)
-        skipped = set(failed)
-        kept = [pid for index, pid in enumerate(parent_ids) if index not in skipped]
-        if not kept:
-            return [], len(failed), 0
-        try:
-            raw = session.run(output_names, {input_name: matrix})
-        except PluginError:
-            raise
-        except Exception as error:
-            raise PluginError(
-                "custom model inference failed",
-                code="CUSTOM_MODEL_INFERENCE_FAILED",
-                context={"batch_size": len(kept), "error_type": type(error).__name__},
-            ) from error
-
-        values = _as_column(raw[0], column=manifest.model.output_column, label="prediction")
-        if values.shape[0] != len(kept):
-            raise PluginError(
-                "the custom model returned a different number of rows than it was given",
-                code="CUSTOM_MODEL_OUTPUT_COUNT_MISMATCH",
-                context={"input_count": len(kept), "output_count": int(values.shape[0])},
-            )
-        spread: np.ndarray | None = None
-        if manifest.uncertainty is not None:
-            spread = _as_column(
-                raw[1], column=manifest.uncertainty.output_column, label="uncertainty"
-            )
-            if spread.shape[0] != len(kept):
-                raise PluginError(
-                    "the custom model uncertainty output has a different row count",
-                    code="CUSTOM_MODEL_OUTPUT_COUNT_MISMATCH",
-                    context={"input_count": len(kept), "output_count": int(spread.shape[0])},
-                )
-            if manifest.uncertainty.scale == "variance":
-                spread = np.sqrt(np.clip(spread, 0.0, None))
-
-        rows: list[dict[str, Any]] = []
-        dropped = 0
-        for index, parent_id in enumerate(kept):
-            mean = float(values[index])
-            if not math.isfinite(mean):
-                # One odd molecule should not abort a two-million-row screen,
-                # but it must not be scored either.  No row means no evidence,
-                # which the gate turns into an explicit reject.
-                dropped += 1
-                continue
-            if manifest.task == "binary_probability" and not 0.0 <= mean <= 1.0:
-                raise PluginError(
-                    "a binary_probability model returned a value outside [0, 1]",
-                    code="CUSTOM_MODEL_PROBABILITY_OUT_OF_RANGE",
-                    hint=(
-                        "This usually means output_name or output_column points at "
-                        "the predicted label instead of the probability tensor."
-                    ),
-                    context={"value": mean},
-                )
-            deviation: float | None = None
-            if spread is not None:
-                candidate = float(spread[index])
-                deviation = candidate if math.isfinite(candidate) and candidate >= 0 else None
-            rows.append(
-                {
-                    "parent_id": parent_id,
-                    "endpoint_id": manifest.endpoint_id,
-                    "model_id": model_id,
-                    "prediction_mean": mean,
-                    "prediction_std": deviation,
-                    "interval_lower": None,
-                    "interval_upper": None,
-                    "calibration_id": None,
-                }
-            )
-        return rows, len(failed), dropped
 
 
 __all__ = [

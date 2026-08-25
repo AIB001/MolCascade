@@ -34,11 +34,13 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from pydantic import Field, ValidationError, field_validator, model_validator
 
-from molcascade.chemistry.datasets import iter_contract_batches, require_single_input
+from molcascade.chemistry.datasets import require_single_input
+from molcascade.chemistry.sharding import shard_stage
 from molcascade.config.canonical import canonical_sha256
 from molcascade.config.models import StrictFrozenModel
 from molcascade.contracts import DECISION_V1, PARENT_V1
 from molcascade.errors import PluginError
+from molcascade.parallel import ShardOutcome, ShardTask, iter_shard_batches
 from molcascade.plugins.api import PendingOutput, StageContext, StageRequest, StageResponse
 from molcascade.plugins.builtin.medchem_support import (
     import_medchem,
@@ -125,23 +127,6 @@ def _validated_config(request: StageRequest) -> MedchemRulesConfig:
         ) from error
 
 
-def _prepare_outputs(context: StageContext) -> tuple[Path, Path]:
-    context.staging_root.mkdir(parents=True, exist_ok=True)
-    destinations = (
-        context.staging_root / _PARENT_PATH,
-        context.staging_root / _DECISION_PATH,
-    )
-    for relative, destination in zip((_PARENT_PATH, _DECISION_PATH), destinations, strict=True):
-        if destination.exists() or destination.is_symlink():
-            raise PluginError(
-                f"medchem rule output already exists: {relative.as_posix()}",
-                code="PLUGIN_STAGING_NOT_EMPTY",
-                context={"path": relative.as_posix()},
-            )
-        destination.parent.mkdir(parents=True, exist_ok=True)
-    return destinations
-
-
 def _available_rules(rule_filters: Any) -> dict[str, str]:
     try:
         names = [str(name) for name in rule_filters.list_available_rules_names()]
@@ -198,6 +183,143 @@ def _detail(
     )
 
 
+def _policy_id(
+    config: MedchemRulesConfig,
+    *,
+    backend_version: str,
+    resolved: tuple[str, ...],
+    required: int,
+) -> str:
+    return "medchem-rule-policy:sha256:" + canonical_sha256(
+        {
+            "backend": "medchem",
+            "backend_version": backend_version,
+            "combination": config.combination.value,
+            "required_rule_count": required,
+            "rules": list(resolved),
+            "semantics": "published-physicochemical-rule-sets",
+        }
+    )
+
+
+def _run_shard(task: ShardTask) -> ShardOutcome:
+    """Apply the rule sets to one contiguous range of parents."""
+
+    from rdkit import Chem
+
+    config = MedchemRulesConfig.model_validate(dict(task.config))
+    medchem = import_medchem()
+    # Rebuilt here rather than shipped from the parent: ``RuleFilters`` holds
+    # compiled callables that do not survive the process boundary, and the rule
+    # catalogue is the same in every worker because it is the same install.
+    rule_filter, resolved = _build_rule_filter(config)
+    required = config.required_passes()
+    policy_id = _policy_id(
+        config,
+        backend_version=medchem_version(medchem),
+        resolved=resolved,
+        required=required,
+    )
+
+    input_count = 0
+    retained_count = 0
+    reject_count = 0
+    decision_count = 0
+    per_rule_failures = dict.fromkeys(resolved, 0)
+    with (
+        pq.ParquetWriter(
+            task.output_paths["primary"], PARENT_V1.schema, compression="zstd"
+        ) as parent_writer,
+        pq.ParquetWriter(
+            task.output_paths["decisions"], DECISION_V1.schema, compression="zstd"
+        ) as decision_writer,
+    ):
+        decision_rows: list[dict[str, Any]] = []
+
+        def flush_decisions() -> None:
+            if decision_rows:
+                decision_writer.write_table(
+                    pa.Table.from_pylist(decision_rows, schema=DECISION_V1.schema)
+                )
+                decision_rows.clear()
+
+        for batch in iter_shard_batches(task, batch_size=config.batch_size):
+            rows = batch.to_pylist()
+            molecules = []
+            for row in rows:
+                smiles = row.get("parent_smiles")
+                molecule = Chem.MolFromSmiles(smiles if isinstance(smiles, str) else "")
+                if molecule is None:
+                    raise PluginError(
+                        "registered parent cannot be parsed for medchem rules",
+                        code="MEDCHEM_PARENT_INVALID",
+                        context={"parent_id": str(row.get("parent_id"))},
+                    )
+                molecules.append(molecule)
+            input_count += len(rows)
+
+            # n_jobs=1: MolCascade owns the parallelism, and a nested pool would
+            # make row order depend on scheduling.
+            frame = rule_filter(
+                molecules,
+                n_jobs=1,
+                progress=False,
+                scheduler="threads",
+                keep_props=False,
+            )
+            columns = {
+                name: result_column(frame, name, len(rows), "rules") for name in resolved
+            }
+
+            retained_rows: list[dict[str, Any]] = []
+            for index, row in enumerate(rows):
+                outcomes = {name: bool(columns[name][index]) for name in resolved}
+                failed = tuple(name for name, ok in outcomes.items() if not ok)
+                for name in failed:
+                    per_rule_failures[name] += 1
+                passed = len(resolved) - len(failed)
+                accepted = passed >= required
+                if accepted:
+                    retained_count += 1
+                    retained_rows.append(row)
+                else:
+                    reject_count += 1
+                decision_rows.append(
+                    {
+                        "entity_id": row.get("parent_id"),
+                        "entity_kind": "PARENT",
+                        "stage_id": task.stage_id,
+                        "outcome": "PASS" if accepted else "REJECT",
+                        "reason_code": _reason_code(() if accepted else failed),
+                        "rule_id": policy_id,
+                        "detail": _detail(
+                            outcomes,
+                            passed=passed,
+                            required=required,
+                            combination=config.combination,
+                        ),
+                    }
+                )
+                decision_count += 1
+                if len(decision_rows) >= config.decision_buffer_size:
+                    flush_decisions()
+            if retained_rows:
+                parent_writer.write_table(
+                    pa.Table.from_pylist(retained_rows, schema=PARENT_V1.schema)
+                )
+        flush_decisions()
+    return ShardOutcome(
+        rows_in=input_count,
+        rows_out={"primary": retained_count, "decisions": decision_count},
+        # A per-rule breakdown is a mapping, not a counter, so it travels whole
+        # and the parent adds the shards together key by key.
+        metadata={
+            "reject_count": reject_count,
+            "per_rule_failure_count": dict(per_rule_failures),
+        },
+    )
+
+
 class MedchemRulesPlugin:
     """Apply published physicochemical rule sets as one combined verdict."""
 
@@ -220,136 +342,56 @@ class MedchemRulesPlugin:
     config_model = MedchemRulesConfig
 
     def execute(self, request: StageRequest, context: StageContext) -> StageResponse:
-        from rdkit import Chem
-
         config = _validated_config(request)
         stage_input = require_single_input(request.inputs, contract_id=PARENT_V1.id)
         medchem = import_medchem()
-        rule_filter, resolved = _build_rule_filter(config)
+        # Built in the parent as well, so an unknown rule name stops the stage
+        # before a shard is scheduled rather than in every worker at once.
+        _, resolved = _build_rule_filter(config)
         required = config.required_passes()
-        parent_destination, decision_destination = _prepare_outputs(context)
+        policy_id = _policy_id(
+            config,
+            backend_version=medchem_version(medchem),
+            resolved=resolved,
+            required=required,
+        )
 
-        policy_payload = {
-            "backend": "medchem",
-            "backend_version": medchem_version(medchem),
-            "combination": config.combination.value,
-            "required_rule_count": required,
-            "rules": list(resolved),
-            "semantics": "published-physicochemical-rule-sets",
-        }
-        policy_id = "medchem-rule-policy:sha256:" + canonical_sha256(policy_payload)
-
-        input_count = 0
-        retained_count = 0
-        reject_count = 0
-        decision_count = 0
+        result = shard_stage(
+            worker=_run_shard,
+            stage_input=stage_input,
+            contract=PARENT_V1,
+            output_paths={
+                "primary": _PARENT_PATH.as_posix(),
+                "decisions": _DECISION_PATH.as_posix(),
+            },
+            context=context,
+            stage_id=request.stage_id,
+            config=config.model_dump(mode="json"),
+        )
+        input_count = result.rows_in
+        if input_count == 0:
+            raise PluginError(
+                "medchem rule input contains no parents",
+                code="MEDCHEM_RULES_EMPTY_INPUT",
+            )
+        retained_count = result.rows_out.get("primary", 0)
+        decision_count = result.rows_out.get("decisions", 0)
+        reject_count = result.total("reject_count")
         per_rule_failures = dict.fromkeys(resolved, 0)
-
-        try:
-            with (
-                pq.ParquetWriter(
-                    parent_destination, PARENT_V1.schema, compression="zstd"
-                ) as parent_writer,
-                pq.ParquetWriter(
-                    decision_destination, DECISION_V1.schema, compression="zstd"
-                ) as decision_writer,
-            ):
-                decision_rows: list[dict[str, Any]] = []
-
-                def flush_decisions() -> None:
-                    if decision_rows:
-                        decision_writer.write_table(
-                            pa.Table.from_pylist(decision_rows, schema=DECISION_V1.schema)
-                        )
-                        decision_rows.clear()
-
-                for batch in iter_contract_batches(
-                    stage_input, PARENT_V1, batch_size=config.batch_size
-                ):
-                    rows = batch.to_pylist()
-                    molecules = []
-                    for row in rows:
-                        smiles = row.get("parent_smiles")
-                        molecule = Chem.MolFromSmiles(smiles if isinstance(smiles, str) else "")
-                        if molecule is None:
-                            raise PluginError(
-                                "registered parent cannot be parsed for medchem rules",
-                                code="MEDCHEM_PARENT_INVALID",
-                                context={"parent_id": str(row.get("parent_id"))},
-                            )
-                        molecules.append(molecule)
-                    input_count += len(rows)
-
-                    # n_jobs=1: MolCascade owns the parallelism, and a nested
-                    # pool would make row order depend on scheduling.
-                    frame = rule_filter(
-                        molecules,
-                        n_jobs=1,
-                        progress=False,
-                        scheduler="threads",
-                        keep_props=False,
-                    )
-                    columns = {
-                        name: result_column(frame, name, len(rows), "rules") for name in resolved
-                    }
-
-                    retained_rows: list[dict[str, Any]] = []
-                    for index, row in enumerate(rows):
-                        outcomes = {name: bool(columns[name][index]) for name in resolved}
-                        failed = tuple(name for name, ok in outcomes.items() if not ok)
-                        for name in failed:
-                            per_rule_failures[name] += 1
-                        passed = len(resolved) - len(failed)
-                        accepted = passed >= required
-                        if accepted:
-                            retained_count += 1
-                            retained_rows.append(row)
-                        else:
-                            reject_count += 1
-                        decision_rows.append(
-                            {
-                                "entity_id": row.get("parent_id"),
-                                "entity_kind": "PARENT",
-                                "stage_id": request.stage_id,
-                                "outcome": "PASS" if accepted else "REJECT",
-                                "reason_code": _reason_code(() if accepted else failed),
-                                "rule_id": policy_id,
-                                "detail": _detail(
-                                    outcomes,
-                                    passed=passed,
-                                    required=required,
-                                    combination=config.combination,
-                                ),
-                            }
-                        )
-                        decision_count += 1
-                        if len(decision_rows) >= config.decision_buffer_size:
-                            flush_decisions()
-                    if retained_rows:
-                        parent_writer.write_table(
-                            pa.Table.from_pylist(retained_rows, schema=PARENT_V1.schema)
-                        )
-                flush_decisions()
-            if input_count == 0:
-                raise PluginError(
-                    "medchem rule input contains no parents",
-                    code="MEDCHEM_RULES_EMPTY_INPUT",
-                )
-        except BaseException:
-            parent_destination.unlink(missing_ok=True)
-            decision_destination.unlink(missing_ok=True)
-            raise
+        for shard in result.shard_metadata:
+            for name, count in dict(shard.get("per_rule_failure_count") or {}).items():
+                per_rule_failures[name] = per_rule_failures.get(name, 0) + int(count)
 
         return StageResponse(
             outputs={
                 "primary": PendingOutput(
                     PARENT_V1.id,
-                    (_PARENT_PATH.as_posix(),),
+                    result.file_paths["primary"],
                     {"row_count": retained_count},
                 ),
                 "decisions": PendingOutput(
                     DECISION_V1.id,
-                    (_DECISION_PATH.as_posix(),),
+                    result.file_paths["decisions"],
                     {"row_count": decision_count, "policy_id": policy_id},
                 ),
             },
@@ -368,6 +410,7 @@ class MedchemRulesPlugin:
                 "backend": "medchem",
                 "backend_version": medchem_version(medchem),
                 "network_or_download_invoked_by_adapter": False,
+                **result.response_metadata(),
             },
         )
 

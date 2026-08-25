@@ -20,6 +20,7 @@ import re
 import shutil
 import stat
 from collections.abc import Mapping
+from functools import cache
 from pathlib import Path, PurePosixPath
 from typing import Any, Self
 
@@ -27,11 +28,13 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from pydantic import Field, ValidationError, field_validator, model_validator
 
-from molcascade.chemistry.datasets import iter_contract_batches, require_single_input
+from molcascade.chemistry.datasets import require_single_input
+from molcascade.chemistry.sharding import shard_stage
 from molcascade.config.canonical import canonical_sha256
 from molcascade.config.models import StrictFrozenModel
 from molcascade.contracts import PARENT_V1, PREDICTION_V1
 from molcascade.errors import PluginError
+from molcascade.parallel import ShardOutcome, ShardTask, iter_shard_batches
 from molcascade.plugins.api import PendingOutput, StageContext, StageRequest, StageResponse
 from molcascade.plugins.manifest import (
     Cardinality,
@@ -66,6 +69,19 @@ _SCIENTIFIC_DISTRIBUTIONS = (
     "torch",
 )
 _COPY_CHUNK_SIZE = 1024 * 1024
+
+#: What the parent worked out and a shard cannot: where the verified model
+#: snapshot landed, and the identity computed from its digests.  It travels
+#: under one key that the worker pops before validating, because ``ADMETAIConfig``
+#: is strict and these are facts about *this run*, not settings anyone authored.
+#: Nothing here reaches ``stage_cache_key`` -- that hashes the stage config in
+#: the pipeline, not the mapping handed to :func:`shard_stage`.
+_RUNTIME_KEY = "molcascade.runtime"
+
+#: Smaller than the 50 000-row default.  Each shard is a Chemprop ensemble
+#: forward pass over every endpoint, so the useful unit of resume here is
+#: minutes of GPU time rather than a fraction of a cheap descriptor sweep.
+_SHARD_ROWS = 20_000
 
 
 class ADMETEndpoint(StrictFrozenModel):
@@ -1008,6 +1024,105 @@ def _prediction_rows(
     return output
 
 
+@cache
+def _loaded_model(snapshot_root: str, num_workers: int) -> Any:
+    """Build the ADMET-AI model once per worker process.
+
+    Cached because a lane is handed shard after shard and this loads a Chemprop
+    ensemble per endpoint group -- hundreds of megabytes off disk and onto the
+    card.  Paying that per shard would cost more than the inference it enables.
+
+    The snapshot path is the key rather than the configuration, because the
+    parent has already verified those bytes against the pinned digests: two
+    stages that snapshot different trees get different models, and two shards of
+    one stage get the same one.
+
+    ``ADMETModel`` takes no device argument, which is exactly why the shard
+    runner pins ``CUDA_VISIBLE_DEVICES`` in the child before this is reached --
+    it is the only way this library can be aimed at a card that is not the first.
+    """
+
+    try:
+        module = importlib.import_module("admet_ai")
+        model_class = module.ADMETModel
+    except (ImportError, AttributeError) as error:
+        raise PluginError(
+            "ADMET-AI v2 could not be imported or does not expose ADMETModel",
+            code="ADMET_AI_BACKEND_UNAVAILABLE",
+            context={"error_type": type(error).__name__},
+        ) from error
+    if not callable(model_class):
+        raise PluginError(
+            "ADMET-AI ADMETModel is not callable",
+            code="ADMET_AI_API_INCOMPATIBLE",
+        )
+    try:
+        return model_class(
+            models_dir=Path(snapshot_root),
+            include_physchem=False,
+            drugbank_path=None,
+            num_workers=num_workers,
+        )
+    except Exception as error:
+        raise PluginError(
+            "ADMET-AI v2 could not load the local model snapshot",
+            code="ADMET_AI_MODEL_LOAD_FAILED",
+            context={"error_type": type(error).__name__},
+        ) from error
+
+
+def _run_shard(task: ShardTask) -> ShardOutcome:
+    """Predict one contiguous range of parents on whichever lane owns it."""
+
+    settings = dict(task.config)
+    runtime = dict(settings.pop(_RUNTIME_KEY))
+    config = ADMETAIConfig.model_validate(settings)
+    model_id = str(runtime["model_id"])
+    model = _loaded_model(str(runtime["snapshot_root"]), config.num_workers)
+
+    input_count = 0
+    prediction_count = 0
+    with (
+        pq.ParquetWriter(
+            task.output_paths["primary"], PARENT_V1.schema, compression="zstd"
+        ) as parent_writer,
+        pq.ParquetWriter(
+            task.output_paths["predictions"], PREDICTION_V1.schema, compression="zstd"
+        ) as prediction_writer,
+    ):
+        for batch in iter_shard_batches(task, batch_size=config.batch_size):
+            parent_ids = [str(value) for value in batch.column("parent_id").to_pylist()]
+            smiles = [str(value) for value in batch.column("parent_smiles").to_pylist()]
+            try:
+                result = model.predict(smiles)
+            except Exception as error:
+                raise PluginError(
+                    "ADMET-AI v2 prediction failed",
+                    code="ADMET_AI_PREDICTION_FAILED",
+                    context={
+                        "batch_size": len(smiles),
+                        "error_type": type(error).__name__,
+                    },
+                ) from error
+            predictions = _prediction_rows(
+                result,
+                parent_ids=parent_ids,
+                input_smiles=smiles,
+                endpoints=config.endpoints,
+                model_id=model_id,
+            )
+            parent_writer.write_batch(batch)
+            prediction_writer.write_table(
+                pa.Table.from_pylist(predictions, schema=PREDICTION_V1.schema)
+            )
+            input_count += batch.num_rows
+            prediction_count += len(predictions)
+    return ShardOutcome(
+        rows_in=input_count,
+        rows_out={"primary": input_count, "predictions": prediction_count},
+    )
+
+
 class ADMETAIV2PredictorPlugin:
     """Run explicitly trusted, locally provisioned ADMET-AI v2 checkpoints."""
 
@@ -1050,19 +1165,6 @@ class ADMETAIV2PredictorPlugin:
         model_root = _local_model_root(config.models_dir)
         context.staging_root.mkdir(parents=True, exist_ok=True)
         snapshot_root = context.staging_root / _MODEL_SNAPSHOT
-        parent_destination = context.staging_root / _PARENT_PATH
-        prediction_destination = context.staging_root / _PREDICTION_PATH
-        for relative, destination in (
-            (_PARENT_PATH, parent_destination),
-            (_PREDICTION_PATH, prediction_destination),
-        ):
-            if destination.exists() or destination.is_symlink():
-                raise PluginError(
-                    "ADMET-AI output already exists in staging",
-                    code="PLUGIN_STAGING_NOT_EMPTY",
-                    context={"path": relative.as_posix()},
-                )
-            destination.parent.mkdir(parents=True, exist_ok=True)
 
         package = _package_provenance(config)
         package_root = package["package_root"]
@@ -1072,7 +1174,9 @@ class ADMETAIV2PredictorPlugin:
         model_manifest: tuple[dict[str, object], ...] = ()
         checkpoints: tuple[dict[str, object], ...] = ()
         input_count = 0
+        prediction_count = 0
         model_id = ""
+        staged: list[Path] = []
         try:
             model_hash, model_manifest, checkpoints = _snapshot_model_tree(
                 model_root,
@@ -1100,85 +1204,37 @@ class ADMETAIV2PredictorPlugin:
                     "drugbank_reference": None,
                 }
             )
-            try:
-                module = importlib.import_module("admet_ai")
-                model_class = module.ADMETModel
-            except (ImportError, AttributeError) as error:
-                raise PluginError(
-                    "ADMET-AI v2 could not be imported or does not expose ADMETModel",
-                    code="ADMET_AI_BACKEND_UNAVAILABLE",
-                    context={"error_type": type(error).__name__},
-                ) from error
-            if not callable(model_class):
-                raise PluginError(
-                    "ADMET-AI ADMETModel is not callable",
-                    code="ADMET_AI_API_INCOMPATIBLE",
-                )
-            try:
-                model = model_class(
-                    models_dir=snapshot_root,
-                    include_physchem=False,
-                    drugbank_path=None,
-                    num_workers=config.num_workers,
-                )
-            except Exception as error:
-                raise PluginError(
-                    "ADMET-AI v2 could not load the local model snapshot",
-                    code="ADMET_AI_MODEL_LOAD_FAILED",
-                    context={"error_type": type(error).__name__},
-                ) from error
-
-            try:
-                with pq.ParquetWriter(
-                    parent_destination, PARENT_V1.schema, compression="zstd"
-                ) as parent_writer, pq.ParquetWriter(
-                    prediction_destination,
-                    PREDICTION_V1.schema,
-                    compression="zstd",
-                ) as prediction_writer:
-                    for batch in iter_contract_batches(
-                        stage_input,
-                        PARENT_V1,
-                        batch_size=config.batch_size,
-                    ):
-                        parent_ids = [
-                            str(value)
-                            for value in batch.column("parent_id").to_pylist()
-                        ]
-                        smiles = [
-                            str(value)
-                            for value in batch.column("parent_smiles").to_pylist()
-                        ]
-                        try:
-                            result = model.predict(smiles)
-                        except Exception as error:
-                            raise PluginError(
-                                "ADMET-AI v2 prediction failed",
-                                code="ADMET_AI_PREDICTION_FAILED",
-                                context={
-                                    "batch_size": len(smiles),
-                                    "error_type": type(error).__name__,
-                                },
-                            ) from error
-                        predictions = _prediction_rows(
-                            result,
-                            parent_ids=parent_ids,
-                            input_smiles=smiles,
-                            endpoints=config.endpoints,
-                            model_id=model_id,
-                        )
-                        parent_writer.write_batch(batch)
-                        prediction_writer.write_table(
-                            pa.Table.from_pylist(predictions, schema=PREDICTION_V1.schema)
-                        )
-                        input_count += batch.num_rows
-            except BaseException:
-                parent_destination.unlink(missing_ok=True)
-                prediction_destination.unlink(missing_ok=True)
-                raise
+            # The lanes read the verified snapshot, not ``models_dir``: the
+            # bytes under a shard's model directory have to be the bytes that
+            # were hashed a moment ago, and the tree the user points at is
+            # outside this run's control.
+            sharded = shard_stage(
+                worker=_run_shard,
+                stage_input=stage_input,
+                contract=PARENT_V1,
+                output_paths={
+                    "primary": _PARENT_PATH.as_posix(),
+                    "predictions": _PREDICTION_PATH.as_posix(),
+                },
+                context=context,
+                stage_id=request.stage_id,
+                config={
+                    **config.model_dump(mode="json"),
+                    _RUNTIME_KEY: {
+                        "snapshot_root": str(snapshot_root),
+                        "model_id": model_id,
+                    },
+                },
+                shard_rows=_SHARD_ROWS,
+            )
+            staged = [
+                context.staging_root / name
+                for names in sharded.file_paths.values()
+                for name in names
+            ]
+            input_count = sharded.rows_in
+            prediction_count = sharded.rows_out.get("predictions", 0)
             if input_count == 0:
-                parent_destination.unlink(missing_ok=True)
-                prediction_destination.unlink(missing_ok=True)
                 raise PluginError(
                     "ADMET-AI input contains no parents",
                     code="ADMET_AI_EMPTY_INPUT",
@@ -1196,39 +1252,37 @@ class ADMETAIV2PredictorPlugin:
                 suffixes=_PACKAGE_CODE_SUFFIXES,
             )
             if post_model_hash != model_hash:
-                parent_destination.unlink(missing_ok=True)
-                prediction_destination.unlink(missing_ok=True)
                 raise PluginError(
                     "ADMET-AI model snapshot changed during inference",
                     code="ADMET_AI_MODEL_MUTATED",
                 )
             if post_package_hash != package_hash:
-                parent_destination.unlink(missing_ok=True)
-                prediction_destination.unlink(missing_ok=True)
                 raise PluginError(
                     "ADMET-AI package code changed during inference",
                     code="ADMET_AI_PACKAGE_MUTATED",
                 )
         except BaseException:
-            parent_destination.unlink(missing_ok=True)
-            prediction_destination.unlink(missing_ok=True)
+            # Staging is discarded by the runner when a stage fails, but a
+            # prediction written by a model that turned out to have moved
+            # underneath the run should not survive even that long.
+            for path in staged:
+                path.unlink(missing_ok=True)
             raise
         finally:
             shutil.rmtree(snapshot_root, ignore_errors=True)
 
-        prediction_count = input_count * len(config.endpoints)
         checkpoint_metadata = [dict(item) for item in checkpoints]
         checkpoint_manifest_sha256 = canonical_sha256(checkpoints)
         return StageResponse(
             outputs={
                 "primary": PendingOutput(
                     PARENT_V1.id,
-                    (_PARENT_PATH.as_posix(),),
+                    sharded.file_paths["primary"],
                     {"row_count": input_count},
                 ),
                 "predictions": PendingOutput(
                     PREDICTION_V1.id,
-                    (_PREDICTION_PATH.as_posix(),),
+                    sharded.file_paths["predictions"],
                     {
                         "row_count": prediction_count,
                         "model_id": model_id,
@@ -1262,6 +1316,7 @@ class ADMETAIV2PredictorPlugin:
                 "uncertainty_available": False,
                 "calibration_available": False,
                 "network_or_download_invoked_by_adapter": False,
+                **sharded.response_metadata(),
             },
         )
 

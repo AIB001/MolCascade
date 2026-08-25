@@ -487,11 +487,15 @@ def test_same_cardinality_dataframe_reorder_is_rejected_before_row_assignment(
             StageContext(output),
         )
     assert captured.value.code == "ADMET_AI_OUTPUT_INDEX_MISMATCH"
-    assert captured.value.context == {
+    # A superset, not an equality: inference runs under the shard runner, which
+    # adds the shard index and the lane it ran on to whatever a worker raises.
+    # That is the half of the answer a parallel stage cannot report otherwise.
+    assert captured.value.context.items() >= {
         "position": 0,
         "expected_smiles": "CCO",
         "actual_index": "CCCO",
-    }
+    }.items()
+    assert captured.value.context["shard_index"] == 0
     assert not (output / "datasets/passed_parents/part-00000.parquet").exists()
     assert not (output / "datasets/admet_predictions/part-00000.parquet").exists()
     assert not (output / ".admet-ai-model-snapshot").exists()

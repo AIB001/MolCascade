@@ -50,11 +50,13 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from pydantic import Field, ValidationError, field_validator, model_validator
 
-from molcascade.chemistry.datasets import iter_contract_batches, require_single_input
+from molcascade.chemistry.datasets import require_single_input
+from molcascade.chemistry.sharding import shard_stage
 from molcascade.config.canonical import canonical_sha256
 from molcascade.config.models import StrictFrozenModel
 from molcascade.contracts import DECISION_V1, PARENT_V1
 from molcascade.errors import PluginError
+from molcascade.parallel import ShardOutcome, ShardTask, iter_shard_batches
 from molcascade.plugins.api import PendingOutput, StageContext, StageRequest, StageResponse
 from molcascade.plugins.manifest import (
     Cardinality,
@@ -205,6 +207,205 @@ class MordredDescriptorGateConfig(StrictFrozenModel):
         return self
 
 
+def _resolve(requested: tuple[str, ...]) -> tuple[Any, dict[str, Any]]:
+    """Look the requested names up in Mordred's live 2D registry.
+
+    Returns the calculator and a name-to-instance map.  Unknown names raise
+    rather than being skipped: a gate that silently drops a filter is worse
+    than one that refuses to start, because the run still produces a plausible
+    looking artifact.
+    """
+
+    from mordred import Calculator
+    from mordred import descriptors as mordred_descriptors
+
+    registry = Calculator(mordred_descriptors, ignore_3D=True)
+    available = {str(item): item for item in registry.descriptors}
+    unknown = [name for name in requested if name not in available]
+    if unknown:
+        # Case-only collisions come first because they are the ones that would
+        # have silently applied the opposite filter had Mordred been lenient;
+        # edit-distance neighbours follow, which is what catches a plausible
+        # invention like "nAromRing" for the real "naRing".
+        folded_index: dict[str, list[str]] = {}
+        for candidate in available:
+            folded_index.setdefault(candidate.casefold(), []).append(candidate)
+        suggestions: dict[str, list[str]] = {}
+        for name in unknown:
+            folded = name.casefold()
+            near: list[str] = sorted(folded_index.get(folded, ()))
+            for match in difflib.get_close_matches(folded, folded_index, n=8, cutoff=0.6):
+                near.extend(
+                    candidate for candidate in sorted(folded_index[match]) if candidate not in near
+                )
+            if near:
+                suggestions[name] = near[:8]
+        raise PluginError(
+            "unknown Mordred descriptor(s): " + ", ".join(sorted(unknown)),
+            code="MORDRED_DESCRIPTOR_UNKNOWN",
+            context={
+                "unknown": sorted(unknown),
+                "registry_size": len(available),
+                # Case-only near-misses are the dangerous ones (naRing vs
+                # nARing), so they are surfaced first.
+                "did_you_mean": {key: value for key, value in sorted(suggestions.items())},
+            },
+        )
+    selected = [available[name] for name in requested]
+    return Calculator(selected), available
+
+
+def _mordred_version() -> str:
+    from importlib.metadata import PackageNotFoundError
+    from importlib.metadata import version as package_version
+
+    try:
+        return package_version("mordredcommunity")
+    except PackageNotFoundError:  # pragma: no cover - the original package
+        return package_version("mordred")
+
+
+def _policy_id(
+    config: MordredDescriptorGateConfig, *, backend_version: str, rdkit_version: str
+) -> str:
+    policy = config.model_dump(mode="json")
+    policy.pop("batch_size", None)
+    return "mordred-gate-policy:sha256:" + canonical_sha256(
+        {
+            "backend": "mordred",
+            "backend_version": backend_version,
+            # Mordred delegates molecule handling to RDKit, so an RDKit upgrade
+            # can move these numbers even when Mordred does not.
+            "rdkit_version": rdkit_version,
+            "policy": policy,
+        }
+    )
+
+
+def _run_shard(task: ShardTask) -> ShardOutcome:
+    """Window one contiguous range of parents in whichever process owns it."""
+
+    from mordred.error import MissingValueBase
+    from rdkit import Chem, rdBase
+
+    config = MordredDescriptorGateConfig.model_validate(dict(task.config))
+    names = tuple(window.descriptor for window in config.windows)
+    # Rebuilt per shard: a Mordred ``Calculator`` holds descriptor instances
+    # that do not cross a process boundary, and resolving names is cheap next
+    # to evaluating them.
+    calculator, _ = _resolve(names)
+    policy_id = _policy_id(
+        config, backend_version=_mordred_version(), rdkit_version=rdBase.rdkitVersion
+    )
+
+    input_count = 0
+    passed_count = 0
+    decision_count = 0
+    with (
+        pq.ParquetWriter(
+            task.output_paths["primary"], PARENT_V1.schema, compression="zstd"
+        ) as parents,
+        pq.ParquetWriter(
+            task.output_paths["decisions"], DECISION_V1.schema, compression="zstd"
+        ) as decisions,
+    ):
+        for batch in iter_shard_batches(task, batch_size=config.batch_size):
+            passed: list[dict[str, Any]] = []
+            decision_rows: list[dict[str, Any]] = []
+            for row in batch.to_pylist():
+                input_count += 1
+                parent_id = row.get("parent_id")
+                smiles = row.get("parent_smiles")
+                molecule = Chem.MolFromSmiles(smiles if isinstance(smiles, str) else "")
+                if molecule is None:
+                    raise PluginError(
+                        "registered parent cannot be parsed by the Mordred gate",
+                        code="MORDRED_GATE_PARENT_INVALID",
+                        context={"parent_id": str(parent_id)},
+                    )
+                computed = calculator(molecule).asdict()
+                findings: list[tuple[str, str]] = []
+                recorded: dict[str, float] = {}
+                for window in config.windows:
+                    value = computed.get(window.descriptor)
+                    if isinstance(value, MissingValueBase):
+                        findings.append(
+                            (
+                                _reason_code(window.descriptor, _UNAVAILABLE_SUFFIX),
+                                f"{window.descriptor} is undefined for this molecule "
+                                f"({value!s}); it cannot be shown to satisfy the window",
+                            )
+                        )
+                        continue
+                    number = float(value)
+                    if not math.isfinite(number):
+                        findings.append(
+                            (
+                                _reason_code(window.descriptor, _NON_FINITE_SUFFIX),
+                                f"{window.descriptor} evaluated to {number!r}",
+                            )
+                        )
+                        continue
+                    recorded[window.descriptor] = number
+                    if window.minimum is not None and number < window.minimum:
+                        findings.append(
+                            (
+                                _reason_code(window.descriptor, "BELOW_MIN"),
+                                f"{window.descriptor}={number!r} is below {window.minimum!r}",
+                            )
+                        )
+                    if window.maximum is not None and number > window.maximum:
+                        findings.append(
+                            (
+                                _reason_code(window.descriptor, "ABOVE_MAX"),
+                                f"{window.descriptor}={number!r} is above {window.maximum!r}",
+                            )
+                        )
+                if findings:
+                    for reason_code, detail in findings:
+                        decision_rows.append(
+                            {
+                                "entity_id": parent_id,
+                                "entity_kind": "PARENT",
+                                "stage_id": task.stage_id,
+                                "outcome": "REJECT",
+                                "reason_code": reason_code,
+                                "rule_id": policy_id,
+                                "detail": detail,
+                            }
+                        )
+                else:
+                    passed.append(row)
+                    passed_count += 1
+                    decision_rows.append(
+                        {
+                            "entity_id": parent_id,
+                            "entity_kind": "PARENT",
+                            "stage_id": task.stage_id,
+                            "outcome": "PASS",
+                            "reason_code": "MORDRED_WINDOW_PASS",
+                            "rule_id": policy_id,
+                            "detail": json.dumps(
+                                recorded,
+                                ensure_ascii=False,
+                                allow_nan=False,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ),
+                        }
+                    )
+                decision_count += max(1, len(findings))
+            if passed:
+                parents.write_table(pa.Table.from_pylist(passed, schema=PARENT_V1.schema))
+            decisions.write_table(
+                pa.Table.from_pylist(decision_rows, schema=DECISION_V1.schema)
+            )
+    return ShardOutcome(
+        rows_in=input_count,
+        rows_out={"primary": passed_count, "decisions": decision_count},
+    )
+
+
 class MordredDescriptorGatePlugin:
     descriptor = PluginDescriptor(
         id="chemistry.mordred_descriptor_gate",
@@ -223,62 +424,8 @@ class MordredDescriptorGatePlugin:
     )
     config_model = MordredDescriptorGateConfig
 
-    @staticmethod
-    def _resolve(requested: tuple[str, ...]) -> tuple[Any, dict[str, Any]]:
-        """Look the requested names up in Mordred's live 2D registry.
-
-        Returns the calculator and a name-to-instance map.  Unknown names raise
-        rather than being skipped: a gate that silently drops a filter is worse
-        than one that refuses to start, because the run still produces a plausible
-        looking artifact.
-        """
-
-        from mordred import Calculator
-        from mordred import descriptors as mordred_descriptors
-
-        registry = Calculator(mordred_descriptors, ignore_3D=True)
-        available = {str(item): item for item in registry.descriptors}
-        unknown = [name for name in requested if name not in available]
-        if unknown:
-            # Case-only collisions come first because they are the ones that would
-            # have silently applied the opposite filter had Mordred been lenient;
-            # edit-distance neighbours follow, which is what catches a plausible
-            # invention like "nAromRing" for the real "naRing".
-            folded_index: dict[str, list[str]] = {}
-            for candidate in available:
-                folded_index.setdefault(candidate.casefold(), []).append(candidate)
-            suggestions: dict[str, list[str]] = {}
-            for name in unknown:
-                folded = name.casefold()
-                near: list[str] = sorted(folded_index.get(folded, ()))
-                for match in difflib.get_close_matches(folded, folded_index, n=8, cutoff=0.6):
-                    near.extend(
-                        candidate
-                        for candidate in sorted(folded_index[match])
-                        if candidate not in near
-                    )
-                if near:
-                    suggestions[name] = near[:8]
-            raise PluginError(
-                "unknown Mordred descriptor(s): " + ", ".join(sorted(unknown)),
-                code="MORDRED_DESCRIPTOR_UNKNOWN",
-                context={
-                    "unknown": sorted(unknown),
-                    "registry_size": len(available),
-                    # Case-only near-misses are the dangerous ones (naRing vs
-                    # nARing), so they are surfaced first.
-                    "did_you_mean": {key: value for key, value in sorted(suggestions.items())},
-                },
-            )
-        selected = [available[name] for name in requested]
-        return Calculator(selected), available
-
     def execute(self, request: StageRequest, context: StageContext) -> StageResponse:
-        from importlib.metadata import PackageNotFoundError
-        from importlib.metadata import version as package_version
-
-        from mordred.error import MissingValueBase
-        from rdkit import Chem, rdBase
+        from rdkit import rdBase
 
         try:
             config = self.config_model.model_validate(dict(request.config))
@@ -290,168 +437,46 @@ class MordredDescriptorGatePlugin:
             ) from error
 
         names = tuple(window.descriptor for window in config.windows)
-        calculator, _ = self._resolve(names)
+        # Resolved in the parent as well, so an unknown descriptor name stops
+        # the stage before a shard is scheduled rather than in every worker.
+        _resolve(names)
 
         stage_input = require_single_input(request.inputs, contract_id=PARENT_V1.id)
-        context.staging_root.mkdir(parents=True, exist_ok=True)
-        for relative in (_PARENT_PATH, _DECISION_PATH):
-            destination = context.staging_root / relative
-            if destination.exists() or destination.is_symlink():
-                raise PluginError(
-                    f"mordred-gate output already exists: {relative.as_posix()}",
-                    code="PLUGIN_STAGING_NOT_EMPTY",
-                )
-            destination.parent.mkdir(parents=True, exist_ok=True)
-
-        try:
-            mordred_version = package_version("mordredcommunity")
-        except PackageNotFoundError:  # pragma: no cover - the original package
-            mordred_version = package_version("mordred")
-
-        policy = config.model_dump(mode="json")
-        policy.pop("batch_size", None)
-        policy_id = "mordred-gate-policy:sha256:" + canonical_sha256(
-            {
-                "backend": "mordred",
-                "backend_version": mordred_version,
-                # Mordred delegates molecule handling to RDKit, so an RDKit
-                # upgrade can move these numbers even when Mordred does not.
-                "rdkit_version": rdBase.rdkitVersion,
-                "policy": policy,
-            }
+        mordred_version = _mordred_version()
+        policy_id = _policy_id(
+            config, backend_version=mordred_version, rdkit_version=rdBase.rdkitVersion
         )
 
-        parent_destination = context.staging_root / _PARENT_PATH
-        decision_destination = context.staging_root / _DECISION_PATH
-        input_count = 0
-        passed_count = 0
-        decision_count = 0
-        try:
-            with pq.ParquetWriter(
-                parent_destination, PARENT_V1.schema, compression="zstd"
-            ) as parents, pq.ParquetWriter(
-                decision_destination,
-                DECISION_V1.schema,
-                compression="zstd",
-            ) as decisions:
-                for batch in iter_contract_batches(
-                    stage_input,
-                    PARENT_V1,
-                    batch_size=config.batch_size,
-                ):
-                    passed: list[dict[str, Any]] = []
-                    decision_rows: list[dict[str, Any]] = []
-                    for row in batch.to_pylist():
-                        input_count += 1
-                        parent_id = row.get("parent_id")
-                        smiles = row.get("parent_smiles")
-                        molecule = Chem.MolFromSmiles(smiles if isinstance(smiles, str) else "")
-                        if molecule is None:
-                            raise PluginError(
-                                "registered parent cannot be parsed by the Mordred gate",
-                                code="MORDRED_GATE_PARENT_INVALID",
-                                context={"parent_id": str(parent_id)},
-                            )
-                        computed = calculator(molecule).asdict()
-                        findings: list[tuple[str, str]] = []
-                        recorded: dict[str, float] = {}
-                        for window in config.windows:
-                            value = computed.get(window.descriptor)
-                            if isinstance(value, MissingValueBase):
-                                findings.append(
-                                    (
-                                        _reason_code(window.descriptor, _UNAVAILABLE_SUFFIX),
-                                        f"{window.descriptor} is undefined for this molecule "
-                                        f"({value!s}); it cannot be shown to satisfy the window",
-                                    )
-                                )
-                                continue
-                            number = float(value)
-                            if not math.isfinite(number):
-                                findings.append(
-                                    (
-                                        _reason_code(window.descriptor, _NON_FINITE_SUFFIX),
-                                        f"{window.descriptor} evaluated to {number!r}",
-                                    )
-                                )
-                                continue
-                            recorded[window.descriptor] = number
-                            if window.minimum is not None and number < window.minimum:
-                                findings.append(
-                                    (
-                                        _reason_code(window.descriptor, "BELOW_MIN"),
-                                        f"{window.descriptor}={number!r} is below "
-                                        f"{window.minimum!r}",
-                                    )
-                                )
-                            if window.maximum is not None and number > window.maximum:
-                                findings.append(
-                                    (
-                                        _reason_code(window.descriptor, "ABOVE_MAX"),
-                                        f"{window.descriptor}={number!r} is above "
-                                        f"{window.maximum!r}",
-                                    )
-                                )
-                        if findings:
-                            for reason_code, detail in findings:
-                                decision_rows.append(
-                                    {
-                                        "entity_id": parent_id,
-                                        "entity_kind": "PARENT",
-                                        "stage_id": request.stage_id,
-                                        "outcome": "REJECT",
-                                        "reason_code": reason_code,
-                                        "rule_id": policy_id,
-                                        "detail": detail,
-                                    }
-                                )
-                        else:
-                            passed.append(row)
-                            passed_count += 1
-                            decision_rows.append(
-                                {
-                                    "entity_id": parent_id,
-                                    "entity_kind": "PARENT",
-                                    "stage_id": request.stage_id,
-                                    "outcome": "PASS",
-                                    "reason_code": "MORDRED_WINDOW_PASS",
-                                    "rule_id": policy_id,
-                                    "detail": json.dumps(
-                                        recorded,
-                                        ensure_ascii=False,
-                                        allow_nan=False,
-                                        sort_keys=True,
-                                        separators=(",", ":"),
-                                    ),
-                                }
-                            )
-                        decision_count += max(1, len(findings))
-                    if passed:
-                        parents.write_table(
-                            pa.Table.from_pylist(passed, schema=PARENT_V1.schema)
-                        )
-                    decisions.write_table(
-                        pa.Table.from_pylist(decision_rows, schema=DECISION_V1.schema)
-                    )
-            if input_count == 0:
-                raise PluginError(
-                    "mordred-gate input contains no parents",
-                    code="MORDRED_GATE_EMPTY_INPUT",
-                )
-        except BaseException:
-            parent_destination.unlink(missing_ok=True)
-            decision_destination.unlink(missing_ok=True)
-            raise
+        result = shard_stage(
+            worker=_run_shard,
+            stage_input=stage_input,
+            contract=PARENT_V1,
+            output_paths={
+                "primary": _PARENT_PATH.as_posix(),
+                "decisions": _DECISION_PATH.as_posix(),
+            },
+            context=context,
+            stage_id=request.stage_id,
+            config=config.model_dump(mode="json"),
+        )
+        input_count = result.rows_in
+        if input_count == 0:
+            raise PluginError(
+                "mordred-gate input contains no parents",
+                code="MORDRED_GATE_EMPTY_INPUT",
+            )
+        passed_count = result.rows_out.get("primary", 0)
+        decision_count = result.rows_out.get("decisions", 0)
         return StageResponse(
             outputs={
                 "primary": PendingOutput(
                     PARENT_V1.id,
-                    (_PARENT_PATH.as_posix(),),
+                    result.file_paths["primary"],
                     {"row_count": passed_count},
                 ),
                 "decisions": PendingOutput(
                     DECISION_V1.id,
-                    (_DECISION_PATH.as_posix(),),
+                    result.file_paths["decisions"],
                     {"row_count": decision_count, "policy_id": policy_id},
                 ),
             },
@@ -465,6 +490,7 @@ class MordredDescriptorGatePlugin:
                 "backend_version": mordred_version,
                 "rdkit_version": rdBase.rdkitVersion,
                 "descriptors": list(names),
+                **result.response_metadata(),
             },
         )
 

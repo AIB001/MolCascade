@@ -57,6 +57,7 @@ import os
 import stat
 from dataclasses import dataclass
 from enum import StrEnum
+from functools import cache
 from pathlib import Path
 from typing import Any
 
@@ -66,11 +67,13 @@ from pydantic import Field, ValidationError, field_validator
 
 from molcascade.assets import is_asset_reference, resolve_reference
 from molcascade.chemistry.alerts import parse_for_alert_matching
-from molcascade.chemistry.datasets import iter_contract_batches, require_single_input
+from molcascade.chemistry.datasets import require_single_input
+from molcascade.chemistry.sharding import shard_stage
 from molcascade.config.canonical import canonical_sha256
 from molcascade.config.models import StrictFrozenModel
 from molcascade.contracts import DECISION_V1, PARENT_V1
 from molcascade.errors import AssetError, PluginError
+from molcascade.parallel import ShardOutcome, ShardTask, iter_shard_batches
 from molcascade.plugins.api import PendingOutput, StageContext, StageRequest, StageResponse
 from molcascade.plugins.manifest import (
     Cardinality,
@@ -188,27 +191,9 @@ def _validated_config(request: StageRequest) -> RdFiltersAlertConfig:
         ) from error
 
 
-def _prepare_outputs(context: StageContext) -> tuple[Path, Path]:
-    context.staging_root.mkdir(parents=True, exist_ok=True)
-    destinations = (
-        context.staging_root / _PARENT_PATH,
-        context.staging_root / _DECISION_PATH,
-    )
-    for relative, destination in zip((_PARENT_PATH, _DECISION_PATH), destinations, strict=True):
-        if destination.exists() or destination.is_symlink():
-            raise PluginError(
-                f"rd_filters alert output already exists: {relative.as_posix()}",
-                code="PLUGIN_STAGING_NOT_EMPTY",
-                context={"path": relative.as_posix()},
-            )
-        destination.parent.mkdir(parents=True, exist_ok=True)
-    return destinations
-
-
-def _read_alert_bytes(config: RdFiltersAlertConfig) -> tuple[Path, bytes, str]:
+def _read_alert_bytes(configured: str, expected_sha256: str | None) -> tuple[Path, bytes, str]:
     """Read the alert table as a regular file and hash exactly those bytes."""
 
-    configured = config.alerts_path
     if is_asset_reference(configured):
         try:
             path = resolve_reference(configured)
@@ -270,13 +255,13 @@ def _read_alert_bytes(config: RdFiltersAlertConfig) -> tuple[Path, bytes, str]:
             os.close(descriptor)
 
     digest = hashlib.sha256(payload).hexdigest()
-    if config.expected_alerts_sha256 is not None and digest != config.expected_alerts_sha256:
+    if expected_sha256 is not None and digest != expected_sha256:
         raise PluginError(
             "rd_filters alert file does not match its pinned digest",
             code="RD_FILTERS_ALERTS_DIGEST_MISMATCH",
             context={
                 "alerts_path": str(path),
-                "expected_sha256": config.expected_alerts_sha256,
+                "expected_sha256": expected_sha256,
                 "observed_sha256": digest,
             },
         )
@@ -406,6 +391,199 @@ def _reason_code(rule_set: str, description: str) -> str:
     return f"RD_FILTERS_ALERT_{rule_set.upper()}_{digest}"
 
 
+@cache
+def _prepared(
+    alerts_path: str, expected_sha256: str | None, enabled: tuple[str, ...]
+) -> tuple[Path, str, dict[str, _Rule], dict[str, int], Any]:
+    """Read, hash, parse and compile the alert table once per worker process.
+
+    1,251 SMARTS compiled per shard would cost more than matching them.  The key
+    is the pinned digest as well as the path, so a re-pinned table can never be
+    served from a memo built on the previous bytes.
+    """
+
+    path, payload, digest = _read_alert_bytes(alerts_path, expected_sha256)
+    rules, sizes = _parse_rules(payload)
+    return path, digest, rules, sizes, _compile_catalog(rules, frozenset(enabled))
+
+
+def _enabled_sets(config: RdFiltersAlertConfig) -> tuple[str, ...]:
+    actions = config.actions()
+    return tuple(
+        sorted(name for name, action in actions.items() if action is not AlertAction.IGNORE)
+    )
+
+
+def _policy_id(
+    config: RdFiltersAlertConfig,
+    *,
+    rdkit_version: str,
+    alerts_digest: str,
+    applied_sizes: dict[str, int],
+) -> str:
+    actions = config.actions()
+    return "rd-filters-alert-policy:sha256:" + canonical_sha256(
+        {
+            "backend": "rd_filters",
+            "backend_version": f"rdkit {rdkit_version}",
+            "alerts_sha256": alerts_digest,
+            "rule_set_actions": {name: actions[name].value for name in RULE_SETS},
+            "rule_counts": applied_sizes,
+            "semantics": "substructure-triage-alert-not-experimental-proof",
+        }
+    )
+
+
+def _run_shard(task: ShardTask) -> ShardOutcome:
+    """Match one contiguous range of parents against the compiled catalog."""
+
+    from rdkit import rdBase
+
+    config = RdFiltersAlertConfig.model_validate(dict(task.config))
+    actions = config.actions()
+    enabled = _enabled_sets(config)
+    _, alerts_digest, rules, catalog_sizes, catalog = _prepared(
+        config.alerts_path, config.expected_alerts_sha256, enabled
+    )
+    applied_sizes = {name: catalog_sizes.get(name, 0) for name in enabled}
+    policy_id = _policy_id(
+        config,
+        rdkit_version=rdBase.rdkitVersion,
+        alerts_digest=alerts_digest,
+        applied_sizes=applied_sizes,
+    )
+
+    input_count = 0
+    retained_count = 0
+    rejected_count = 0
+    warning_decision_count = 0
+    reject_decision_count = 0
+    decision_count = 0
+    with (
+        pq.ParquetWriter(
+            task.output_paths["primary"], PARENT_V1.schema, compression="zstd"
+        ) as parent_writer,
+        pq.ParquetWriter(
+            task.output_paths["decisions"], DECISION_V1.schema, compression="zstd"
+        ) as decision_writer,
+    ):
+        decision_rows: list[dict[str, Any]] = []
+
+        def flush_decisions() -> None:
+            if decision_rows:
+                decision_writer.write_table(
+                    pa.Table.from_pylist(decision_rows, schema=DECISION_V1.schema)
+                )
+                decision_rows.clear()
+
+        for batch in iter_shard_batches(task, batch_size=config.batch_size):
+            retained_rows: list[dict[str, Any]] = []
+            for row in batch.to_pylist():
+                input_count += 1
+                parent_id = row.get("parent_id")
+                smiles = row.get("parent_smiles")
+                molecule = parse_for_alert_matching(smiles)
+                if molecule is None:
+                    raise PluginError(
+                        "registered parent cannot be parsed by RDKit",
+                        code="RD_FILTERS_ALERTS_PARENT_INVALID",
+                        context={"parent_id": str(parent_id)},
+                    )
+                try:
+                    matched_ids = [
+                        str(entry.GetDescription()) for entry in catalog.GetMatches(molecule)
+                    ]
+                except (RuntimeError, ValueError) as error:
+                    raise PluginError(
+                        "rd_filters alert matching failed",
+                        code="RD_FILTERS_ALERTS_MATCH_FAILED",
+                        context={"parent_id": str(parent_id)},
+                    ) from error
+
+                # Sorted by (set, description) so the decision rows for a
+                # molecule are in the same order on every run and on every
+                # machine.
+                findings = sorted(
+                    {
+                        (rules[rule_id].rule_set, rules[rule_id].description)
+                        for rule_id in matched_ids
+                        if rule_id in rules
+                    }
+                )
+                rejected = any(
+                    actions[rule_set] is AlertAction.REJECT for rule_set, _ in findings
+                )
+                if rejected:
+                    rejected_count += 1
+                else:
+                    retained_count += 1
+                    retained_rows.append(row)
+
+                if not findings:
+                    decision_rows.append(
+                        {
+                            "entity_id": parent_id,
+                            "entity_kind": "PARENT",
+                            "stage_id": task.stage_id,
+                            "outcome": "PASS",
+                            "reason_code": "RD_FILTERS_ALERTS_CLEAR",
+                            "rule_id": policy_id,
+                            "detail": "No match in any enabled rd_filters alert set.",
+                        }
+                    )
+                    decision_count += 1
+                else:
+                    for rule_set, description in findings:
+                        action = actions[rule_set]
+                        if action is AlertAction.WARN:
+                            warning_decision_count += 1
+                        else:
+                            reject_decision_count += 1
+                        decision_rows.append(
+                            {
+                                "entity_id": parent_id,
+                                "entity_kind": "PARENT",
+                                "stage_id": task.stage_id,
+                                "outcome": action.value.upper(),
+                                "reason_code": _reason_code(rule_set, description),
+                                "rule_id": policy_id,
+                                "detail": json.dumps(
+                                    {
+                                        "action": action.value,
+                                        "alert": description,
+                                        "collection": "rd_filters",
+                                        "interpretation": (
+                                            "substructure triage flag; not "
+                                            "experimental proof"
+                                        ),
+                                        "rule_set": rule_set,
+                                    },
+                                    ensure_ascii=True,
+                                    allow_nan=False,
+                                    sort_keys=True,
+                                    separators=(",", ":"),
+                                ),
+                            }
+                        )
+                        decision_count += 1
+                if len(decision_rows) >= config.decision_buffer_size:
+                    flush_decisions()
+            if retained_rows:
+                parent_writer.write_table(
+                    pa.Table.from_pylist(retained_rows, schema=PARENT_V1.schema)
+                )
+        flush_decisions()
+    return ShardOutcome(
+        rows_in=input_count,
+        rows_out={"primary": retained_count, "decisions": decision_count},
+        metadata={
+            "reject_count": rejected_count,
+            "warning_decision_count": warning_decision_count,
+            "reject_decision_count": reject_decision_count,
+        },
+    )
+
+
 class RdFiltersAlertsPlugin:
     """Apply the eight rd_filters alert sets with per-set actions."""
 
@@ -432,14 +610,15 @@ class RdFiltersAlertsPlugin:
 
         config = _validated_config(request)
         stage_input = require_single_input(request.inputs, contract_id=PARENT_V1.id)
-        parent_destination, decision_destination = _prepare_outputs(context)
 
-        actions = config.actions()
-        enabled = frozenset(
-            name for name, action in actions.items() if action is not AlertAction.IGNORE
+        enabled = _enabled_sets(config)
+        # Read, hashed, parsed and compiled in the parent as well, so a missing
+        # asset or an unparseable alert table stops the stage before a shard is
+        # scheduled rather than in every worker at once.  The memo makes the
+        # inline single-shard path pay for this exactly once.
+        alerts_path, alerts_digest, _, catalog_sizes, _ = _prepared(
+            config.alerts_path, config.expected_alerts_sha256, enabled
         )
-        alerts_path, payload, alerts_digest = _read_alert_bytes(config)
-        rules, catalog_sizes = _parse_rules(payload)
 
         unknown = sorted(set(catalog_sizes) - set(RULE_SETS))
         if unknown:
@@ -458,164 +637,48 @@ class RdFiltersAlertsPlugin:
                 hint="Enable at least one set, or remove the stage from the cascade.",
             )
 
-        catalog = _compile_catalog(rules, enabled)
-        applied_sizes = {name: catalog_sizes.get(name, 0) for name in sorted(enabled)}
+        applied_sizes = {name: catalog_sizes.get(name, 0) for name in enabled}
+        policy_id = _policy_id(
+            config,
+            rdkit_version=rdBase.rdkitVersion,
+            alerts_digest=alerts_digest,
+            applied_sizes=applied_sizes,
+        )
 
-        policy_payload = {
-            "backend": "rd_filters",
-            "backend_version": f"rdkit {rdBase.rdkitVersion}",
-            "alerts_sha256": alerts_digest,
-            "rule_set_actions": {name: actions[name].value for name in RULE_SETS},
-            "rule_counts": applied_sizes,
-            "semantics": "substructure-triage-alert-not-experimental-proof",
-        }
-        policy_id = "rd-filters-alert-policy:sha256:" + canonical_sha256(policy_payload)
-
-        input_count = 0
-        retained_count = 0
-        rejected_count = 0
-        warning_decision_count = 0
-        reject_decision_count = 0
-        decision_count = 0
-
-        try:
-            with pq.ParquetWriter(
-                parent_destination, PARENT_V1.schema, compression="zstd"
-            ) as parent_writer, pq.ParquetWriter(
-                decision_destination, DECISION_V1.schema, compression="zstd"
-            ) as decision_writer:
-                decision_rows: list[dict[str, Any]] = []
-
-                def flush_decisions() -> None:
-                    if decision_rows:
-                        decision_writer.write_table(
-                            pa.Table.from_pylist(decision_rows, schema=DECISION_V1.schema)
-                        )
-                        decision_rows.clear()
-
-                for batch in iter_contract_batches(
-                    stage_input, PARENT_V1, batch_size=config.batch_size
-                ):
-                    retained_rows: list[dict[str, Any]] = []
-                    for row in batch.to_pylist():
-                        input_count += 1
-                        parent_id = row.get("parent_id")
-                        smiles = row.get("parent_smiles")
-                        molecule = parse_for_alert_matching(smiles)
-                        if molecule is None:
-                            raise PluginError(
-                                "registered parent cannot be parsed by RDKit",
-                                code="RD_FILTERS_ALERTS_PARENT_INVALID",
-                                context={"parent_id": str(parent_id)},
-                            )
-                        try:
-                            matched_ids = [
-                                str(entry.GetDescription())
-                                for entry in catalog.GetMatches(molecule)
-                            ]
-                        except (RuntimeError, ValueError) as error:
-                            raise PluginError(
-                                "rd_filters alert matching failed",
-                                code="RD_FILTERS_ALERTS_MATCH_FAILED",
-                                context={"parent_id": str(parent_id)},
-                            ) from error
-
-                        # Sorted by (set, description) so the decision rows
-                        # for a molecule are in the same order on every run
-                        # and on every machine.
-                        findings = sorted(
-                            {
-                                (rules[rule_id].rule_set, rules[rule_id].description)
-                                for rule_id in matched_ids
-                                if rule_id in rules
-                            }
-                        )
-                        rejected = any(
-                            actions[rule_set] is AlertAction.REJECT
-                            for rule_set, _ in findings
-                        )
-                        if rejected:
-                            rejected_count += 1
-                        else:
-                            retained_count += 1
-                            retained_rows.append(row)
-
-                        if not findings:
-                            decision_rows.append(
-                                {
-                                    "entity_id": parent_id,
-                                    "entity_kind": "PARENT",
-                                    "stage_id": request.stage_id,
-                                    "outcome": "PASS",
-                                    "reason_code": "RD_FILTERS_ALERTS_CLEAR",
-                                    "rule_id": policy_id,
-                                    "detail": (
-                                        "No match in any enabled rd_filters alert set."
-                                    ),
-                                }
-                            )
-                            decision_count += 1
-                        else:
-                            for rule_set, description in findings:
-                                action = actions[rule_set]
-                                if action is AlertAction.WARN:
-                                    warning_decision_count += 1
-                                else:
-                                    reject_decision_count += 1
-                                decision_rows.append(
-                                    {
-                                        "entity_id": parent_id,
-                                        "entity_kind": "PARENT",
-                                        "stage_id": request.stage_id,
-                                        "outcome": action.value.upper(),
-                                        "reason_code": _reason_code(rule_set, description),
-                                        "rule_id": policy_id,
-                                        "detail": json.dumps(
-                                            {
-                                                "action": action.value,
-                                                "alert": description,
-                                                "collection": "rd_filters",
-                                                "interpretation": (
-                                                    "substructure triage flag; not "
-                                                    "experimental proof"
-                                                ),
-                                                "rule_set": rule_set,
-                                            },
-                                            ensure_ascii=True,
-                                            allow_nan=False,
-                                            sort_keys=True,
-                                            separators=(",", ":"),
-                                        ),
-                                    }
-                                )
-                                decision_count += 1
-                        if len(decision_rows) >= config.decision_buffer_size:
-                            flush_decisions()
-                    if retained_rows:
-                        parent_writer.write_table(
-                            pa.Table.from_pylist(retained_rows, schema=PARENT_V1.schema)
-                        )
-                flush_decisions()
-            if input_count == 0:
-                raise PluginError(
-                    "rd_filters alert input contains no parents",
-                    code="RD_FILTERS_ALERTS_EMPTY_INPUT",
-                )
-        except BaseException:
-            parent_destination.unlink(missing_ok=True)
-            decision_destination.unlink(missing_ok=True)
-            raise
+        result = shard_stage(
+            worker=_run_shard,
+            stage_input=stage_input,
+            contract=PARENT_V1,
+            output_paths={
+                "primary": _PARENT_PATH.as_posix(),
+                "decisions": _DECISION_PATH.as_posix(),
+            },
+            context=context,
+            stage_id=request.stage_id,
+            config=config.model_dump(mode="json"),
+        )
+        input_count = result.rows_in
+        if input_count == 0:
+            raise PluginError(
+                "rd_filters alert input contains no parents",
+                code="RD_FILTERS_ALERTS_EMPTY_INPUT",
+            )
+        retained_count = result.rows_out.get("primary", 0)
+        decision_count = result.rows_out.get("decisions", 0)
+        rejected_count = result.total("reject_count")
+        warning_decision_count = result.total("warning_decision_count")
+        reject_decision_count = result.total("reject_decision_count")
 
         return StageResponse(
             outputs={
                 "primary": PendingOutput(
                     PARENT_V1.id,
-                    (_PARENT_PATH.as_posix(),),
+                    result.file_paths["primary"],
                     {"row_count": retained_count},
                 ),
                 "decisions": PendingOutput(
                     DECISION_V1.id,
-                    (_DECISION_PATH.as_posix(),),
+                    result.file_paths["decisions"],
                     {"row_count": decision_count, "policy_id": policy_id},
                 ),
             },
@@ -633,6 +696,7 @@ class RdFiltersAlertsPlugin:
                 "alerts_sha256": alerts_digest,
                 "backend": "rd_filters",
                 "backend_version": f"rdkit {rdBase.rdkitVersion}",
+                **result.response_metadata(),
             },
         )
 

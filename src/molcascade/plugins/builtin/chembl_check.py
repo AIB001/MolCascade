@@ -38,11 +38,13 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from pydantic import Field, ValidationError
 
-from molcascade.chemistry.datasets import iter_contract_batches, require_single_input
+from molcascade.chemistry.datasets import require_single_input
+from molcascade.chemistry.sharding import shard_stage
 from molcascade.config.canonical import canonical_sha256
 from molcascade.config.models import StrictFrozenModel
 from molcascade.contracts import DECISION_V1, PARENT_V1
 from molcascade.errors import PluginError
+from molcascade.parallel import ShardOutcome, ShardTask, iter_shard_batches
 from molcascade.plugins.api import PendingOutput, StageContext, StageRequest, StageResponse
 from molcascade.plugins.manifest import (
     Cardinality,
@@ -73,6 +75,162 @@ class ChemblStructureCheckConfig(StrictFrozenModel):
     record_advisories: bool = True
 
 
+def _backend() -> tuple[Any, Any]:
+    """Import the checker, or say which distribution is missing.
+
+    Called in the parent *and* in every worker: the parent so a missing backend
+    stops the stage before a shard is scheduled, the worker because a spawned
+    process inherits no imports from the one that planned the work.
+    """
+
+    try:
+        import chembl_structure_pipeline
+        from chembl_structure_pipeline import checker
+    except ImportError as error:  # pragma: no cover - exercised by availability probe
+        raise PluginError(
+            "the ChEMBL Structure Pipeline checker is not installed",
+            code="CHEMBL_CHECK_BACKEND_MISSING",
+            context={"distribution": "chembl-structure-pipeline"},
+        ) from error
+    return chembl_structure_pipeline, checker
+
+
+def _policy_id(
+    config: ChemblStructureCheckConfig, *, backend_version: str, rdkit_version: str
+) -> str:
+    """Identity of the verdict: the thresholds *and* what computed them."""
+
+    policy = config.model_dump(mode="json")
+    policy.pop("batch_size", None)
+    # The InChI verdicts come out of RDKit's bundled InChI build, so the
+    # RDKit version is part of what produced this answer, not background.
+    return "chembl-structure-check-policy:sha256:" + canonical_sha256(
+        {
+            "backend": "chembl_structure_pipeline",
+            "backend_version": backend_version,
+            "rdkit_version": rdkit_version,
+            "policy": policy,
+        }
+    )
+
+
+def _run_shard(task: ShardTask) -> ShardOutcome:
+    """Check one contiguous range of parents in whichever process owns it."""
+
+    from rdkit import Chem, rdBase
+
+    chembl_structure_pipeline, checker = _backend()
+    config = ChemblStructureCheckConfig.model_validate(dict(task.config))
+    backend_version = str(getattr(chembl_structure_pipeline, "__version__", "unknown"))
+    policy_id = _policy_id(
+        config, backend_version=backend_version, rdkit_version=rdBase.rdkitVersion
+    )
+
+    input_count = 0
+    passed_count = 0
+    decision_count = 0
+    advisory_count = 0
+    with (
+        pq.ParquetWriter(
+            task.output_paths["primary"], PARENT_V1.schema, compression="zstd"
+        ) as parents,
+        pq.ParquetWriter(
+            task.output_paths["decisions"], DECISION_V1.schema, compression="zstd"
+        ) as decisions,
+    ):
+        for batch in iter_shard_batches(task, batch_size=config.batch_size):
+            passed: list[dict[str, Any]] = []
+            decision_rows: list[dict[str, Any]] = []
+            for row in batch.to_pylist():
+                input_count += 1
+                parent_id = row.get("parent_id")
+                smiles = row.get("parent_smiles")
+                molecule = Chem.MolFromSmiles(smiles if isinstance(smiles, str) else "")
+                if molecule is None:
+                    raise PluginError(
+                        "registered parent cannot be parsed by the ChEMBL check",
+                        code="CHEMBL_CHECK_PARENT_INVALID",
+                        context={"parent_id": str(parent_id)},
+                    )
+                try:
+                    # No conformer on the molecule means RDKit lays out a 2D
+                    # depiction here, which is what the geometry checks need in
+                    # order to be fair.
+                    molblock = Chem.MolToMolBlock(molecule)
+                except Exception as error:
+                    raise PluginError(
+                        "registered parent could not be written as a mol block",
+                        code="CHEMBL_CHECK_MOLBLOCK_FAILED",
+                        context={
+                            "parent_id": str(parent_id),
+                            "error": type(error).__name__,
+                        },
+                    ) from error
+
+                findings = tuple(checker.check_molblock(molblock))
+                # check_molblock sorts worst-first; taking the max explicitly
+                # says so rather than relying on it.
+                severity = max((int(p) for p, _ in findings), default=0)
+                detail = json.dumps(
+                    {
+                        "max_penalty": severity,
+                        "findings": [
+                            {"penalty": int(p), "issue": str(e)} for p, e in findings
+                        ],
+                    },
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+
+                if severity >= config.reject_at_penalty:
+                    decision_rows.append(
+                        {
+                            "entity_id": parent_id,
+                            "entity_kind": "PARENT",
+                            "stage_id": task.stage_id,
+                            "outcome": "REJECT",
+                            "reason_code": f"CHEMBL_STRUCTURE_PENALTY_{severity}",
+                            "rule_id": policy_id,
+                            "detail": detail,
+                        }
+                    )
+                else:
+                    if findings:
+                        advisory_count += 1
+                    passed.append(row)
+                    passed_count += 1
+                    decision_rows.append(
+                        {
+                            "entity_id": parent_id,
+                            "entity_kind": "PARENT",
+                            "stage_id": task.stage_id,
+                            "outcome": "PASS",
+                            "reason_code": "CHEMBL_STRUCTURE_CHECK_PASS",
+                            "rule_id": policy_id,
+                            "detail": (
+                                detail
+                                if config.record_advisories
+                                else json.dumps(
+                                    {"max_penalty": severity}, separators=(",", ":")
+                                )
+                            ),
+                        }
+                    )
+                decision_count += 1
+            if passed:
+                parents.write_table(pa.Table.from_pylist(passed, schema=PARENT_V1.schema))
+            decisions.write_table(
+                pa.Table.from_pylist(decision_rows, schema=DECISION_V1.schema)
+            )
+    return ShardOutcome(
+        rows_in=input_count,
+        rows_out={"primary": passed_count, "decisions": decision_count},
+        metadata={"advisory_count": advisory_count},
+    )
+
+
 class ChemblStructureCheckPlugin:
     descriptor = PluginDescriptor(
         id="chemistry.chembl_structure_check",
@@ -92,17 +250,9 @@ class ChemblStructureCheckPlugin:
     config_model = ChemblStructureCheckConfig
 
     def execute(self, request: StageRequest, context: StageContext) -> StageResponse:
-        from rdkit import Chem, rdBase
+        from rdkit import rdBase
 
-        try:
-            import chembl_structure_pipeline
-            from chembl_structure_pipeline import checker
-        except ImportError as error:  # pragma: no cover - exercised by availability probe
-            raise PluginError(
-                "the ChEMBL Structure Pipeline checker is not installed",
-                code="CHEMBL_CHECK_BACKEND_MISSING",
-                context={"distribution": "chembl-structure-pipeline"},
-            ) from error
+        chembl_structure_pipeline, _ = _backend()
 
         try:
             config = self.config_model.model_validate(dict(request.config))
@@ -114,157 +264,43 @@ class ChemblStructureCheckPlugin:
             ) from error
 
         stage_input = require_single_input(request.inputs, contract_id=PARENT_V1.id)
-        context.staging_root.mkdir(parents=True, exist_ok=True)
-        for relative in (_PARENT_PATH, _DECISION_PATH):
-            destination = context.staging_root / relative
-            if destination.exists() or destination.is_symlink():
-                raise PluginError(
-                    f"ChEMBL check output already exists: {relative.as_posix()}",
-                    code="PLUGIN_STAGING_NOT_EMPTY",
-                )
-            destination.parent.mkdir(parents=True, exist_ok=True)
-
         backend_version = str(getattr(chembl_structure_pipeline, "__version__", "unknown"))
-        policy = config.model_dump(mode="json")
-        policy.pop("batch_size", None)
-        # The InChI verdicts come out of RDKit's bundled InChI build, so the
-        # RDKit version is part of what produced this answer, not background.
-        policy_id = "chembl-structure-check-policy:sha256:" + canonical_sha256(
-            {
-                "backend": "chembl_structure_pipeline",
-                "backend_version": backend_version,
-                "rdkit_version": rdBase.rdkitVersion,
-                "policy": policy,
-            }
+        policy_id = _policy_id(
+            config, backend_version=backend_version, rdkit_version=rdBase.rdkitVersion
         )
 
-        parent_destination = context.staging_root / _PARENT_PATH
-        decision_destination = context.staging_root / _DECISION_PATH
-        input_count = 0
-        passed_count = 0
-        decision_count = 0
-        advisory_count = 0
-
-        try:
-            with pq.ParquetWriter(
-                parent_destination, PARENT_V1.schema, compression="zstd"
-            ) as parents, pq.ParquetWriter(
-                decision_destination, DECISION_V1.schema, compression="zstd"
-            ) as decisions:
-                for batch in iter_contract_batches(
-                    stage_input, PARENT_V1, batch_size=config.batch_size
-                ):
-                    passed: list[dict[str, Any]] = []
-                    decision_rows: list[dict[str, Any]] = []
-                    for row in batch.to_pylist():
-                        input_count += 1
-                        parent_id = row.get("parent_id")
-                        smiles = row.get("parent_smiles")
-                        molecule = Chem.MolFromSmiles(
-                            smiles if isinstance(smiles, str) else ""
-                        )
-                        if molecule is None:
-                            raise PluginError(
-                                "registered parent cannot be parsed by the ChEMBL check",
-                                code="CHEMBL_CHECK_PARENT_INVALID",
-                                context={"parent_id": str(parent_id)},
-                            )
-                        try:
-                            # No conformer on the molecule means RDKit lays
-                            # out a 2D depiction here, which is what the
-                            # geometry checks need in order to be fair.
-                            molblock = Chem.MolToMolBlock(molecule)
-                        except Exception as error:
-                            raise PluginError(
-                                "registered parent could not be written as a mol block",
-                                code="CHEMBL_CHECK_MOLBLOCK_FAILED",
-                                context={
-                                    "parent_id": str(parent_id),
-                                    "error": type(error).__name__,
-                                },
-                            ) from error
-
-                        findings = tuple(checker.check_molblock(molblock))
-                        # check_molblock sorts worst-first; taking the max
-                        # explicitly says so rather than relying on it.
-                        severity = max((int(p) for p, _ in findings), default=0)
-                        detail = json.dumps(
-                            {
-                                "max_penalty": severity,
-                                "findings": [
-                                    {"penalty": int(p), "issue": str(e)}
-                                    for p, e in findings
-                                ],
-                            },
-                            ensure_ascii=False,
-                            allow_nan=False,
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        )
-
-                        if severity >= config.reject_at_penalty:
-                            decision_rows.append(
-                                {
-                                    "entity_id": parent_id,
-                                    "entity_kind": "PARENT",
-                                    "stage_id": request.stage_id,
-                                    "outcome": "REJECT",
-                                    "reason_code": f"CHEMBL_STRUCTURE_PENALTY_{severity}",
-                                    "rule_id": policy_id,
-                                    "detail": detail,
-                                }
-                            )
-                        else:
-                            if findings:
-                                advisory_count += 1
-                            passed.append(row)
-                            passed_count += 1
-                            decision_rows.append(
-                                {
-                                    "entity_id": parent_id,
-                                    "entity_kind": "PARENT",
-                                    "stage_id": request.stage_id,
-                                    "outcome": "PASS",
-                                    "reason_code": "CHEMBL_STRUCTURE_CHECK_PASS",
-                                    "rule_id": policy_id,
-                                    "detail": (
-                                        detail
-                                        if config.record_advisories
-                                        else json.dumps(
-                                            {"max_penalty": severity},
-                                            separators=(",", ":"),
-                                        )
-                                    ),
-                                }
-                            )
-                        decision_count += 1
-                    if passed:
-                        parents.write_table(
-                            pa.Table.from_pylist(passed, schema=PARENT_V1.schema)
-                        )
-                    decisions.write_table(
-                        pa.Table.from_pylist(decision_rows, schema=DECISION_V1.schema)
-                    )
-            if input_count == 0:
-                raise PluginError(
-                    "ChEMBL structure check input contains no parents",
-                    code="CHEMBL_CHECK_EMPTY_INPUT",
-                )
-        except BaseException:
-            parent_destination.unlink(missing_ok=True)
-            decision_destination.unlink(missing_ok=True)
-            raise
+        result = shard_stage(
+            worker=_run_shard,
+            stage_input=stage_input,
+            contract=PARENT_V1,
+            output_paths={
+                "primary": _PARENT_PATH.as_posix(),
+                "decisions": _DECISION_PATH.as_posix(),
+            },
+            context=context,
+            stage_id=request.stage_id,
+            config=config.model_dump(mode="json"),
+        )
+        input_count = result.rows_in
+        if input_count == 0:
+            raise PluginError(
+                "ChEMBL structure check input contains no parents",
+                code="CHEMBL_CHECK_EMPTY_INPUT",
+            )
+        passed_count = result.rows_out.get("primary", 0)
+        decision_count = result.rows_out.get("decisions", 0)
+        advisory_count = result.total("advisory_count")
 
         return StageResponse(
             outputs={
                 "primary": PendingOutput(
                     PARENT_V1.id,
-                    (_PARENT_PATH.as_posix(),),
+                    result.file_paths["primary"],
                     {"row_count": passed_count},
                 ),
                 "decisions": PendingOutput(
                     DECISION_V1.id,
-                    (_DECISION_PATH.as_posix(),),
+                    result.file_paths["decisions"],
                     {"row_count": decision_count, "policy_id": policy_id},
                 ),
             },
@@ -280,6 +316,7 @@ class ChemblStructureCheckPlugin:
                 "backend": "chembl_structure_pipeline",
                 "backend_version": backend_version,
                 "rdkit_version": rdBase.rdkitVersion,
+                **result.response_metadata(),
             },
         )
 

@@ -42,6 +42,7 @@ Reference:
 
 from __future__ import annotations
 
+from functools import cache
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -49,12 +50,15 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from pydantic import Field, ValidationError
 
-from molcascade.chemistry.datasets import iter_contract_batches, require_single_input
+from molcascade.chemistry.datasets import discover_contract_files, require_single_input
+from molcascade.chemistry.sharding import shard_stage
 from molcascade.config.canonical import canonical_sha256
 from molcascade.contracts import APPLICABILITY_V1, DECISION_V1, PARENT_V1
 from molcascade.errors import PluginError
+from molcascade.parallel import ShardOutcome, ShardTask, iter_shard_batches
 from molcascade.plugins.api import PendingOutput, StageContext, StageRequest, StageResponse
 from molcascade.plugins.builtin.similarity import (
+    _RUNTIME_KEY,
     ReferenceSimilarityConfig,
     SimilarityFailureAction,
     _load_reference_records,
@@ -118,18 +122,22 @@ class Fpsim2SimilarityConfig(ReferenceSimilarityConfig):
 
 def _build_index(
     directory: Path,
-    reference_rows: list[tuple[str, str, Any]],
+    reference_rows: list[tuple[str, str]],
     config: Fpsim2SimilarityConfig,
-) -> Any:
-    """Write the reference set out and return an in-memory FPSim2 engine.
+) -> Path:
+    """Write the reference set out and build the FPSim2 index file.
 
     The molecules written are the canonical SMILES this stage already parsed and
     validated, not the strings as supplied, so the index is built from exactly
     the structures that went into ``reference_set_id``.
+
+    Built once, in the parent: the index is a pure function of the reference set,
+    it costs more than the queries it saves below a thousand references, and
+    building it per shard would multiply that cost by the shard count.  Each
+    worker opens the finished file read-only.
     """
 
     try:
-        from FPSim2 import FPSim2Engine
         from FPSim2.io import create_db_file
     except ImportError as error:
         raise PluginError(
@@ -153,7 +161,7 @@ def _build_index(
     # sort in.  That is what makes "smallest mol_id among the tied" and
     # "lexicographically first reference id among the tied" the same rule.
     with smi_path.open("w", encoding="utf-8") as stream:
-        for index, (_, canonical, _) in enumerate(reference_rows, start=1):
+        for index, (_, canonical) in enumerate(reference_rows, start=1):
             stream.write(f"{canonical}\t{index}\n")
 
     try:
@@ -168,7 +176,6 @@ def _build_index(
                 "includeChirality": config.include_chirality,
             },
         )
-        return FPSim2Engine(str(index_path), in_memory_fps=True, fps_sort=True)
     except PluginError:
         raise
     except Exception as error:
@@ -177,12 +184,42 @@ def _build_index(
             code="FPSIM2_INDEX_BUILD_FAILED",
             context={"error_type": type(error).__name__, "error": str(error)[:500]},
         ) from error
+    return index_path
+
+
+@cache
+def _engine(index_path: str, reference_set_id: str) -> Any:
+    """Open the prebuilt index once per worker process.
+
+    ``in_memory_fps`` is what makes the popcount bound cheap, and it means each
+    worker holds its own copy of the fingerprints -- 64 MB for a quarter-million
+    2048-bit references, which is the price of the scan being parallel at all.
+    The reference-set identity is part of the memo key so a second stage in the
+    same process can never be served the first one's index.
+    """
+
+    try:
+        from FPSim2 import FPSim2Engine
+    except ImportError as error:
+        raise PluginError(
+            "FPSim2 is required for indexed reference similarity",
+            code="FPSIM2_BACKEND_MISSING",
+            hint="Install it with: pip install FPSim2",
+        ) from error
+    try:
+        return FPSim2Engine(index_path, in_memory_fps=True, fps_sort=True)
+    except Exception as error:
+        raise PluginError(
+            "could not open the FPSim2 reference index",
+            code="FPSIM2_INDEX_BUILD_FAILED",
+            context={"error_type": type(error).__name__, "error": str(error)[:500]},
+        ) from error
 
 
 def _nearest(
     engine: Any,
     molecule: Any,
-    reference_rows: list[tuple[str, str, Any]],
+    reference_rows: list[tuple[str, str]],
     config: Fpsim2SimilarityConfig,
 ) -> tuple[float, str | None]:
     """Maximum similarity and the reference that carries it, ties resolved."""
@@ -214,6 +251,116 @@ def _nearest(
             context={"position": position, "reference_count": len(reference_rows)},
         )
     return best, reference_rows[position - 1][0]
+
+
+def _run_shard(task: ShardTask) -> ShardOutcome:
+    """Query one contiguous range of parents against the prebuilt index."""
+
+    from rdkit import Chem
+
+    settings = dict(task.config)
+    runtime = dict(settings.pop(_RUNTIME_KEY))
+    config = Fpsim2SimilarityConfig.model_validate(settings)
+    reference_rows = [(str(entry[0]), str(entry[1])) for entry in runtime["references"]]
+    reference_set_id = str(runtime["reference_set_id"])
+    method_id = str(runtime["method_id"])
+    policy_id = str(runtime["policy_id"])
+    engine = _engine(str(runtime["index_path"]), reference_set_id)
+
+    input_count = 0
+    output_count = 0
+    reject_count = 0
+    warning_count = 0
+    decision_count = 0
+    with (
+        pq.ParquetWriter(
+            task.output_paths["primary"], PARENT_V1.schema, compression="zstd"
+        ) as parent_writer,
+        pq.ParquetWriter(
+            task.output_paths["applicability"], APPLICABILITY_V1.schema, compression="zstd"
+        ) as applicability_writer,
+        pq.ParquetWriter(
+            task.output_paths["decisions"], DECISION_V1.schema, compression="zstd"
+        ) as decision_writer,
+    ):
+        for batch in iter_shard_batches(task, batch_size=config.batch_size):
+            retained: list[dict[str, Any]] = []
+            applicability_rows: list[dict[str, Any]] = []
+            decision_rows: list[dict[str, Any]] = []
+            for row in batch.to_pylist():
+                input_count += 1
+                # Parsed here rather than handed to FPSim2 as a string: FPSim2
+                # would let RDKit's None escape as a Boost argument error naming
+                # a C++ signature, which is not a message anyone can act on.
+                molecule = Chem.MolFromSmiles(row["parent_smiles"])
+                if molecule is None:
+                    raise PluginError(
+                        "registered parent cannot be parsed for similarity",
+                        code="REFERENCE_SIMILARITY_PARENT_INVALID",
+                        context={"parent_id": str(row["parent_id"])},
+                    )
+                maximum, nearest_id = _nearest(engine, molecule, reference_rows, config)
+                in_domain = maximum >= config.domain_similarity_threshold
+                applicability_rows.append(
+                    {
+                        "parent_id": row["parent_id"],
+                        "model_id": reference_set_id,
+                        "method_id": method_id,
+                        "in_domain": in_domain,
+                        "raw_metric": maximum,
+                        "threshold": config.domain_similarity_threshold,
+                        "nearest_reference_id": nearest_id,
+                        "nearest_similarity": maximum,
+                    }
+                )
+                passes, reason, threshold = objective_outcome(config, maximum)
+                rejected = (
+                    not passes and config.failure_action is SimilarityFailureAction.REJECT
+                )
+                if not rejected:
+                    retained.append(row)
+                    output_count += 1
+                else:
+                    reject_count += 1
+                if not passes and not rejected:
+                    warning_count += 1
+                decision_rows.extend(
+                    similarity_decision_rows(
+                        parent_id=row["parent_id"],
+                        stage_id=task.stage_id,
+                        policy_id=policy_id,
+                        detail=similarity_detail(
+                            config,
+                            maximum=maximum,
+                            nearest_id=nearest_id,
+                            in_domain=in_domain,
+                            threshold=threshold,
+                        ),
+                        reason=reason,
+                        passes=passes,
+                        rejected=rejected,
+                    )
+                )
+            if retained:
+                parent_writer.write_table(
+                    pa.Table.from_pylist(retained, schema=PARENT_V1.schema)
+                )
+            applicability_writer.write_table(
+                pa.Table.from_pylist(applicability_rows, schema=APPLICABILITY_V1.schema)
+            )
+            decision_writer.write_table(
+                pa.Table.from_pylist(decision_rows, schema=DECISION_V1.schema)
+            )
+            decision_count += len(decision_rows)
+    return ShardOutcome(
+        rows_in=input_count,
+        rows_out={
+            "primary": output_count,
+            "applicability": input_count,
+            "decisions": decision_count,
+        },
+        metadata={"reject_count": reject_count, "warning_count": warning_count},
+    )
 
 
 class Fpsim2ReferenceSimilarityPlugin:
@@ -276,7 +423,10 @@ class Fpsim2ReferenceSimilarityPlugin:
                 },
             )
 
-        reference_rows: list[tuple[str, str, Any]] = []
+        # Parsed and canonicalised in the parent, like the exact backend: the
+        # index is built from these strings and the shards resolve tie-broken
+        # positions back through them, so both have to be the same list.
+        reference_rows: list[tuple[str, str]] = []
         seen_ids: set[str] = set()
         for record in records:
             if record.reference_id in seen_ids:
@@ -294,7 +444,7 @@ class Fpsim2ReferenceSimilarityPlugin:
                     context={"reference_id": record.reference_id},
                 )
             canonical = Chem.MolToSmiles(molecule, canonical=True, isomericSmiles=True)
-            reference_rows.append((record.reference_id, canonical, None))
+            reference_rows.append((record.reference_id, canonical))
         reference_rows.sort(key=lambda row: row[0])
 
         # Identical to the exact backend's, and deliberately so: the same
@@ -331,151 +481,78 @@ class Fpsim2ReferenceSimilarityPlugin:
             }
         )
 
-        destinations = tuple(
-            context.staging_root / relative
-            for relative in (_PARENT_PATH, _APPLICABILITY_PATH, _DECISION_PATH)
+        # The budget is settled from the Parquet footers before a molecule is
+        # read.  It stays a worst case -- the popcount bound skips most of the
+        # reference set -- but a guardrail that only fires halfway through the
+        # run is not a guardrail.
+        total_rows = sum(
+            pq.ParquetFile(path).metadata.num_rows
+            for path in discover_contract_files(stage_input, PARENT_V1)
         )
-        for relative, destination in zip(
-            (_PARENT_PATH, _APPLICABILITY_PATH, _DECISION_PATH), destinations, strict=True
-        ):
-            if destination.exists() or destination.is_symlink():
-                raise PluginError(
-                    "reference-similarity output already exists in staging",
-                    code="PLUGIN_STAGING_NOT_EMPTY",
-                    context={"path": relative.as_posix()},
-                )
-            destination.parent.mkdir(parents=True, exist_ok=True)
+        comparisons = total_rows * len(reference_rows)
+        if comparisons > config.max_total_comparisons:
+            raise PluginError(
+                "reference-similarity comparison budget exceeded",
+                code="REFERENCE_SIMILARITY_BUDGET_EXCEEDED",
+                hint=(
+                    "Reduce the candidate or reference count, or raise "
+                    "max_total_comparisons."
+                ),
+                context={
+                    "comparison_count": comparisons,
+                    "limit": config.max_total_comparisons,
+                },
+            )
 
-        parent_destination, applicability_destination, decision_destination = destinations
-        input_count = 0
-        output_count = 0
-        reject_count = 0
-        warning_count = 0
-        comparisons = 0
-        engine = _build_index(context.staging_root, reference_rows, config)
+        index_path = _build_index(context.staging_root, reference_rows, config)
         try:
-            with pq.ParquetWriter(
-                parent_destination, PARENT_V1.schema, compression="zstd"
-            ) as parent_writer, pq.ParquetWriter(
-                applicability_destination, APPLICABILITY_V1.schema, compression="zstd"
-            ) as applicability_writer, pq.ParquetWriter(
-                decision_destination, DECISION_V1.schema, compression="zstd"
-            ) as decision_writer:
-                for batch in iter_contract_batches(
-                    stage_input, PARENT_V1, batch_size=config.batch_size
-                ):
-                    retained: list[dict[str, Any]] = []
-                    applicability_rows: list[dict[str, Any]] = []
-                    decision_rows: list[dict[str, Any]] = []
-                    for row in batch.to_pylist():
-                        input_count += 1
-                        comparisons += len(reference_rows)
-                        if comparisons > config.max_total_comparisons:
-                            raise PluginError(
-                                "reference-similarity comparison budget exceeded",
-                                code="REFERENCE_SIMILARITY_BUDGET_EXCEEDED",
-                                hint=(
-                                    "Reduce the candidate or reference count, or "
-                                    "raise max_total_comparisons."
-                                ),
-                                context={
-                                    "comparison_count": comparisons,
-                                    "limit": config.max_total_comparisons,
-                                },
-                            )
-                        # Parsed here rather than handed to FPSim2 as a
-                        # string: FPSim2 would let RDKit's None escape as
-                        # a Boost argument error naming a C++ signature,
-                        # which is not a message anyone can act on.
-                        molecule = Chem.MolFromSmiles(row["parent_smiles"])
-                        if molecule is None:
-                            raise PluginError(
-                                "registered parent cannot be parsed for similarity",
-                                code="REFERENCE_SIMILARITY_PARENT_INVALID",
-                                context={"parent_id": str(row["parent_id"])},
-                            )
-                        maximum, nearest_id = _nearest(
-                            engine, molecule, reference_rows, config
-                        )
-                        in_domain = maximum >= config.domain_similarity_threshold
-                        applicability_rows.append(
-                            {
-                                "parent_id": row["parent_id"],
-                                "model_id": reference_set_id,
-                                "method_id": method_id,
-                                "in_domain": in_domain,
-                                "raw_metric": maximum,
-                                "threshold": config.domain_similarity_threshold,
-                                "nearest_reference_id": nearest_id,
-                                "nearest_similarity": maximum,
-                            }
-                        )
-                        passes, reason, threshold = objective_outcome(config, maximum)
-                        rejected = (
-                            not passes
-                            and config.failure_action is SimilarityFailureAction.REJECT
-                        )
-                        if not rejected:
-                            retained.append(row)
-                            output_count += 1
-                        else:
-                            reject_count += 1
-                        if not passes and not rejected:
-                            warning_count += 1
-                        decision_rows.extend(
-                            similarity_decision_rows(
-                                parent_id=row["parent_id"],
-                                stage_id=request.stage_id,
-                                policy_id=policy_id,
-                                detail=similarity_detail(
-                                    config,
-                                    maximum=maximum,
-                                    nearest_id=nearest_id,
-                                    in_domain=in_domain,
-                                    threshold=threshold,
-                                ),
-                                reason=reason,
-                                passes=passes,
-                                rejected=rejected,
-                            )
-                        )
-                    if retained:
-                        parent_writer.write_table(
-                            pa.Table.from_pylist(retained, schema=PARENT_V1.schema)
-                        )
-                    applicability_writer.write_table(
-                        pa.Table.from_pylist(
-                            applicability_rows, schema=APPLICABILITY_V1.schema
-                        )
-                    )
-                    decision_writer.write_table(
-                        pa.Table.from_pylist(
-                            decision_rows, schema=DECISION_V1.schema
-                        )
-                    )
-            if input_count == 0:
-                raise PluginError(
-                    "reference-similarity input contains no parents",
-                    code="REFERENCE_SIMILARITY_EMPTY_INPUT",
-                )
-        except BaseException:
-            for destination in destinations:
-                destination.unlink(missing_ok=True)
-            raise
+            result = shard_stage(
+                worker=_run_shard,
+                stage_input=stage_input,
+                contract=PARENT_V1,
+                output_paths={
+                    "primary": _PARENT_PATH.as_posix(),
+                    "applicability": _APPLICABILITY_PATH.as_posix(),
+                    "decisions": _DECISION_PATH.as_posix(),
+                },
+                context=context,
+                stage_id=request.stage_id,
+                config={
+                    **config.model_dump(mode="json"),
+                    _RUNTIME_KEY: {
+                        "references": [[row[0], row[1]] for row in reference_rows],
+                        "reference_set_id": reference_set_id,
+                        "method_id": method_id,
+                        "policy_id": policy_id,
+                        "index_path": str(index_path),
+                    },
+                },
+            )
         finally:
-            # The index is reference-set-derived scratch, and it is big.
-            del engine
+            # The index is reference-set-derived scratch, and it is big.  It has
+            # to go whether the stage succeeded or failed, and it cannot survive
+            # into the committed artifact.
             for name in (_REFERENCE_SMI, _REFERENCE_INDEX):
                 (context.staging_root / name).unlink(missing_ok=True)
+
+        input_count = result.rows_in
+        if input_count == 0:
+            raise PluginError(
+                "reference-similarity input contains no parents",
+                code="REFERENCE_SIMILARITY_EMPTY_INPUT",
+            )
+        output_count = result.rows_out.get("primary", 0)
+        reject_count = result.total("reject_count")
+        warning_count = result.total("warning_count")
 
         return StageResponse(
             outputs={
                 "primary": PendingOutput(
-                    PARENT_V1.id, (_PARENT_PATH.as_posix(),), {"row_count": output_count}
+                    PARENT_V1.id, result.file_paths["primary"], {"row_count": output_count}
                 ),
                 "applicability": PendingOutput(
                     APPLICABILITY_V1.id,
-                    (_APPLICABILITY_PATH.as_posix(),),
+                    result.file_paths["applicability"],
                     {
                         "row_count": input_count,
                         "method_id": method_id,
@@ -483,7 +560,7 @@ class Fpsim2ReferenceSimilarityPlugin:
                     },
                 ),
                 "decisions": PendingOutput(
-                    DECISION_V1.id, (_DECISION_PATH.as_posix(),), {"policy_id": policy_id}
+                    DECISION_V1.id, result.file_paths["decisions"], {"policy_id": policy_id}
                 ),
             },
             metadata={
@@ -501,6 +578,7 @@ class Fpsim2ReferenceSimilarityPlugin:
                 "backend": "fpsim2",
                 "backend_version": _fpsim2_version(),
                 "cacheable": False,
+                **result.response_metadata(),
             },
         )
 

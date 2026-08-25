@@ -39,8 +39,8 @@ from molcascade.chemistry.alerts import parse_for_alert_matching
 from molcascade.plugins import create_builtin_registry
 from molcascade.plugins.builtin.medchem_alerts import (
     MedchemAlertsConfig,
-    MedchemAlertsPlugin,
     _build_filters,
+    _evaluate,
     _nibr_rule_index,
 )
 from molcascade.plugins.builtin.structural_alerts import (
@@ -138,7 +138,7 @@ def _medchem_findings(
     assert all(molecule is not None for molecule in molecules)
     common, nibr, _ = _build_filters(settings)
     compound_class_rules, exclude_level_rules = _nibr_rule_index(nibr)
-    return MedchemAlertsPlugin()._evaluate(
+    return _evaluate(
         molecules,
         common=common,
         nibr=nibr,

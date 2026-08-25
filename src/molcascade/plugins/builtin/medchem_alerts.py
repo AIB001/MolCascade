@@ -39,11 +39,13 @@ import pyarrow.parquet as pq
 from pydantic import Field, ValidationError, field_validator
 
 from molcascade.chemistry.alerts import parse_for_alert_matching
-from molcascade.chemistry.datasets import iter_contract_batches, require_single_input
+from molcascade.chemistry.datasets import require_single_input
+from molcascade.chemistry.sharding import shard_stage
 from molcascade.config.canonical import canonical_sha256
 from molcascade.config.models import StrictFrozenModel
 from molcascade.contracts import DECISION_V1, PARENT_V1
 from molcascade.errors import PluginError
+from molcascade.parallel import ShardOutcome, ShardTask, iter_shard_batches
 from molcascade.plugins.api import PendingOutput, StageContext, StageRequest, StageResponse
 from molcascade.plugins.builtin.medchem_support import (
     hash_data_file,
@@ -165,23 +167,6 @@ def _validated_config(request: StageRequest) -> MedchemAlertsConfig:
             hint="Name at least one alert set, or enable use_nibr.",
         )
     return config
-
-
-def _prepare_outputs(context: StageContext) -> tuple[Path, Path]:
-    context.staging_root.mkdir(parents=True, exist_ok=True)
-    destinations = (
-        context.staging_root / _PARENT_PATH,
-        context.staging_root / _DECISION_PATH,
-    )
-    for relative, destination in zip((_PARENT_PATH, _DECISION_PATH), destinations, strict=True):
-        if destination.exists() or destination.is_symlink():
-            raise PluginError(
-                f"medchem alert output already exists: {relative.as_posix()}",
-                code="PLUGIN_STAGING_NOT_EMPTY",
-                context={"path": relative.as_posix()},
-            )
-        destination.parent.mkdir(parents=True, exist_ok=True)
-    return destinations
 
 
 def _resolve_alerts_db(configured: str | None) -> Path:
@@ -351,6 +336,241 @@ def _detail(family: str, status: str, reasons: str, action: CatalogAction, **ext
     )
 
 
+def _evaluate(
+    molecules: list[Any],
+    *,
+    common: Any,
+    nibr: Any,
+    reject_at_severity: int,
+    compound_class_rules: frozenset[str] = frozenset(),
+    exclude_level_rules: frozenset[str] = frozenset(),
+) -> list[list[tuple[str, str, str, dict[str, Any]]]]:
+    """Return one list of ``(family, status, reasons, extra)`` per molecule."""
+
+    findings: list[list[tuple[str, str, str, dict[str, Any]]]] = [
+        [] for _ in range(len(molecules))
+    ]
+    if not molecules:
+        return findings
+
+    if common is not None:
+        # n_jobs=1 keeps the worker single-threaded and the row order fixed.
+        frame = common(molecules, n_jobs=1, progress=False, scheduler="threads")
+        statuses = result_column(frame, "status", len(molecules), "common")
+        reasons = result_column(frame, "reasons", len(molecules), "common")
+        for index, (status_value, reason_value) in enumerate(
+            zip(statuses, reasons, strict=True)
+        ):
+            status = _status_of(status_value, "common")
+            if status == "ok":
+                continue
+            findings[index].append(("common", status, _reason_text(reason_value), {}))
+
+    if nibr is not None:
+        frame = nibr(molecules, n_jobs=1, progress=False, scheduler="threads")
+        statuses = result_column(frame, "status", len(molecules), _NIBR_FAMILY)
+        reasons = result_column(frame, "reasons", len(molecules), _NIBR_FAMILY)
+        severities = result_column(frame, "severity", len(molecules), _NIBR_FAMILY)
+        covalent = result_column(frame, "n_covalent_motif", len(molecules), _NIBR_FAMILY)
+        for index, (status_value, reason_value, severity_value, covalent_value) in enumerate(
+            zip(statuses, reasons, severities, covalent, strict=True)
+        ):
+            status = _status_of(status_value, _NIBR_FAMILY)
+            severity = int(severity_value)
+            reasons_text = _reason_text(reason_value)
+            # Accumulated severity is its own axis: a molecule can collect
+            # enough "flag" rules to be worse than one "exclude" rule, and
+            # the project decides where that line sits.
+            if severity >= reject_at_severity:
+                matched = _nibr_rule_names(reasons_text)
+                exclusions = matched & exclude_level_rules
+                # An exclusion is reported as class membership only when
+                # *every* exclude-level rule behind it was a class rule.
+                # One genuine liability alongside and it stays an exclusion
+                # -- a compound class is never allowed to speak for a
+                # molecule that has something real wrong with it.  Lower
+                # severities that merely accumulated were not exclusions in
+                # the first place, so they do not change the reading, and
+                # they stay in the reported reasons either way.
+                if exclusions and exclusions <= compound_class_rules:
+                    status = _COMPOUND_CLASS_STATUS
+                else:
+                    status = "exclude"
+            elif status == "ok":
+                continue
+            findings[index].append(
+                (
+                    _NIBR_FAMILY,
+                    status,
+                    reasons_text,
+                    {
+                        "severity": severity,
+                        "n_covalent_motif": int(covalent_value),
+                        "reject_at_severity": reject_at_severity,
+                    },
+                )
+            )
+    return findings
+
+
+def _policy_id(
+    config: MedchemAlertsConfig,
+    *,
+    backend_version: str,
+    resolved_sets: tuple[str, ...],
+    rules_digest: str,
+) -> str:
+    actions = config.actions()
+    return "medchem-alert-policy:sha256:" + canonical_sha256(
+        {
+            "alert_sets": list(resolved_sets),
+            "backend": "medchem",
+            "backend_version": backend_version,
+            "nibr_enabled": config.use_nibr,
+            "nibr_reject_at_severity": config.nibr_reject_at_severity,
+            "rules_sha256": rules_digest,
+            "semantics": "substructure-triage-alert-not-experimental-proof",
+            "status_actions": {status: action.value for status, action in actions.items()},
+        }
+    )
+
+
+#: What the parent worked out and a shard would only recompute: the digest of
+#: the alert database, and the policy identity that digest is part of.  Popped
+#: before validation because ``MedchemAlertsConfig`` is strict, and never seen by
+#: ``stage_cache_key`` -- that hashes the pipeline's stage config, not this.
+_RUNTIME_KEY = "molcascade.runtime"
+
+
+def _run_shard(task: ShardTask) -> ShardOutcome:
+    """Screen one contiguous range of parents against the enabled catalogs."""
+
+    settings = dict(task.config)
+    runtime = dict(settings.pop(_RUNTIME_KEY))
+    config = MedchemAlertsConfig.model_validate(settings)
+    policy_id = str(runtime["policy_id"])
+    # Rebuilt per worker: the filters hold compiled RDKit catalogs, which do not
+    # cross a process boundary, and building them is cheap next to matching.
+    common, nibr, _ = _build_filters(config)
+    compound_class_rules, exclude_level_rules = (
+        _nibr_rule_index(nibr) if nibr is not None else (frozenset(), frozenset())
+    )
+    actions = config.actions()
+
+    counters = {
+        "input_count": 0,
+        "retained_count": 0,
+        "reject_count": 0,
+        "warning_decision_count": 0,
+        "reject_decision_count": 0,
+        "decision_count": 0,
+    }
+    with (
+        pq.ParquetWriter(
+            task.output_paths["primary"], PARENT_V1.schema, compression="zstd"
+        ) as parent_writer,
+        pq.ParquetWriter(
+            task.output_paths["decisions"], DECISION_V1.schema, compression="zstd"
+        ) as decision_writer,
+    ):
+        decision_rows: list[dict[str, Any]] = []
+
+        def flush_decisions() -> None:
+            if decision_rows:
+                decision_writer.write_table(
+                    pa.Table.from_pylist(decision_rows, schema=DECISION_V1.schema)
+                )
+                decision_rows.clear()
+
+        for batch in iter_shard_batches(task, batch_size=config.batch_size):
+            rows = batch.to_pylist()
+            molecules = []
+            for row in rows:
+                smiles = row.get("parent_smiles")
+                molecule = parse_for_alert_matching(smiles)
+                if molecule is None:
+                    raise PluginError(
+                        "registered parent cannot be parsed for medchem alerts",
+                        code="MEDCHEM_PARENT_INVALID",
+                        context={"parent_id": str(row.get("parent_id"))},
+                    )
+                molecules.append(molecule)
+            counters["input_count"] += len(rows)
+
+            findings = _evaluate(
+                molecules,
+                common=common,
+                nibr=nibr,
+                reject_at_severity=config.nibr_reject_at_severity,
+                compound_class_rules=compound_class_rules,
+                exclude_level_rules=exclude_level_rules,
+            )
+
+            retained_rows: list[dict[str, Any]] = []
+            for row, per_molecule in zip(rows, findings, strict=True):
+                parent_id = row.get("parent_id")
+                rejected = False
+                emitted = 0
+                for family, status, reasons, extra in per_molecule:
+                    action = actions[status]
+                    if action is CatalogAction.IGNORE:
+                        continue
+                    if action is CatalogAction.REJECT:
+                        rejected = True
+                        counters["reject_decision_count"] += 1
+                    else:
+                        counters["warning_decision_count"] += 1
+                    decision_rows.append(
+                        {
+                            "entity_id": parent_id,
+                            "entity_kind": "PARENT",
+                            "stage_id": task.stage_id,
+                            "outcome": action.value.upper(),
+                            "reason_code": _reason_code(family, status, reasons),
+                            "rule_id": policy_id,
+                            "detail": _detail(family, status, reasons, action, **extra),
+                        }
+                    )
+                    counters["decision_count"] += 1
+                    emitted += 1
+                if emitted == 0:
+                    decision_rows.append(
+                        {
+                            "entity_id": parent_id,
+                            "entity_kind": "PARENT",
+                            "stage_id": task.stage_id,
+                            "outcome": "PASS",
+                            "reason_code": "MEDCHEM_ALERTS_CLEAR",
+                            "rule_id": policy_id,
+                            "detail": (
+                                "No acted-upon match in any enabled medchem "
+                                "alert collection."
+                            ),
+                        }
+                    )
+                    counters["decision_count"] += 1
+                if rejected:
+                    counters["reject_count"] += 1
+                else:
+                    counters["retained_count"] += 1
+                    retained_rows.append(row)
+                if len(decision_rows) >= config.decision_buffer_size:
+                    flush_decisions()
+            if retained_rows:
+                parent_writer.write_table(
+                    pa.Table.from_pylist(retained_rows, schema=PARENT_V1.schema)
+                )
+        flush_decisions()
+    return ShardOutcome(
+        rows_in=counters["input_count"],
+        rows_out={
+            "primary": counters["retained_count"],
+            "decisions": counters["decision_count"],
+        },
+        metadata=dict(counters),
+    )
+
+
 class MedchemAlertsPlugin:
     """Screen parents against the medchem alert collections and NIBR rules."""
 
@@ -376,155 +596,63 @@ class MedchemAlertsPlugin:
         config = _validated_config(request)
         stage_input = require_single_input(request.inputs, contract_id=PARENT_V1.id)
         medchem = import_medchem()
-        common, nibr, resolved_sets = _build_filters(config)
-        compound_class_rules, exclude_level_rules = (
-            _nibr_rule_index(nibr) if nibr is not None else (frozenset(), frozenset())
-        )
+        # Built and read in the parent as well, so an unknown collection name or
+        # an unreadable NIBR rule file stops the stage before a shard is
+        # scheduled rather than in every worker at once.
+        _, nibr, resolved_sets = _build_filters(config)
+        if nibr is not None:
+            _nibr_rule_index(nibr)
         alerts_db = _resolve_alerts_db(config.alerts_db_path)
         rules_digest = hash_data_file(alerts_db, code="MEDCHEM_ALERTS_DB_INVALID")
-        parent_destination, decision_destination = _prepare_outputs(context)
-        actions = config.actions()
+        policy_id = _policy_id(
+            config,
+            backend_version=medchem_version(medchem),
+            resolved_sets=resolved_sets,
+            rules_digest=rules_digest,
+        )
 
-        policy_payload = {
-            "alert_sets": list(resolved_sets),
-            "backend": "medchem",
-            "backend_version": medchem_version(medchem),
-            "nibr_enabled": config.use_nibr,
-            "nibr_reject_at_severity": config.nibr_reject_at_severity,
-            "rules_sha256": rules_digest,
-            "semantics": "substructure-triage-alert-not-experimental-proof",
-            "status_actions": {status: action.value for status, action in actions.items()},
-        }
-        policy_id = "medchem-alert-policy:sha256:" + canonical_sha256(policy_payload)
-
+        result = shard_stage(
+            worker=_run_shard,
+            stage_input=stage_input,
+            contract=PARENT_V1,
+            output_paths={
+                "primary": _PARENT_PATH.as_posix(),
+                "decisions": _DECISION_PATH.as_posix(),
+            },
+            context=context,
+            stage_id=request.stage_id,
+            config={
+                **config.model_dump(mode="json"),
+                _RUNTIME_KEY: {"policy_id": policy_id},
+            },
+        )
+        if result.rows_in == 0:
+            raise PluginError(
+                "medchem alert input contains no parents",
+                code="MEDCHEM_ALERTS_EMPTY_INPUT",
+            )
         counters = {
-            "input_count": 0,
-            "retained_count": 0,
-            "reject_count": 0,
-            "warning_decision_count": 0,
-            "reject_decision_count": 0,
-            "decision_count": 0,
+            name: result.total(name)
+            for name in (
+                "input_count",
+                "retained_count",
+                "reject_count",
+                "warning_decision_count",
+                "reject_decision_count",
+                "decision_count",
+            )
         }
-
-        try:
-            with (
-                pq.ParquetWriter(
-                    parent_destination, PARENT_V1.schema, compression="zstd"
-                ) as parent_writer,
-                pq.ParquetWriter(
-                    decision_destination, DECISION_V1.schema, compression="zstd"
-                ) as decision_writer,
-            ):
-                decision_rows: list[dict[str, Any]] = []
-
-                def flush_decisions() -> None:
-                    if decision_rows:
-                        decision_writer.write_table(
-                            pa.Table.from_pylist(decision_rows, schema=DECISION_V1.schema)
-                        )
-                        decision_rows.clear()
-
-                for batch in iter_contract_batches(
-                    stage_input, PARENT_V1, batch_size=config.batch_size
-                ):
-                    rows = batch.to_pylist()
-                    molecules = []
-                    for row in rows:
-                        smiles = row.get("parent_smiles")
-                        molecule = parse_for_alert_matching(smiles)
-                        if molecule is None:
-                            raise PluginError(
-                                "registered parent cannot be parsed for medchem alerts",
-                                code="MEDCHEM_PARENT_INVALID",
-                                context={"parent_id": str(row.get("parent_id"))},
-                            )
-                        molecules.append(molecule)
-                    counters["input_count"] += len(rows)
-
-                    findings = self._evaluate(
-                        molecules,
-                        common=common,
-                        nibr=nibr,
-                        reject_at_severity=config.nibr_reject_at_severity,
-                        compound_class_rules=compound_class_rules,
-                        exclude_level_rules=exclude_level_rules,
-                    )
-
-                    retained_rows: list[dict[str, Any]] = []
-                    for row, per_molecule in zip(rows, findings, strict=True):
-                        parent_id = row.get("parent_id")
-                        rejected = False
-                        emitted = 0
-                        for family, status, reasons, extra in per_molecule:
-                            action = actions[status]
-                            if action is CatalogAction.IGNORE:
-                                continue
-                            if action is CatalogAction.REJECT:
-                                rejected = True
-                                counters["reject_decision_count"] += 1
-                            else:
-                                counters["warning_decision_count"] += 1
-                            decision_rows.append(
-                                {
-                                    "entity_id": parent_id,
-                                    "entity_kind": "PARENT",
-                                    "stage_id": request.stage_id,
-                                    "outcome": action.value.upper(),
-                                    "reason_code": _reason_code(family, status, reasons),
-                                    "rule_id": policy_id,
-                                    "detail": _detail(family, status, reasons, action, **extra),
-                                }
-                            )
-                            counters["decision_count"] += 1
-                            emitted += 1
-                        if emitted == 0:
-                            decision_rows.append(
-                                {
-                                    "entity_id": parent_id,
-                                    "entity_kind": "PARENT",
-                                    "stage_id": request.stage_id,
-                                    "outcome": "PASS",
-                                    "reason_code": "MEDCHEM_ALERTS_CLEAR",
-                                    "rule_id": policy_id,
-                                    "detail": (
-                                        "No acted-upon match in any enabled medchem "
-                                        "alert collection."
-                                    ),
-                                }
-                            )
-                            counters["decision_count"] += 1
-                        if rejected:
-                            counters["reject_count"] += 1
-                        else:
-                            counters["retained_count"] += 1
-                            retained_rows.append(row)
-                        if len(decision_rows) >= config.decision_buffer_size:
-                            flush_decisions()
-                    if retained_rows:
-                        parent_writer.write_table(
-                            pa.Table.from_pylist(retained_rows, schema=PARENT_V1.schema)
-                        )
-                flush_decisions()
-            if counters["input_count"] == 0:
-                raise PluginError(
-                    "medchem alert input contains no parents",
-                    code="MEDCHEM_ALERTS_EMPTY_INPUT",
-                )
-        except BaseException:
-            parent_destination.unlink(missing_ok=True)
-            decision_destination.unlink(missing_ok=True)
-            raise
 
         return StageResponse(
             outputs={
                 "primary": PendingOutput(
                     PARENT_V1.id,
-                    (_PARENT_PATH.as_posix(),),
+                    result.file_paths["primary"],
                     {"row_count": counters["retained_count"]},
                 ),
                 "decisions": PendingOutput(
                     DECISION_V1.id,
-                    (_DECISION_PATH.as_posix(),),
+                    result.file_paths["decisions"],
                     {"row_count": counters["decision_count"], "policy_id": policy_id},
                 ),
             },
@@ -538,85 +666,9 @@ class MedchemAlertsPlugin:
                 "backend": "medchem",
                 "backend_version": medchem_version(medchem),
                 "network_or_download_invoked_by_adapter": False,
+                **result.response_metadata(),
             },
         )
-
-    def _evaluate(
-        self,
-        molecules: list[Any],
-        *,
-        common: Any,
-        nibr: Any,
-        reject_at_severity: int,
-        compound_class_rules: frozenset[str] = frozenset(),
-        exclude_level_rules: frozenset[str] = frozenset(),
-    ) -> list[list[tuple[str, str, str, dict[str, Any]]]]:
-        """Return one list of ``(family, status, reasons, extra)`` per molecule."""
-
-        findings: list[list[tuple[str, str, str, dict[str, Any]]]] = [
-            [] for _ in range(len(molecules))
-        ]
-        if not molecules:
-            return findings
-
-        if common is not None:
-            # n_jobs=1 keeps the worker single-threaded and the row order fixed.
-            frame = common(molecules, n_jobs=1, progress=False, scheduler="threads")
-            statuses = result_column(frame, "status", len(molecules), "common")
-            reasons = result_column(frame, "reasons", len(molecules), "common")
-            for index, (status_value, reason_value) in enumerate(
-                zip(statuses, reasons, strict=True)
-            ):
-                status = _status_of(status_value, "common")
-                if status == "ok":
-                    continue
-                findings[index].append(("common", status, _reason_text(reason_value), {}))
-
-        if nibr is not None:
-            frame = nibr(molecules, n_jobs=1, progress=False, scheduler="threads")
-            statuses = result_column(frame, "status", len(molecules), _NIBR_FAMILY)
-            reasons = result_column(frame, "reasons", len(molecules), _NIBR_FAMILY)
-            severities = result_column(frame, "severity", len(molecules), _NIBR_FAMILY)
-            covalent = result_column(frame, "n_covalent_motif", len(molecules), _NIBR_FAMILY)
-            for index, (status_value, reason_value, severity_value, covalent_value) in enumerate(
-                zip(statuses, reasons, severities, covalent, strict=True)
-            ):
-                status = _status_of(status_value, _NIBR_FAMILY)
-                severity = int(severity_value)
-                reasons_text = _reason_text(reason_value)
-                # Accumulated severity is its own axis: a molecule can collect
-                # enough "flag" rules to be worse than one "exclude" rule, and
-                # the project decides where that line sits.
-                if severity >= reject_at_severity:
-                    matched = _nibr_rule_names(reasons_text)
-                    exclusions = matched & exclude_level_rules
-                    # An exclusion is reported as class membership only when
-                    # *every* exclude-level rule behind it was a class rule.
-                    # One genuine liability alongside and it stays an exclusion
-                    # -- a compound class is never allowed to speak for a
-                    # molecule that has something real wrong with it.  Lower
-                    # severities that merely accumulated were not exclusions in
-                    # the first place, so they do not change the reading, and
-                    # they stay in the reported reasons either way.
-                    if exclusions and exclusions <= compound_class_rules:
-                        status = _COMPOUND_CLASS_STATUS
-                    else:
-                        status = "exclude"
-                elif status == "ok":
-                    continue
-                findings[index].append(
-                    (
-                        _NIBR_FAMILY,
-                        status,
-                        reasons_text,
-                        {
-                            "severity": severity,
-                            "n_covalent_motif": int(covalent_value),
-                            "reject_at_severity": reject_at_severity,
-                        },
-                    )
-                )
-        return findings
 
 
 __all__ = ["MedchemAlertsConfig", "MedchemAlertsPlugin"]

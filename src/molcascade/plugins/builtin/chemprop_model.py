@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import math
 import re
+from functools import cache
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, Self
@@ -36,12 +37,14 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from pydantic import Field, ValidationError, field_validator, model_validator
 
-from molcascade.chemistry.datasets import iter_contract_batches, require_single_input
+from molcascade.chemistry.datasets import require_single_input
+from molcascade.chemistry.sharding import shard_stage
 from molcascade.config.canonical import canonical_sha256
 from molcascade.config.load import load_yaml
 from molcascade.config.models import StrictFrozenModel
 from molcascade.contracts import PARENT_V1, PREDICTION_V1
 from molcascade.errors import PluginError
+from molcascade.parallel import ShardOutcome, ShardTask, iter_shard_batches
 from molcascade.plugins.api import PendingOutput, StageContext, StageRequest, StageResponse
 from molcascade.plugins.builtin._bundles import BundleCodes, bundle_files, bundle_root
 from molcascade.plugins.manifest import (
@@ -62,6 +65,16 @@ _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.:/-]{0,127}$")
 
 #: Bundle-reading failures reported under this plugin's own error vocabulary.
 _CODES = BundleCodes("CHEMPROP")
+
+#: What the parent verified and a shard cannot: which directory holds the
+#: checkpoint whose digest was just checked, and the identity derived from it.
+#: Popped before the strict config model sees the mapping.
+_RUNTIME_KEY = "molcascade.runtime"
+
+#: A message-passing forward pass per molecule, so a shard is minutes of GPU
+#: time rather than seconds of arithmetic.  Smaller than the default for the
+#: same reason ADMET's is: resume should not cost more than it saves.
+_SHARD_ROWS = 20_000
 
 
 class CheckpointSpec(StrictFrozenModel):
@@ -410,6 +423,171 @@ def _predict(
     return np.vstack(chunks).astype(np.float64, copy=False)
 
 
+def _score(
+    model: Any,
+    *,
+    manifest: ChempropBundleManifest,
+    model_id: str,
+    parent_ids: list[str],
+    smiles: list[str],
+    batch_size: int,
+    num_workers: int,
+) -> tuple[list[dict[str, Any]], int, int]:
+    # Chemprop raises on a SMILES RDKit cannot parse, which would abort the
+    # screen on one bad row.  Parents are canonicalized upstream so this is
+    # rare, but a hand-assembled pipeline may not have standardized, and one
+    # unparseable molecule is evidence-missing, not a run failure.
+    from rdkit import Chem
+
+    kept: list[str] = []
+    kept_smiles: list[str] = []
+    skipped = 0
+    for parent_id, value in zip(parent_ids, smiles, strict=True):
+        if Chem.MolFromSmiles(value) is None:
+            skipped += 1
+            continue
+        kept.append(parent_id)
+        kept_smiles.append(value)
+    if not kept:
+        return [], skipped, 0
+
+    try:
+        predictions = _predict(
+            model, kept_smiles, batch_size=batch_size, num_workers=num_workers
+        )
+    except PluginError:
+        raise
+    except Exception as error:
+        raise PluginError(
+            "chemprop inference failed",
+            code="CHEMPROP_INFERENCE_FAILED",
+            context={"batch_size": len(kept), "error_type": type(error).__name__},
+        ) from error
+
+    if predictions.shape[0] != len(kept):
+        raise PluginError(
+            "chemprop returned a different number of rows than it was given",
+            code="CHEMPROP_OUTPUT_COUNT_MISMATCH",
+            context={
+                "input_count": len(kept),
+                "output_count": int(predictions.shape[0]),
+            },
+        )
+    if predictions.ndim != 2 or predictions.shape[1] <= manifest.model.task_index:
+        raise PluginError(
+            "chemprop output has no column at the manifest's task_index",
+            code="CHEMPROP_TASK_INDEX_OUT_OF_RANGE",
+            context={
+                "shape": [int(size) for size in predictions.shape],
+                "task_index": manifest.model.task_index,
+            },
+        )
+    values = predictions[:, manifest.model.task_index]
+
+    rows: list[dict[str, Any]] = []
+    dropped = 0
+    for index, parent_id in enumerate(kept):
+        mean = float(values[index])
+        if not math.isfinite(mean):
+            # One odd molecule should not abort a two-million-row screen,
+            # but it must not be scored either.  No row means no evidence,
+            # which the gate turns into an explicit reject.
+            dropped += 1
+            continue
+        if manifest.task == "binary_probability" and not 0.0 <= mean <= 1.0:
+            raise PluginError(
+                "a binary_probability model returned a value outside [0, 1]",
+                code="CHEMPROP_PROBABILITY_OUT_OF_RANGE",
+                hint=(
+                    "This usually means the checkpoint has a regression head "
+                    "and the manifest declares the wrong task."
+                ),
+                context={"value": mean},
+            )
+        rows.append(
+            {
+                "parent_id": parent_id,
+                "endpoint_id": manifest.endpoint_id,
+                "model_id": model_id,
+                "prediction_mean": mean,
+                "prediction_std": None,
+                "interval_lower": None,
+                "interval_upper": None,
+                "calibration_id": None,
+            }
+        )
+    return rows, skipped, dropped
+
+@cache
+def _loaded_bundle(bundle_dir: str, bundle_sha256: str) -> tuple[ChempropBundleManifest, Any]:
+    """Read the manifest and deserialize the checkpoint once per worker process.
+
+    Cached because a lane is handed shard after shard and this is a
+    ``torch.load`` of a trained message-passing network.  ``bundle_sha256`` is
+    part of the key rather than decoration: the parent has already proved those
+    bytes, so two stages pinning different bundles can never share one model,
+    and re-pinning the same directory reloads instead of returning the old one.
+    """
+
+    root = Path(bundle_dir)
+    manifest = _parse_manifest((root / MANIFEST_FILENAME).read_bytes())
+    return manifest, _load_checkpoint(root / manifest.model.file, manifest)
+
+
+def _run_shard(task: ShardTask) -> ShardOutcome:
+    """Score one contiguous range of parents on whichever lane owns it."""
+
+    settings = dict(task.config)
+    runtime = dict(settings.pop(_RUNTIME_KEY))
+    config = ChempropCheckpointConfig.model_validate(settings)
+    model_id = str(runtime["model_id"])
+    manifest, model = _loaded_bundle(
+        str(runtime["bundle_dir"]), str(runtime["bundle_sha256"])
+    )
+
+    input_count = 0
+    prediction_count = 0
+    unfeaturizable = 0
+    non_finite = 0
+    with (
+        pq.ParquetWriter(
+            task.output_paths["primary"], PARENT_V1.schema, compression="zstd"
+        ) as parent_writer,
+        pq.ParquetWriter(
+            task.output_paths["predictions"], PREDICTION_V1.schema, compression="zstd"
+        ) as prediction_writer,
+    ):
+        for batch in iter_shard_batches(task, batch_size=config.batch_size):
+            parent_ids = [str(value) for value in batch.column("parent_id").to_pylist()]
+            smiles = [str(value) for value in batch.column("parent_smiles").to_pylist()]
+            rows, skipped, dropped = _score(
+                model,
+                manifest=manifest,
+                model_id=model_id,
+                parent_ids=parent_ids,
+                smiles=smiles,
+                batch_size=config.batch_size,
+                num_workers=config.num_workers,
+            )
+            parent_writer.write_batch(batch)
+            if rows:
+                prediction_writer.write_table(
+                    pa.Table.from_pylist(rows, schema=PREDICTION_V1.schema)
+                )
+            input_count += batch.num_rows
+            prediction_count += len(rows)
+            unfeaturizable += skipped
+            non_finite += dropped
+    return ShardOutcome(
+        rows_in=input_count,
+        rows_out={"primary": input_count, "predictions": prediction_count},
+        metadata={
+            "unfeaturizable_count": unfeaturizable,
+            "non_finite_prediction_count": non_finite,
+        },
+    )
+
+
 class ChempropCheckpointPlugin:
     """Score molecules with a user-trained, hash-pinned Chemprop checkpoint."""
 
@@ -473,24 +651,11 @@ class ChempropCheckpointPlugin:
                 },
             )
         root = Path(str(inspected["bundle_dir"]))
-        manifest = _parse_manifest((root / MANIFEST_FILENAME).read_bytes())
-
-        context.staging_root.mkdir(parents=True, exist_ok=True)
-        parent_destination = context.staging_root / _PARENT_PATH
-        prediction_destination = context.staging_root / _PREDICTION_PATH
-        for relative, destination in (
-            (_PARENT_PATH, parent_destination),
-            (_PREDICTION_PATH, prediction_destination),
-        ):
-            if destination.exists() or destination.is_symlink():
-                raise PluginError(
-                    "chemprop output already exists in staging",
-                    code="PLUGIN_STAGING_NOT_EMPTY",
-                    context={"path": relative.as_posix()},
-                )
-            destination.parent.mkdir(parents=True, exist_ok=True)
-
-        model = _load_checkpoint(root / manifest.model.file, manifest)
+        # Loaded in the parent as well, so a checkpoint that Torch refuses or
+        # that is shaped unlike its manifest stops the stage before a single
+        # shard is scheduled -- and so the manifest below is the one the model
+        # was checked against.
+        manifest, _ = _loaded_bundle(str(root), str(inspected["bundle_sha256"]))
         # Settled after the import succeeded, so it names the release that
         # actually ran rather than the one metadata advertised.
         model_id = _model_id(
@@ -498,51 +663,32 @@ class ChempropCheckpointPlugin:
             list(inspected["files"]),
             str(inspected["chemprop_version"]),
         )
-        input_count = 0
-        prediction_count = 0
-        unfeaturizable = 0
-        non_finite = 0
-        try:
-            with pq.ParquetWriter(
-                parent_destination, PARENT_V1.schema, compression="zstd"
-            ) as parent_writer, pq.ParquetWriter(
-                prediction_destination, PREDICTION_V1.schema, compression="zstd"
-            ) as prediction_writer:
-                for batch in iter_contract_batches(
-                    stage_input, PARENT_V1, batch_size=config.batch_size
-                ):
-                    parent_ids = [
-                        str(value) for value in batch.column("parent_id").to_pylist()
-                    ]
-                    smiles = [
-                        str(value) for value in batch.column("parent_smiles").to_pylist()
-                    ]
-                    rows, skipped, dropped = self._score(
-                        model,
-                        manifest=manifest,
-                        model_id=model_id,
-                        parent_ids=parent_ids,
-                        smiles=smiles,
-                        batch_size=config.batch_size,
-                        num_workers=config.num_workers,
-                    )
-                    parent_writer.write_batch(batch)
-                    if rows:
-                        prediction_writer.write_table(
-                            pa.Table.from_pylist(rows, schema=PREDICTION_V1.schema)
-                        )
-                    input_count += batch.num_rows
-                    prediction_count += len(rows)
-                    unfeaturizable += skipped
-                    non_finite += dropped
-        except BaseException:
-            parent_destination.unlink(missing_ok=True)
-            prediction_destination.unlink(missing_ok=True)
-            raise
+        sharded = shard_stage(
+            worker=_run_shard,
+            stage_input=stage_input,
+            contract=PARENT_V1,
+            output_paths={
+                "primary": _PARENT_PATH.as_posix(),
+                "predictions": _PREDICTION_PATH.as_posix(),
+            },
+            context=context,
+            stage_id=request.stage_id,
+            config={
+                **config.model_dump(mode="json"),
+                _RUNTIME_KEY: {
+                    "bundle_dir": str(root),
+                    "bundle_sha256": str(inspected["bundle_sha256"]),
+                    "model_id": model_id,
+                },
+            },
+            shard_rows=_SHARD_ROWS,
+        )
+        input_count = sharded.rows_in
+        prediction_count = sharded.rows_out.get("predictions", 0)
+        unfeaturizable = sharded.total("unfeaturizable_count")
+        non_finite = sharded.total("non_finite_prediction_count")
 
         if input_count == 0:
-            parent_destination.unlink(missing_ok=True)
-            prediction_destination.unlink(missing_ok=True)
             raise PluginError(
                 "chemprop input contains no parents",
                 code="CHEMPROP_EMPTY_INPUT",
@@ -551,11 +697,11 @@ class ChempropCheckpointPlugin:
         return StageResponse(
             outputs={
                 "primary": PendingOutput(
-                    PARENT_V1.id, (_PARENT_PATH.as_posix(),), {"row_count": input_count}
+                    PARENT_V1.id, sharded.file_paths["primary"], {"row_count": input_count}
                 ),
                 "predictions": PendingOutput(
                     PREDICTION_V1.id,
-                    (_PREDICTION_PATH.as_posix(),),
+                    sharded.file_paths["predictions"],
                     {"row_count": prediction_count, "model_id": model_id},
                 ),
             },
@@ -583,104 +729,9 @@ class ChempropCheckpointPlugin:
                 "calibration_available": False,
                 "model_deserialization_trust_acknowledged": True,
                 "network_or_download_invoked_by_adapter": False,
+                **sharded.response_metadata(),
             },
         )
-
-    def _score(
-        self,
-        model: Any,
-        *,
-        manifest: ChempropBundleManifest,
-        model_id: str,
-        parent_ids: list[str],
-        smiles: list[str],
-        batch_size: int,
-        num_workers: int,
-    ) -> tuple[list[dict[str, Any]], int, int]:
-        # Chemprop raises on a SMILES RDKit cannot parse, which would abort the
-        # screen on one bad row.  Parents are canonicalized upstream so this is
-        # rare, but a hand-assembled pipeline may not have standardized, and one
-        # unparseable molecule is evidence-missing, not a run failure.
-        from rdkit import Chem
-
-        kept: list[str] = []
-        kept_smiles: list[str] = []
-        skipped = 0
-        for parent_id, value in zip(parent_ids, smiles, strict=True):
-            if Chem.MolFromSmiles(value) is None:
-                skipped += 1
-                continue
-            kept.append(parent_id)
-            kept_smiles.append(value)
-        if not kept:
-            return [], skipped, 0
-
-        try:
-            predictions = _predict(
-                model, kept_smiles, batch_size=batch_size, num_workers=num_workers
-            )
-        except PluginError:
-            raise
-        except Exception as error:
-            raise PluginError(
-                "chemprop inference failed",
-                code="CHEMPROP_INFERENCE_FAILED",
-                context={"batch_size": len(kept), "error_type": type(error).__name__},
-            ) from error
-
-        if predictions.shape[0] != len(kept):
-            raise PluginError(
-                "chemprop returned a different number of rows than it was given",
-                code="CHEMPROP_OUTPUT_COUNT_MISMATCH",
-                context={
-                    "input_count": len(kept),
-                    "output_count": int(predictions.shape[0]),
-                },
-            )
-        if predictions.ndim != 2 or predictions.shape[1] <= manifest.model.task_index:
-            raise PluginError(
-                "chemprop output has no column at the manifest's task_index",
-                code="CHEMPROP_TASK_INDEX_OUT_OF_RANGE",
-                context={
-                    "shape": [int(size) for size in predictions.shape],
-                    "task_index": manifest.model.task_index,
-                },
-            )
-        values = predictions[:, manifest.model.task_index]
-
-        rows: list[dict[str, Any]] = []
-        dropped = 0
-        for index, parent_id in enumerate(kept):
-            mean = float(values[index])
-            if not math.isfinite(mean):
-                # One odd molecule should not abort a two-million-row screen,
-                # but it must not be scored either.  No row means no evidence,
-                # which the gate turns into an explicit reject.
-                dropped += 1
-                continue
-            if manifest.task == "binary_probability" and not 0.0 <= mean <= 1.0:
-                raise PluginError(
-                    "a binary_probability model returned a value outside [0, 1]",
-                    code="CHEMPROP_PROBABILITY_OUT_OF_RANGE",
-                    hint=(
-                        "This usually means the checkpoint has a regression head "
-                        "and the manifest declares the wrong task."
-                    ),
-                    context={"value": mean},
-                )
-            rows.append(
-                {
-                    "parent_id": parent_id,
-                    "endpoint_id": manifest.endpoint_id,
-                    "model_id": model_id,
-                    "prediction_mean": mean,
-                    "prediction_std": None,
-                    "interval_lower": None,
-                    "interval_upper": None,
-                    "calibration_id": None,
-                }
-            )
-        return rows, skipped, dropped
 
 
 __all__ = [
