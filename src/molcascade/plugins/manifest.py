@@ -46,6 +46,7 @@ class PluginKind(StrEnum):
     PREDICTOR = "predictor"
     APPLICABILITY = "applicability"
     SYNTHESIS = "synthesis"
+    DOCK = "dock"
     SCAFFOLDER = "scaffolder"
     CLUSTERER = "clusterer"
     SELECTOR = "selector"

@@ -25,6 +25,7 @@ from molcascade.cascade.models import (
     CriterionConfig,
     LibraryFormat,
     StepConfig,
+    TargetConfig,
     TierConfig,
     TierMode,
 )
@@ -48,6 +49,7 @@ _KIND_SLOTS: Mapping[PluginKind, str] = MappingProxyType(
         PluginKind.PREDICTOR: "predict",
         PluginKind.APPLICABILITY: "applicability",
         PluginKind.SYNTHESIS: "synthesis",
+        PluginKind.DOCK: "dock",
         PluginKind.SCAFFOLDER: "scaffold",
         PluginKind.CLUSTERER: "cluster",
         PluginKind.SELECTOR: "select",
@@ -119,12 +121,25 @@ def _binding(request_port: str, stage: str, port: str = "primary") -> dict[str, 
     return {"request_port": request_port, "stage": stage, "port": port}
 
 
+def _evidence_port_name(contract_id: str) -> str:
+    """Name the request port after the contract the binding carries.
+
+    The name is documentation rather than routing -- plugins classify their
+    inputs by contract -- so deriving it keeps generated pipelines readable
+    without inventing a second identifier that could drift from the contract.
+    """
+
+    return contract_id.rsplit("/", 1)[0].replace(".", "_").replace("-", "_")
+
+
 class _StageAccumulator:
     """Collect stages in execution order while tracking the current population."""
 
     def __init__(self) -> None:
         self.stages: list[dict[str, Any]] = []
         self.origins: list[StageOrigin] = []
+        self.kinds: set[PluginKind] = set()
+        self._producers: dict[str, tuple[str, str]] = {}
 
     def add(
         self,
@@ -146,6 +161,60 @@ class _StageAccumulator:
             }
         )
         self.origins.append(origin)
+        self.kinds.add(descriptor.kind)
+        for port, contract in descriptor.output_ports.items():
+            self._producers[contract] = (stage_id, port)
+
+    def producers(self) -> dict[str, tuple[str, str]]:
+        """Snapshot which stage and port last produced each contract."""
+
+        return dict(self._producers)
+
+
+def _evidence_bindings(
+    descriptor: PluginDescriptor,
+    *,
+    producers: Mapping[str, tuple[str, str]],
+    backend: str,
+    where: str,
+) -> list[dict[str, str]]:
+    """Bind every side contract a stage consumes to its latest producer.
+
+    A criterion reads the population on its ``primary`` port.  Anything else it
+    declares -- 3D conformers shared by several docking engines, a fingerprint
+    table shared by several similarity criteria -- is precomputed by an earlier
+    stage, and binding it here is what lets one expensive computation feed
+    several consumers instead of being repeated per consumer.
+
+    Decisions are excluded on purpose: they are wired by the tier's policy join,
+    which is the only place allowed to decide what a decision stream means.
+    """
+
+    bindings: list[dict[str, str]] = []
+    for contract_id in descriptor.inputs:
+        if contract_id in {PARENT_V1.id, DECISION_V1.id}:
+            continue
+        producer = producers.get(contract_id)
+        if producer is None:
+            raise ConfigError(
+                f"{where} uses {backend!r}, which needs {contract_id!r} evidence that no "
+                "earlier stage produces",
+                code="CASCADE_CRITERION_EVIDENCE_UNAVAILABLE",
+                hint=(
+                    "Add the stage that produces this contract above this tier, or choose "
+                    "a backend that computes the evidence itself."
+                ),
+                context={
+                    "backend": backend,
+                    "where": where,
+                    "missing_contract": contract_id,
+                    "available_contracts": sorted(producers),
+                },
+            )
+        bindings.append(
+            _binding(_evidence_port_name(contract_id), producer[0], producer[1])
+        )
+    return bindings
 
 
 def _lower_criterion(
@@ -156,6 +225,8 @@ def _lower_criterion(
     accumulator: _StageAccumulator,
     parent_stage: str,
     parent_port: str,
+    producers: Mapping[str, tuple[str, str]],
+    target: TargetConfig | None = None,
 ) -> tuple[str, str, tuple[str, str] | None]:
     """Emit a criterion's producer and optional gate.
 
@@ -164,18 +235,28 @@ def _lower_criterion(
     """
 
     where = f"criterion {criterion.id!r} in tier {tier.id!r}"
-    producer = _descriptor(registry, criterion.backend, where=where)
+    entry = _entry(registry, criterion.backend, where=where)
+    producer = cast(PluginDescriptor, entry.descriptor)
     if PARENT_V1.id not in producer.inputs:
         raise ConfigError(
             f"{where} uses {criterion.backend!r}, which does not accept a parent population",
             code="CASCADE_CRITERION_NOT_APPLICABLE",
             context={"backend": criterion.backend, "where": where},
         )
+    inputs = [_binding("primary", parent_stage, parent_port)]
+    inputs.extend(
+        _evidence_bindings(
+            producer,
+            producers=producers,
+            backend=criterion.backend,
+            where=where,
+        )
+    )
     accumulator.add(
         stage_id=criterion.id,
         descriptor=producer,
-        settings=criterion.settings,
-        inputs=[_binding("primary", parent_stage, parent_port)],
+        settings=_target_settings(entry, criterion.settings, target),
+        inputs=inputs,
         origin=StageOrigin(
             stage_id=criterion.id,
             role="criterion",
@@ -258,6 +339,7 @@ def _lower_tier(
     registry: PluginRegistry,
     accumulator: _StageAccumulator,
     anchor: tuple[str, str],
+    target: TargetConfig | None = None,
 ) -> tuple[str, str]:
     criteria = tier.active_criteria
     if not criteria:
@@ -273,11 +355,16 @@ def _lower_tier(
                 accumulator=accumulator,
                 parent_stage=stage,
                 parent_port=port,
+                producers=accumulator.producers(),
+                target=target,
             )
         return stage, port
 
     # Parallel modes: every criterion reads the population entering the tier so
-    # that no criterion can hide evidence from another by filtering first.
+    # that no criterion can hide evidence from another by filtering first.  The
+    # same rule applies to side evidence, so the producer map is frozen before
+    # the loop and a criterion can never bind a sibling in its own tier.
+    visible = accumulator.producers()
     decisions: list[tuple[str, str, str]] = []
     survivors: list[tuple[str, str]] = []
     for criterion in criteria:
@@ -288,6 +375,8 @@ def _lower_tier(
             accumulator=accumulator,
             parent_stage=anchor[0],
             parent_port=anchor[1],
+            producers=visible,
+            target=target,
         )
         survivors.append((stage, port))
         if decision is None:
@@ -338,13 +427,19 @@ def _lower_step(
     accumulator: _StageAccumulator,
     anchor: tuple[str, str] | None,
     settings: Mapping[str, Any] | None = None,
+    target: TargetConfig | None = None,
 ) -> tuple[str, str]:
-    descriptor = _descriptor(registry, step.backend, where=f"{role} step {step.id!r}")
+    entry = _entry(registry, step.backend, where=f"{role} step {step.id!r}")
+    descriptor = cast(PluginDescriptor, entry.descriptor)
     inputs = [] if anchor is None else [_binding("primary", anchor[0], anchor[1])]
     accumulator.add(
         stage_id=step.id,
         descriptor=descriptor,
-        settings=step.settings if settings is None else settings,
+        settings=_target_settings(
+            entry,
+            step.settings if settings is None else settings,
+            target,
+        ),
         inputs=inputs,
         origin=StageOrigin(stage_id=step.id, role=role, label=descriptor.display_name),
     )
@@ -358,16 +453,22 @@ def lower_cascade(
     library_path: str | None = None,
     library_format: LibraryFormat | None = None,
     allow_missing_library: bool = False,
+    target: TargetConfig | None = None,
 ) -> LoweredCascade:
     """Render a cascade as an ordered, compilable :class:`PipelineConfig`.
 
     Set ``allow_missing_library`` to compile a cascade that names no library --
     the shape of the funnel is checkable long before a file is chosen.  The
     result is marked as carrying a placeholder path and must not be executed.
+
+    ``target`` overrides the cascade's own target block, which is how the run-
+    time flags (``--receptor`` and friends) reach the docking stages without the
+    cascade file on disk having to be rewritten first.
     """
 
     active_registry = registry or create_builtin_registry()
     accumulator = _StageAccumulator()
+    active_target = cascade.target if target is None else target
 
     source_descriptor = _descriptor(
         active_registry, cascade.ingest.backend, where="the ingest step"
@@ -398,6 +499,7 @@ def lower_cascade(
             registry=active_registry,
             accumulator=accumulator,
             anchor=anchor,
+            target=active_target,
         )
 
     for tier in cascade.tiers:
@@ -408,6 +510,7 @@ def lower_cascade(
             registry=active_registry,
             accumulator=accumulator,
             anchor=anchor,
+            target=active_target,
         )
 
     for step in cascade.finalize.steps:
@@ -421,6 +524,7 @@ def lower_cascade(
             accumulator=accumulator,
             anchor=anchor,
             settings=settings,
+            target=active_target,
         )
 
     pipeline = PipelineConfig.model_validate(
@@ -429,7 +533,11 @@ def lower_cascade(
             "name": cascade.name,
             "description": cascade.description,
             "stages": accumulator.stages,
-            "metadata": _pipeline_metadata(cascade, resolved.path),
+            "metadata": _pipeline_metadata(
+                cascade,
+                resolved.path,
+                docking_included=PluginKind.DOCK in accumulator.kinds,
+            ),
         }
     )
     return LoweredCascade(
@@ -438,6 +546,79 @@ def lower_cascade(
         origins=tuple(accumulator.origins),
         library_is_placeholder=resolved.is_placeholder,
     )
+
+
+#: The marker field.  A plugin that declares somewhere to find a receptor is a
+#: plugin that docks against one; nothing else in the tree declares it.  Keying
+#: off a declared field rather than off :class:`PluginKind` means a future
+#: preparation stage that needs the same protein is covered without being
+#: reclassified, and a plugin that merely happens to have a ``name`` option is
+#: never handed the target's name.
+_TARGET_MARKER_FIELD = "receptor_path"
+
+
+def _target_values(target: TargetConfig) -> dict[str, Any]:
+    """Expand one target block into the fields the engines spell.
+
+    Only the site definition the user actually gave is expanded.  A box that was
+    derived from a reference ligand arrives here already expanded -- deriving it
+    twice, once per engine, is how two engines end up searching two volumes.
+
+    ``pocket_pdb_path`` accepts the generic ``pocket_path`` as its source
+    because a pocket PDB supplied as *the site definition* and one supplied as
+    *KarmaDock's override* are the same file used for the same purpose; the
+    override wins when both are set, which is what makes it an override.
+    """
+
+    values: dict[str, Any] = {"receptor_path": target.receptor_path}
+    if target.receptor_sha256 is not None:
+        # Written only when pinned, so an unpinned target does not put a null in
+        # the stage config and change its cache key for no scientific reason.
+        values["receptor_sha256"] = target.receptor_sha256
+    if target.box is not None:
+        values.update(target.box.settings)
+    if target.reference_ligand_path is not None:
+        values["reference_ligand_path"] = target.reference_ligand_path
+    if target.receptor_pdbqt_path is not None:
+        values["receptor_pdbqt_path"] = target.receptor_pdbqt_path
+    pocket = target.pocket_pdb_path or target.pocket_path
+    if pocket is not None:
+        values["pocket_pdb_path"] = pocket
+    return values
+
+
+def _target_settings(
+    entry: Any,
+    settings: Mapping[str, Any],
+    target: TargetConfig | None,
+) -> dict[str, Any]:
+    """Push the cascade's single target into one docking stage's settings.
+
+    The same "write only what the plugin declares" rule ``_finalize_settings``
+    uses, and for a stronger reason: three engines in one tier that each carried
+    their own receptor could be pointed at three different proteins, and their
+    consensus would be a comparison between numbers that are not about the same
+    thing.  The target therefore *overrides* whatever the stage settings said --
+    a per-engine receptor is not a customisation, it is a disagreement.
+
+    A missing target is not an error here.  A cascade is authored, validated and
+    exported long before anyone chooses a protein, and refusing to lower one
+    would make the docking tier unauthorable.  The requirement is enforced
+    against the stages that need it, at the point a run is about to start, by
+    :func:`molcascade.backends.preflight.preflight_docking_target`.
+    """
+
+    resolved = dict(settings)
+    if target is None:
+        return resolved
+    config_model = getattr(entry.plugin, "config_model", None)
+    fields = set(getattr(config_model, "model_fields", {}))
+    if _TARGET_MARKER_FIELD not in fields:
+        return resolved
+    for name, value in _target_values(target).items():
+        if name in fields:
+            resolved[name] = value
+    return resolved
 
 
 def _finalize_settings(
@@ -465,7 +646,12 @@ def _finalize_settings(
     return settings
 
 
-def _pipeline_metadata(cascade: CascadeConfig, library_path: str) -> dict[str, Any]:
+def _pipeline_metadata(
+    cascade: CascadeConfig,
+    library_path: str,
+    *,
+    docking_included: bool,
+) -> dict[str, Any]:
     metadata = dict(cascade.metadata)
     metadata.update(
         {
@@ -474,7 +660,7 @@ def _pipeline_metadata(cascade: CascadeConfig, library_path: str) -> dict[str, A
             "final_parent_target": cascade.finalize.target_count,
             "random_seed": cascade.finalize.seed,
             "library_path": library_path,
-            "docking_included": False,
+            "docking_included": docking_included,
             "tiers": [
                 {
                     "id": tier.id,

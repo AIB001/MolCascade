@@ -359,6 +359,84 @@ SYNTHESIS_SCORE_V1 = DataContract(
 )
 
 
+LIGAND_CONFORMER_V1 = DataContract(
+    id="ligand_conformer/v1",
+    schema=_schema(
+        "ligand_conformer/v1",
+        [
+            pa.field("parent_id", pa.string(), nullable=False),
+            pa.field("conformer_index", pa.int32(), nullable=False),
+            pa.field("molblock", pa.large_string(), nullable=True),
+            pa.field("energy_kcal_mol", pa.float64(), nullable=True),
+            pa.field("embed_status", pa.string(), nullable=False),
+            pa.field("method_id", pa.string(), nullable=False),
+        ],
+    ),
+    primary_key=("parent_id", "conformer_index"),
+    enums={
+        "embed_status": (
+            "EMBEDDED",
+            "MINIMIZED",
+            "EMBED_FAILED",
+            "MINIMIZE_FAILED",
+        )
+    },
+    invariants={
+        "shared_geometry": (
+            "every docking engine reads the same conformers, so their scores stay comparable"
+        ),
+        "failure_recorded": (
+            "a molecule that could not be embedded keeps a row with a null molblock "
+            "and the reason in embed_status"
+        ),
+        "coordinates_are_3d": "a non-null molblock carries explicit 3D coordinates",
+    },
+)
+
+
+DOCKING_SCORE_V1 = DataContract(
+    id="docking_score/v1",
+    schema=_schema(
+        "docking_score/v1",
+        [
+            pa.field("parent_id", pa.string(), nullable=False),
+            pa.field("engine_id", pa.string(), nullable=False),
+            pa.field("receptor_id", pa.string(), nullable=False),
+            pa.field("pose_rank", pa.int32(), nullable=False),
+            pa.field("score", pa.float64(), nullable=False),
+            pa.field("score_kind", pa.string(), nullable=False),
+            pa.field("direction", pa.string(), nullable=False),
+            pa.field("secondary_score", pa.float64(), nullable=True),
+            pa.field("pose_molblock", pa.large_string(), nullable=True),
+            pa.field("method_id", pa.string(), nullable=False),
+        ],
+    ),
+    primary_key=("parent_id", "engine_id", "receptor_id", "pose_rank"),
+    enums={
+        "score_kind": (
+            "VINA_KCAL_MOL",
+            "VINARDO_KCAL_MOL",
+            "AD4_KCAL_MOL",
+            "CNN_SCORE",
+            "CNN_AFFINITY",
+            "KARMADOCK_MDN",
+        ),
+        "direction": ("LOWER_STRONGER", "HIGHER_STRONGER"),
+    },
+    invariants={
+        "receptor_bound": (
+            "receptor_id is the digest of the receptor bytes, so a score can never be "
+            "compared against a pose computed on a different structure"
+        ),
+        "pose_rank_ordered": "pose_rank is zero-based and orders poses best-first per engine",
+        "not_affinity": (
+            "a docking score ranks candidates and is not a measured or predicted "
+            "binding free energy"
+        ),
+    },
+)
+
+
 SCAFFOLD_ASSIGNMENT_V1 = DataContract(
     id="scaffold_assignment/v1",
     schema=_schema(
@@ -478,7 +556,9 @@ SHORTLIST_EXPORT_V1 = DataContract(
             "record_format determines how structure_record is materialized; no pickle is used"
         ),
         "handoff_only": (
-            "the contract is a shortlist handoff and does not execute docking, MD, or MMPBSA"
+            "the contract is a shortlist handoff and does not execute MD or free-energy "
+            "calculations; docking evidence, when present, travels as scores in "
+            "docking_score/v1 and is not a claim of binding"
         ),
     },
 )
@@ -495,6 +575,8 @@ BUILTIN_CONTRACTS = (
     PREDICTION_V1,
     APPLICABILITY_V1,
     SYNTHESIS_SCORE_V1,
+    LIGAND_CONFORMER_V1,
+    DOCKING_SCORE_V1,
     SCAFFOLD_ASSIGNMENT_V1,
     CLUSTER_ASSIGNMENT_V1,
     SELECTION_DECISION_V1,
@@ -506,8 +588,10 @@ __all__ = [
     "BUILTIN_CONTRACTS",
     "CLUSTER_ASSIGNMENT_V1",
     "DECISION_V1",
+    "DOCKING_SCORE_V1",
     "DRUG_LIKENESS_V1",
     "FINGERPRINT_V1",
+    "LIGAND_CONFORMER_V1",
     "PARENT_SOURCE_MAP_V1",
     "PARENT_V1",
     "PREDICTION_V1",

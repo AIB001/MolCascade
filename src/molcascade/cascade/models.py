@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import re
 from enum import StrEnum
+from pathlib import Path
 from typing import Any, Literal, Self
 
 from pydantic import Field, JsonValue, field_validator, model_validator
@@ -315,6 +316,131 @@ class FinalizeConfig(StrictFrozenModel):
         return self
 
 
+class BoxConfig(StrictFrozenModel):
+    """The search volume, in angstrom, for the engines that search one.
+
+    All six numbers are required.  A default edge length would be a guess about
+    the size of someone else's binding site, and a box that is too small silently
+    truncates the search while a box that is too large turns a pocket study into
+    a blind-docking run -- neither of which announces itself in the scores.
+    """
+
+    center_x: float = Field(allow_inf_nan=False, ge=-10_000.0, le=10_000.0)
+    center_y: float = Field(allow_inf_nan=False, ge=-10_000.0, le=10_000.0)
+    center_z: float = Field(allow_inf_nan=False, ge=-10_000.0, le=10_000.0)
+    size_x: float = Field(allow_inf_nan=False, gt=0.0, le=200.0)
+    size_y: float = Field(allow_inf_nan=False, gt=0.0, le=200.0)
+    size_z: float = Field(allow_inf_nan=False, gt=0.0, le=200.0)
+
+    @property
+    def settings(self) -> dict[str, float]:
+        """The box as the engine configs spell it, in a fixed order."""
+
+        return {
+            "center_x": self.center_x,
+            "center_y": self.center_y,
+            "center_z": self.center_z,
+            "size_x": self.size_x,
+            "size_y": self.size_y,
+            "size_z": self.size_z,
+        }
+
+
+class TargetConfig(StrictFrozenModel):
+    """The protein a cascade's docking tier is pointed at.
+
+    One target per cascade, not one per engine.  Three engines each carrying
+    their own receptor could be handed three different proteins -- or, far more
+    likely, three preparations of the same one -- and the tier's consensus would
+    then be a comparison between numbers that are not about the same thing.
+    Lowering writes these fields into every docking stage that declares them, so
+    the disagreement is structurally impossible rather than merely discouraged.
+
+    The site arrives in one of three forms: an explicit ``box``, a
+    ``reference_ligand_path`` whose atoms define one, or a ``pocket_path``
+    holding the residues that line it.  At least one, and never both files --
+    two structures each claiming to locate the site are two answers to one
+    question, and picking a winner silently would be deciding the experiment.
+
+    A box *alongside* one of those files is the ordinary resolved state rather
+    than a contradiction: ``resolve_target`` derives the box from the file so the
+    engines that read six numbers and the engine that reads a ligand search the
+    same volume.  When both were authored by hand instead,
+    :func:`~molcascade.cascade.target.resolve_target` checks that they agree
+    before either reaches a stage.
+
+    ``receptor_sha256`` is what binds a docking score to bytes rather than to a
+    path.  Present, it is verified and a mismatch stops the run; absent, this
+    run establishes it.
+    """
+
+    name: str = Field(min_length=1, max_length=256)
+
+    #: The structure the *user* supplied, in PDB.  MolCascade reads, hashes and
+    #: validates it; it never edits it.  Protonation, tautomers, cofactors,
+    #: metals and missing loops decide the science and are not guessed here.
+    receptor_path: str = Field(min_length=1, max_length=4096)
+
+    receptor_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+    box: BoxConfig | None = None
+
+    #: A ligand bound in the site, in mol2/sdf/mol.  Its atoms' extent plus a
+    #: padding becomes the box, the ``--autobox_ligand`` convention.
+    reference_ligand_path: str | None = Field(default=None, min_length=1, max_length=4096)
+
+    #: The residues lining the site, as a PDB.  Their extent becomes the box.
+    pocket_path: str | None = Field(default=None, min_length=1, max_length=4096)
+
+    #: Uni-Dock reads PDBQT, and MolCascade derives one with meeko.  Set this
+    #: when that preparation cannot cope with the structure -- odd residues and
+    #: unusual protonation are where it fails -- rather than editing the PDB.
+    receptor_pdbqt_path: str | None = Field(default=None, min_length=1, max_length=4096)
+
+    #: KarmaDock reads an already-selected pocket.  Set this when the geometric
+    #: selection picks up the wrong chain or misses a residue that matters.
+    pocket_pdb_path: str | None = Field(default=None, min_length=1, max_length=4096)
+
+    @field_validator(
+        "receptor_path",
+        "reference_ligand_path",
+        "pocket_path",
+        "receptor_pdbqt_path",
+        "pocket_pdb_path",
+    )
+    @classmethod
+    def _paths_are_absolute(cls, value: str | None) -> str | None:
+        """Refuse a path that means a different file from a different directory.
+
+        A cascade is re-run from wherever someone happens to be standing, and a
+        receptor resolved against the working directory would make the run's
+        identity depend on it.  The CLI expands what the user typed before it
+        gets here, so this only ever fires on a hand-written file.
+        """
+
+        if value is None:
+            return None
+        candidate = Path(value.strip()).expanduser()
+        if not value.strip() or not candidate.is_absolute():
+            raise ValueError("must be an absolute path")
+        return str(candidate)
+
+    @model_validator(mode="after")
+    def _site_is_locatable_and_unambiguous(self) -> Self:
+        if self.box is None and self.reference_ligand_path is None and self.pocket_path is None:
+            raise ValueError(
+                f"target {self.name!r} names a receptor but no binding site; give one of "
+                "'box', 'reference_ligand_path' or 'pocket_path'"
+            )
+        if self.reference_ligand_path is not None and self.pocket_path is not None:
+            raise ValueError(
+                f"target {self.name!r} locates the binding site with two different "
+                "structures ('reference_ligand_path' and 'pocket_path'); keep the one "
+                "that is actually in the site"
+            )
+        return self
+
+
 class CascadeConfig(StrictFrozenModel):
     """Version 2 tier-first screening cascade.
 
@@ -331,6 +457,14 @@ class CascadeConfig(StrictFrozenModel):
     standardize: StepConfig | None = None
     tiers: tuple[TierConfig, ...] = ()
     finalize: FinalizeConfig = Field(default_factory=FinalizeConfig)
+
+    #: The protein the docking tier is pointed at, when there is one.  Optional
+    #: because a cascade is authored long before a target is chosen, and because
+    #: most cascades have no docking tier at all -- the requirement is enforced
+    #: at run time, against the stages that actually need it, rather than by
+    #: making every cascade carry a receptor it will never open.
+    target: TargetConfig | None = None
+
     metadata: dict[str, JsonValue] = Field(default_factory=dict)
 
     @field_validator("name")
@@ -394,6 +528,7 @@ class CascadeConfig(StrictFrozenModel):
 __all__ = [
     "CASCADE_SCHEMA_VERSION",
     "DEFAULT_TARGET_COUNT",
+    "BoxConfig",
     "CascadeConfig",
     "CriterionConfig",
     "FinalizeConfig",
@@ -401,6 +536,7 @@ __all__ = [
     "LibraryConfig",
     "LibraryFormat",
     "StepConfig",
+    "TargetConfig",
     "ThresholdDirection",
     "TierConfig",
     "TierMode",

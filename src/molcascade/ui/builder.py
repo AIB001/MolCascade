@@ -380,6 +380,7 @@ _CAPABILITY_SLOTS: dict[Capability, str] = {
     Capability.PREDICT: "predict",
     Capability.APPLICABILITY: "applicability",
     Capability.SYNTHESIS: "synthesis",
+    Capability.DOCK: "dock",
     Capability.SCAFFOLD: "scaffold",
     Capability.CLUSTER: "cluster",
     Capability.SELECT: "select",

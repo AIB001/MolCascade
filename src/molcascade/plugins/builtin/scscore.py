@@ -41,6 +41,7 @@ import io
 import json
 import os
 import stat
+from functools import cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -50,11 +51,13 @@ import pyarrow.parquet as pq
 from pydantic import Field, ValidationError, field_validator
 
 from molcascade.assets import is_asset_reference, resolve_reference
-from molcascade.chemistry.datasets import iter_contract_batches, require_single_input
+from molcascade.chemistry.datasets import require_single_input
+from molcascade.chemistry.sharding import shard_stage
 from molcascade.config.canonical import canonical_json, canonical_sha256
 from molcascade.config.models import StrictFrozenModel
 from molcascade.contracts import PARENT_V1, SYNTHESIS_SCORE_V1
 from molcascade.errors import AssetError, PluginError
+from molcascade.parallel import ShardOutcome, ShardTask, iter_shard_batches
 from molcascade.plugins.api import PendingOutput, StageContext, StageRequest, StageResponse
 from molcascade.plugins.manifest import (
     Cardinality,
@@ -131,23 +134,6 @@ def _validated_config(request: StageRequest) -> ScScoreConfig:
             code="PLUGIN_CONFIG_INVALID",
             context={"error_count": error.error_count()},
         ) from error
-
-
-def _prepare_outputs(context: StageContext) -> tuple[Path, Path]:
-    context.staging_root.mkdir(parents=True, exist_ok=True)
-    destinations = (
-        context.staging_root / _PARENT_PATH,
-        context.staging_root / _SCORE_PATH,
-    )
-    for relative, destination in zip((_PARENT_PATH, _SCORE_PATH), destinations, strict=True):
-        if destination.exists() or destination.is_symlink():
-            raise PluginError(
-                f"SCScore output already exists: {relative.as_posix()}",
-                code="PLUGIN_STAGING_NOT_EMPTY",
-                context={"path": relative.as_posix()},
-            )
-        destination.parent.mkdir(parents=True, exist_ok=True)
-    return destinations
 
 
 def _read_weight_bytes(configured: str) -> tuple[Path, bytes, str]:
@@ -376,6 +362,156 @@ def _forward(features: np.ndarray, layers: tuple[tuple[np.ndarray, np.ndarray], 
     return 1.0 + (_SCORE_SCALE - 1.0) / (1.0 + np.exp(-np.clip(logits, -500.0, 500.0)))
 
 
+@cache
+def _load_model(
+    weights_path: str,
+    expected_sha256: str,
+) -> tuple[Path, str, tuple[tuple[np.ndarray, np.ndarray], ...], int]:
+    """Read, verify and parse the published weights once per process.
+
+    Cached because the file is a 10-40 MB gzipped JSON list of matrices and a
+    worker is handed many shards in a row; parsing it per shard would cost more
+    than the forward pass over the whole shard.  The digest is part of the key,
+    so a differently-pinned criterion never sees another one's matrices.
+    """
+
+    path, payload, digest = _read_weight_bytes(weights_path)
+    if digest != expected_sha256:
+        raise PluginError(
+            "SCScore weight file does not match the pinned digest",
+            code="SCSCORE_WEIGHTS_DIGEST_MISMATCH",
+            hint=(
+                "Set expected_weights_sha256 to the value sha256sum prints for the "
+                "file you intend to use, or restore the file you pinned."
+            ),
+            context={
+                "weights_path": str(path),
+                "expected": expected_sha256,
+                "actual": digest,
+            },
+        )
+    layers = _parse_layers(_decompress(payload))
+    del payload
+    return path, digest, layers, int(layers[0][0].shape[0])
+
+
+def _method_id(
+    config: ScScoreConfig,
+    *,
+    rdkit_version: str,
+    fingerprint_bits: int,
+    layers: tuple[tuple[np.ndarray, np.ndarray], ...],
+    digest: str,
+) -> str:
+    return "synthesis-sc:sha256:" + canonical_sha256(
+        {
+            "backend": "molcascade-native-numpy",
+            "direction": "HIGHER_HARDER",
+            "doi": "10.1021/acs.jcim.7b00622",
+            "fingerprint": config.fingerprint,
+            "fingerprint_bits": fingerprint_bits,
+            "implementation_version": _IMPLEMENTATION_VERSION,
+            "layer_shapes": [[int(size) for size in weight.shape] for weight, _ in layers],
+            "method": "SCScore (Coley 2018)",
+            "morgan_radius": _MORGAN_RADIUS,
+            "rdkit_version": rdkit_version,
+            "score_scale": _SCORE_SCALE,
+            "use_chirality": _USE_CHIRALITY,
+            "weights_sha256": digest,
+        }
+    )
+
+
+def _run_shard(task: ShardTask) -> ShardOutcome:
+    """Score one contiguous range of parents in whichever process owns it."""
+
+    from rdkit import Chem, rdBase
+
+    config = ScScoreConfig.model_validate(dict(task.config))
+    _, digest, layers, fingerprint_bits = _load_model(
+        config.weights_path, config.expected_weights_sha256
+    )
+    use_counts = config.fingerprint == "counts"
+    method_id = _method_id(
+        config,
+        rdkit_version=rdBase.rdkitVersion,
+        fingerprint_bits=fingerprint_bits,
+        layers=layers,
+        digest=digest,
+    )
+    domain = (
+        f"SCScore reaction-complexity model over a {fingerprint_bits}-bit Morgan "
+        f"fingerprint ({config.fingerprint}); nominal range 1-5"
+    )
+    warning_codes = canonical_json(["SYNTHESIS_PROXY_NOT_ROUTE"])
+    input_count = 0
+    with (
+        pq.ParquetWriter(
+            task.output_paths["primary"], PARENT_V1.schema, compression="zstd"
+        ) as parent_writer,
+        pq.ParquetWriter(
+            task.output_paths["synthesis_scores"],
+            SYNTHESIS_SCORE_V1.schema,
+            compression="zstd",
+        ) as score_writer,
+    ):
+        for batch in iter_shard_batches(task, batch_size=config.batch_size):
+            rows = batch.select(["parent_id", "parent_smiles"]).to_pylist()
+            molecules = []
+            for row in rows:
+                smiles = row.get("parent_smiles")
+                molecule = Chem.MolFromSmiles(smiles if isinstance(smiles, str) else "")
+                if molecule is None:
+                    raise PluginError(
+                        "registered parent cannot be parsed for SCScore",
+                        code="SCSCORE_PARENT_INVALID",
+                        context={"parent_id": str(row.get("parent_id"))},
+                    )
+                molecules.append(molecule)
+            input_count += len(rows)
+
+            features = _fingerprints(molecules, bits=fingerprint_bits, counts=use_counts)
+            empty = np.flatnonzero(features.sum(axis=1) == 0.0)
+            if empty.size:
+                # The reference scores these 0.0, which on a HIGHER_HARDER axis
+                # reads as "trivially easy" -- the opposite of "no answer".
+                # Stop instead.
+                raise PluginError(
+                    "a parent produced an empty fingerprint, so SCScore has no input "
+                    "to score",
+                    code="SCSCORE_FINGERPRINT_EMPTY",
+                    context={"parent_id": str(rows[int(empty[0])].get("parent_id"))},
+                )
+            scores = _forward(features, layers)
+            if not np.all(np.isfinite(scores)):
+                raise PluginError(
+                    "SCScore produced a non-finite value",
+                    code="SCSCORE_SCORE_NON_FINITE",
+                )
+
+            parent_writer.write_batch(batch)
+            score_writer.write_table(
+                pa.Table.from_pylist(
+                    [
+                        {
+                            "parent_id": row.get("parent_id"),
+                            "method_id": method_id,
+                            "score": float(score),
+                            "direction": "HIGHER_HARDER",
+                            "domain": domain,
+                            "warning_codes_json": warning_codes,
+                        }
+                        for row, score in zip(rows, scores.tolist(), strict=True)
+                    ],
+                    schema=SYNTHESIS_SCORE_V1.schema,
+                )
+            )
+    return ShardOutcome(
+        rows_in=input_count,
+        rows_out={"primary": input_count, "synthesis_scores": input_count},
+    )
+
+
 class ScScorePlugin:
     """Score reaction-derived synthetic complexity from published weights."""
 
@@ -401,140 +537,51 @@ class ScScorePlugin:
     config_model = ScScoreConfig
 
     def execute(self, request: StageRequest, context: StageContext) -> StageResponse:
-        from rdkit import Chem, rdBase
+        from rdkit import rdBase
 
         config = _validated_config(request)
         stage_input = require_single_input(request.inputs, contract_id=PARENT_V1.id)
-
-        path, payload, digest = _read_weight_bytes(config.weights_path)
-        if digest != config.expected_weights_sha256:
+        # Loaded in the parent as well, so a missing or re-pinned weight file
+        # stops the stage before any shard is scheduled -- and the digest that
+        # goes into the method identity is read from bytes, not from config.
+        path, digest, layers, fingerprint_bits = _load_model(
+            config.weights_path, config.expected_weights_sha256
+        )
+        method_id = _method_id(
+            config,
+            rdkit_version=rdBase.rdkitVersion,
+            fingerprint_bits=fingerprint_bits,
+            layers=layers,
+            digest=digest,
+        )
+        result = shard_stage(
+            worker=_run_shard,
+            stage_input=stage_input,
+            contract=PARENT_V1,
+            output_paths={
+                "primary": _PARENT_PATH.as_posix(),
+                "synthesis_scores": _SCORE_PATH.as_posix(),
+            },
+            context=context,
+            stage_id=request.stage_id,
+            config=config.model_dump(mode="json"),
+        )
+        if result.rows_in == 0:
             raise PluginError(
-                "SCScore weight file does not match the pinned digest",
-                code="SCSCORE_WEIGHTS_DIGEST_MISMATCH",
-                hint=(
-                    "Set expected_weights_sha256 to the value sha256sum prints for the "
-                    "file you intend to use, or restore the file you pinned."
-                ),
-                context={
-                    "weights_path": str(path),
-                    "expected": config.expected_weights_sha256,
-                    "actual": digest,
-                },
+                "SCScore input contains no parents",
+                code="SCSCORE_EMPTY_INPUT",
             )
-        layers = _parse_layers(_decompress(payload))
-        del payload
-        fingerprint_bits = int(layers[0][0].shape[0])
-        use_counts = config.fingerprint == "counts"
-
-        parent_destination, score_destination = _prepare_outputs(context)
-        method_id = "synthesis-sc:sha256:" + canonical_sha256(
-            {
-                "backend": "molcascade-native-numpy",
-                "direction": "HIGHER_HARDER",
-                "doi": "10.1021/acs.jcim.7b00622",
-                "fingerprint": config.fingerprint,
-                "fingerprint_bits": fingerprint_bits,
-                "implementation_version": _IMPLEMENTATION_VERSION,
-                "layer_shapes": [[int(size) for size in weight.shape] for weight, _ in layers],
-                "method": "SCScore (Coley 2018)",
-                "morgan_radius": _MORGAN_RADIUS,
-                "rdkit_version": rdBase.rdkitVersion,
-                "score_scale": _SCORE_SCALE,
-                "use_chirality": _USE_CHIRALITY,
-                "weights_sha256": digest,
-            }
-        )
-        domain = (
-            f"SCScore reaction-complexity model over a {fingerprint_bits}-bit Morgan "
-            f"fingerprint ({config.fingerprint}); nominal range 1-5"
-        )
-        warning_codes = canonical_json(["SYNTHESIS_PROXY_NOT_ROUTE"])
-
-        input_count = 0
-        try:
-            with (
-                pq.ParquetWriter(
-                    parent_destination, PARENT_V1.schema, compression="zstd"
-                ) as parent_writer,
-                pq.ParquetWriter(
-                    score_destination, SYNTHESIS_SCORE_V1.schema, compression="zstd"
-                ) as score_writer,
-            ):
-                for batch in iter_contract_batches(
-                    stage_input, PARENT_V1, batch_size=config.batch_size
-                ):
-                    rows = batch.select(["parent_id", "parent_smiles"]).to_pylist()
-                    molecules = []
-                    for row in rows:
-                        smiles = row.get("parent_smiles")
-                        molecule = Chem.MolFromSmiles(smiles if isinstance(smiles, str) else "")
-                        if molecule is None:
-                            raise PluginError(
-                                "registered parent cannot be parsed for SCScore",
-                                code="SCSCORE_PARENT_INVALID",
-                                context={"parent_id": str(row.get("parent_id"))},
-                            )
-                        molecules.append(molecule)
-                    input_count += len(rows)
-
-                    features = _fingerprints(
-                        molecules, bits=fingerprint_bits, counts=use_counts
-                    )
-                    empty = np.flatnonzero(features.sum(axis=1) == 0.0)
-                    if empty.size:
-                        # The reference scores these 0.0, which on a
-                        # HIGHER_HARDER axis reads as "trivially easy" -- the
-                        # opposite of "no answer".  Stop instead.
-                        raise PluginError(
-                            "a parent produced an empty fingerprint, so SCScore has no input "
-                            "to score",
-                            code="SCSCORE_FINGERPRINT_EMPTY",
-                            context={"parent_id": str(rows[int(empty[0])].get("parent_id"))},
-                        )
-                    scores = _forward(features, layers)
-                    if not np.all(np.isfinite(scores)):
-                        raise PluginError(
-                            "SCScore produced a non-finite value",
-                            code="SCSCORE_SCORE_NON_FINITE",
-                        )
-
-                    parent_writer.write_batch(batch)
-                    score_writer.write_table(
-                        pa.Table.from_pylist(
-                            [
-                                {
-                                    "parent_id": row.get("parent_id"),
-                                    "method_id": method_id,
-                                    "score": float(score),
-                                    "direction": "HIGHER_HARDER",
-                                    "domain": domain,
-                                    "warning_codes_json": warning_codes,
-                                }
-                                for row, score in zip(rows, scores.tolist(), strict=True)
-                            ],
-                            schema=SYNTHESIS_SCORE_V1.schema,
-                        )
-                    )
-            if input_count == 0:
-                raise PluginError(
-                    "SCScore input contains no parents",
-                    code="SCSCORE_EMPTY_INPUT",
-                )
-        except BaseException:
-            parent_destination.unlink(missing_ok=True)
-            score_destination.unlink(missing_ok=True)
-            raise
-
+        input_count = result.rows_in
         return StageResponse(
             outputs={
                 "primary": PendingOutput(
                     PARENT_V1.id,
-                    (_PARENT_PATH.as_posix(),),
+                    result.file_paths["primary"],
                     {"row_count": input_count},
                 ),
                 "synthesis_scores": PendingOutput(
                     SYNTHESIS_SCORE_V1.id,
-                    (_SCORE_PATH.as_posix(),),
+                    result.file_paths["synthesis_scores"],
                     {"row_count": input_count, "method_id": method_id},
                 ),
             },
@@ -552,6 +599,7 @@ class ScScorePlugin:
                 "fingerprint_bits": fingerprint_bits,
                 "layer_count": len(layers),
                 "network_or_download_invoked_by_adapter": False,
+                **result.response_metadata(),
             },
         )
 

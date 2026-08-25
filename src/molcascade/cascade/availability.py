@@ -168,6 +168,20 @@ def option_availability(
             runnable=False,
             reason="The threshold gate this tool needs is not registered here.",
         )
+    if option.requires_license_optin:
+        # Checked before the package probe because the answer does not depend on
+        # this machine: installing the tool would not make it selectable, and a
+        # message about a missing import would send the user to fix the wrong
+        # thing.
+        return OptionAvailability(
+            runnable=False,
+            reason=(
+                f"This tool is {option.license_spdx}, and a run has to permit "
+                "copyleft backends before it will start. Screen with "
+                "'--allow-copyleft' if your project accepts those terms; the "
+                "run records that it was given, so a methods section can say so."
+            ),
+        )
     packages = missing_requirements(option)
     if packages:
         return OptionAvailability(

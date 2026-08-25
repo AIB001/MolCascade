@@ -507,18 +507,27 @@ def _plan(cpu: CpuInfo, memory: MemoryInfo, gpus: tuple[GpuDevice, ...]) -> Exec
         device = "cuda:0" if gpus[0].vendor is AcceleratorVendor.NVIDIA else "gpu:0"
         if gpus[0].vendor is AcceleratorVendor.APPLE:
             device = "mps"
+        # Only NVIDIA cards become addressable lanes here, because a lane is
+        # pinned with CUDA_VISIBLE_DEVICES and nothing else honours it.  A
+        # machine with one Apple or AMD accelerator still reports one lane; it
+        # simply cannot report four of them.
+        cuda = tuple(f"cuda:{gpu.index}" for gpu in gpus if gpu.vendor is AcceleratorVendor.NVIDIA)
+        devices = cuda or (device,)
         rationale = (
             f"{len(gpus)} accelerator(s) detected ({gpus[0].name}); "
+            f"{len(devices)} execution lane(s) ({', '.join(devices)}); "
             f"{workers} CPU worker(s) from {cores} usable core(s); {memory_reason}"
         )
     else:
         device = "cpu"
+        devices = ()
         rationale = (
             f"no accelerator detected; {workers} CPU worker(s) from {cores} usable "
             f"core(s); {memory_reason}"
         )
     return ExecutionPlan(
         device=device,
+        devices=devices,
         gpu_count=len(gpus),
         recommended_workers=workers,
         recommended_batch_size=batch,

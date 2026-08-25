@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 import threading
 import uuid
 from collections.abc import Callable, Mapping
@@ -9,7 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from pydantic import ValidationError
+from pydantic import JsonValue, ValidationError
 
 from molcascade.artifacts import (
     ArtifactDatasetRef,
@@ -28,6 +29,8 @@ from molcascade.errors import (
     PluginError,
 )
 from molcascade.io.atomic import DestinationExistsError, atomic_write_bytes
+from molcascade.parallel.models import StageResources
+from molcascade.parallel.shards import count_completed_shards
 from molcascade.pipeline import CompiledPipeline, CompiledStage, PipelineCompiler
 from molcascade.pipeline.models import PipelineRevision
 from molcascade.plugins import (
@@ -132,6 +135,8 @@ class LocalRunner:
         contracts: ContractRegistry = DEFAULT_CONTRACT_REGISTRY,
         clock: Callable[[], datetime] = _utcnow,
         run_id_factory: Callable[[], str] | None = None,
+        resources: StageResources | None = None,
+        permitted_licenses: Mapping[str, str] | None = None,
     ) -> None:
         if not isinstance(plugins, PluginRegistry):
             raise TypeError("plugins must be a PluginRegistry")
@@ -141,6 +146,10 @@ class LocalRunner:
             raise TypeError("clock must be callable")
         if run_id_factory is not None and not callable(run_id_factory):
             raise TypeError("run_id_factory must be callable")
+        if resources is not None and not isinstance(resources, StageResources):
+            raise TypeError("resources must be a StageResources")
+        if permitted_licenses is not None and not isinstance(permitted_licenses, Mapping):
+            raise TypeError("permitted_licenses must be a mapping of backend id to SPDX id")
 
         requested = Path(workspace).expanduser()
         if requested.is_symlink():
@@ -161,7 +170,18 @@ class LocalRunner:
         self.events_root = _ensure_workspace_child(self.workspace, "events")
         self.cache_root = _ensure_workspace_child(self.workspace, "cache")
         self.run_locks_root = _ensure_workspace_child(self.workspace, ".run-locks")
+        # Keyed by invocation cache key, not by run id: an interrupted run and
+        # the run that resumes it are two run ids computing the same stage, and
+        # sharing shards between them is the entire point.
+        self.checkpoints_root = _ensure_workspace_child(self.workspace, "checkpoints")
         self.cache = LocalStageCache(self.cache_root)
+        self.resources = resources or StageResources()
+        # Which copyleft backends this run was deliberately allowed to link, by
+        # SPDX identifier.  Recorded rather than merely enforced: a screening
+        # campaign that used GNINA has to be able to say so in its methods
+        # section, and "the operator passed a flag" is not the same statement as
+        # "this run executed GNINA under GPL-2.0-or-later".
+        self.permitted_licenses = dict(permitted_licenses or {})
         self._clock = clock
         self._run_id_factory = run_id_factory or (lambda: f"run-{uuid.uuid4().hex}")
         self._lock = threading.RLock()
@@ -173,6 +193,60 @@ class LocalRunner:
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError("clock must return a timezone-aware datetime")
         return value.astimezone(UTC)
+
+    def _stage_resources(self, cache_key: str, *, force: bool) -> StageResources:
+        """Grant one stage its share of this machine, plus somewhere to resume from.
+
+        The directory is named by the invocation cache key rather than by the
+        run, so a stage that is recomputing exactly the same thing finds its own
+        earlier shards no matter which run wrote them -- and a stage whose
+        inputs or config changed gets a different key and therefore an empty
+        directory, without anyone having to invalidate anything.
+
+        ``--force`` already discards the stage cache; it discards checkpoints
+        for the same reason.  A user re-running to escape a result they do not
+        trust must not be handed pieces of it back.
+        """
+
+        return self.resources.replace(
+            checkpoint_dir=self.checkpoints_root / cache_key,
+            reuse_checkpoints=not force,
+        )
+
+    @staticmethod
+    def _discard_checkpoints(checkpoint_dir: Path | None) -> None:
+        """Drop a committed stage's shards; never let cleanup fail a good run."""
+
+        if checkpoint_dir is None:
+            return
+        shutil.rmtree(checkpoint_dir, ignore_errors=True)
+
+    def _audit_shard_plan(
+        self,
+        audit: AuditLog,
+        stage_id: str,
+        metadata: Mapping[str, JsonValue],
+    ) -> None:
+        """Record how a stage was actually divided, if it was divided at all.
+
+        Read back out of the plugin's own response rather than predicted, so
+        the log says what happened.  Above all it names the lanes: a run that
+        had GPUs and used CPU is exactly the outcome that must never be
+        reconstructable only by watching how long it took.
+        """
+
+        if "shard_count" not in metadata:
+            return
+        details: dict[str, JsonValue] = {"shard_count": metadata["shard_count"]}
+        for field in ("shards_reused", "execution_lanes", "execution_notes"):
+            if field in metadata:
+                details[field] = metadata[field]
+        audit.append(
+            "STAGE_SHARDS_PLANNED",
+            timestamp=self._now(),
+            stage_id=stage_id,
+            details=details,
+        )
 
     @staticmethod
     def _checked_run_id(run_id: str) -> str:
@@ -914,7 +988,10 @@ class LocalRunner:
                     audit.append(
                         "RUN_STARTED",
                         timestamp=state.started_at,
-                        details={"force": force},
+                        details={
+                            "force": force,
+                            "permitted_licenses": dict(self.permitted_licenses),
+                        },
                     )
                 except Exception as raw_error:
                     public_error = self._control_plane_error(
@@ -1107,6 +1184,26 @@ class LocalRunner:
                             },
                         )
 
+                    stage_resources = self._stage_resources(key, force=force)
+                    checkpoint_dir = stage_resources.checkpoint_dir
+                    if force:
+                        # --force already throws away the stage cache.  Leaving
+                        # half a dataset behind under the same key would let a
+                        # later, non-forced run pick pieces of it back up.
+                        self._discard_checkpoints(checkpoint_dir)
+                    elif checkpoint_dir is not None:
+                        resumed, _ = count_completed_shards(checkpoint_dir)
+                        if resumed:
+                            # One event per stage, not per shard: AuditLog.append
+                            # rewrites the whole JSONL, so forty shards across
+                            # twenty tiers would be eight hundred full rewrites.
+                            audit.append(
+                                "STAGE_SHARDS_RESUMED",
+                                timestamp=self._now(),
+                                stage_id=stage.stage_id,
+                                details={"shards_reused": resumed, "cache_key": key},
+                            )
+
                     with self.store.staging_area() as staging:
                         request_inputs = {
                             request_port: StageInput(
@@ -1123,7 +1220,11 @@ class LocalRunner:
                             inputs=request_inputs,
                             config=stage.config,
                         )
-                        response = plugin.execute(request, StageContext(staging))
+                        response = plugin.execute(
+                            request,
+                            StageContext(staging, stage_resources),
+                        )
+                        self._audit_shard_plan(audit, stage.stage_id, response.metadata)
                         validated = validate_stage_response(
                             stage,
                             response,
@@ -1156,6 +1257,11 @@ class LocalRunner:
                             },
                             cache_key=key,
                         )
+                    # The artifact is committed and immutable, so the shards it
+                    # was built from are now redundant copies of it.  Kept on
+                    # failure, discarded on success -- that asymmetry is the
+                    # whole contract of the checkpoint directory.
+                    self._discard_checkpoints(checkpoint_dir)
                     output_ref = manifest.dataset_ref(stage.output_port)
                     produced_outputs = self._verify_checkpoint(
                         stage,

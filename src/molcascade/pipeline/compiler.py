@@ -37,6 +37,8 @@ DEFAULT_SLOT_KINDS: Mapping[str, PluginKind] = MappingProxyType(
         "hard_gate": PluginKind.GATE,
         "gate": PluginKind.GATE,
         "synthesis": PluginKind.SYNTHESIS,
+        "dock": PluginKind.DOCK,
+        "docking": PluginKind.DOCK,
         "featurize": PluginKind.FEATURIZER,
         "featurizer": PluginKind.FEATURIZER,
         "train": PluginKind.TRAINER,

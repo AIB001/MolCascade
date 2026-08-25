@@ -25,6 +25,7 @@ from molcascade.config.canonical import canonical_sha256
 from molcascade.config.models import StrictFrozenModel
 from molcascade.contracts import (
     DECISION_V1,
+    DOCKING_SCORE_V1,
     PARENT_V1,
     PREDICTION_V1,
     SYNTHESIS_SCORE_V1,
@@ -123,12 +124,80 @@ class SynthesisScoreEvidenceGateConfig(_NumericBoundsConfig):
         return SynthesisScoreDirection(value) if isinstance(value, str) else value
 
 
+class DockingScoreDirection(StrEnum):
+    """Direction values defined by ``docking_score/v1``."""
+
+    LOWER_STRONGER = "LOWER_STRONGER"
+    HIGHER_STRONGER = "HIGHER_STRONGER"
+
+
+class DockingScoreKind(StrEnum):
+    """Score scales defined by ``docking_score/v1``.
+
+    The scale is part of the threshold, not decoration.  ``-8.5`` is a strong
+    Vina score and an impossible CNN score; ``0.9`` is the reverse.  A window
+    typed against one scale and applied to another would reject everything or
+    accept everything, and it would do so quietly, which is why the gate makes
+    the operator name the scale and then refuses to run when the evidence
+    disagrees.
+    """
+
+    VINA_KCAL_MOL = "VINA_KCAL_MOL"
+    VINARDO_KCAL_MOL = "VINARDO_KCAL_MOL"
+    AD4_KCAL_MOL = "AD4_KCAL_MOL"
+    CNN_SCORE = "CNN_SCORE"
+    CNN_AFFINITY = "CNN_AFFINITY"
+    KARMADOCK_MDN = "KARMADOCK_MDN"
+
+
+class DockingScoreEvidenceGateConfig(_NumericBoundsConfig):
+    """Bind one engine, one receptor and one score scale to a numeric window."""
+
+    engine_id: str | None = Field(default=None, min_length=1, max_length=256)
+    #: The sha256 of the receptor the scores were computed against.  Left unset
+    #: it is resolved from the evidence, which is the common case: a cascade
+    #: docks one target.  Set, it is a promise that this gate's threshold was
+    #: chosen for *these* bytes -- and evidence from a different structure then
+    #: fails closed instead of being silently compared against it.
+    receptor_id: str | None = Field(default=None, min_length=1, max_length=256)
+    expected_score_kind: DockingScoreKind
+    expected_direction: DockingScoreDirection
+
+    @field_validator("engine_id", "receptor_id")
+    @classmethod
+    def _identities_are_unambiguous(cls, value: str | None) -> str | None:
+        if value is not None and (
+            value != value.strip() or any(character in value for character in "\r\n\x00")
+        ):
+            raise ValueError(
+                "engine_id and receptor_id must not contain surrounding or control whitespace"
+            )
+        return value
+
+    @field_validator("expected_score_kind", mode="before")
+    @classmethod
+    def _parse_score_kind(cls, value: Any) -> Any:
+        return DockingScoreKind(value) if isinstance(value, str) else value
+
+    @field_validator("expected_direction", mode="before")
+    @classmethod
+    def _parse_docking_direction(cls, value: Any) -> Any:
+        return DockingScoreDirection(value) if isinstance(value, str) else value
+
+
+_GateConfig = (
+    DockingScoreEvidenceGateConfig
+    | PredictionEvidenceGateConfig
+    | SynthesisScoreEvidenceGateConfig
+)
+
+
 def _validated_config(
     request: StageRequest,
-    model: type[PredictionEvidenceGateConfig] | type[SynthesisScoreEvidenceGateConfig],
+    model: type[_GateConfig],
     *,
     label: str,
-) -> PredictionEvidenceGateConfig | SynthesisScoreEvidenceGateConfig:
+) -> _GateConfig:
     try:
         return model.model_validate(dict(request.config))
     except ValidationError as error:
@@ -314,7 +383,7 @@ def _retained_evidence_outside_current_population(
 ) -> int:
     """Count valid upstream evidence rows ignored after an earlier serial filter."""
 
-    if table not in {"prediction_evidence", "synthesis_evidence"}:
+    if table not in {"docking_evidence", "prediction_evidence", "synthesis_evidence"}:
         raise ValueError("unknown internal evidence table")
     row = connection.execute(
         f"""
@@ -541,6 +610,114 @@ def _insert_synthesis_evidence(
     return count
 
 
+def _insert_docking_evidence(
+    connection: sqlite3.Connection,
+    stage_input: StageInput,
+    *,
+    batch_size: int,
+) -> int:
+    """Load every pose, not just the ranked one.
+
+    A docking engine emits several poses per molecule and the pose that decides
+    the molecule's fate is the strongest one, which is a question about the
+    scores rather than about the ordering.  Loading the whole set means the gate
+    can find it for itself instead of trusting ``pose_rank`` to have been
+    computed with the same notion of "better" the threshold uses -- and the two
+    disagreeing is exactly the kind of silent inversion that would let a run
+    keep its worst poses and call them hits.
+
+    ``pose_molblock`` is deliberately not loaded.  It is the largest column in
+    the contract by a wide margin and no threshold reads it; the geometry stays
+    in the evidence artifact where a later stage can find it.
+    """
+
+    connection.execute(
+        """
+        CREATE TABLE docking_evidence (
+            parent_id TEXT NOT NULL,
+            engine_id TEXT NOT NULL,
+            receptor_id TEXT NOT NULL,
+            pose_rank INTEGER NOT NULL,
+            score REAL NOT NULL,
+            score_kind TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            PRIMARY KEY (parent_id, engine_id, receptor_id, pose_rank)
+        ) WITHOUT ROWID
+        """
+    )
+    count = 0
+    allowed_kinds = {item.value for item in DockingScoreKind}
+    allowed_directions = {item.value for item in DockingScoreDirection}
+    for batch in iter_contract_batches(
+        stage_input,
+        DOCKING_SCORE_V1,
+        batch_size=batch_size,
+    ):
+        for row in batch.to_pylist():
+            parent_id = str(row["parent_id"])
+            engine_id = str(row["engine_id"])
+            receptor_id = str(row["receptor_id"])
+            score_kind = str(row["score_kind"])
+            direction = str(row["direction"])
+            if (
+                not engine_id
+                or not receptor_id
+                or score_kind not in allowed_kinds
+                or direction not in allowed_directions
+            ):
+                raise PluginError(
+                    "docking evidence contains an invalid engine, receptor, scale or direction",
+                    code="EVIDENCE_GATE_IDENTITY_INVALID",
+                    context={
+                        "parent_id": parent_id,
+                        "engine_id": engine_id,
+                        "receptor_id": receptor_id,
+                        "score_kind": score_kind,
+                        "direction": direction,
+                    },
+                )
+            pose_rank = int(row["pose_rank"])
+            if pose_rank < 0:
+                raise PluginError(
+                    "docking evidence contains a negative pose rank",
+                    code="EVIDENCE_GATE_POSE_RANK_INVALID",
+                    context={"parent_id": parent_id, "pose_rank": pose_rank},
+                )
+            for field in ("score", "secondary_score"):
+                _ensure_finite(
+                    row.get(field),
+                    field=field,
+                    parent_id=parent_id,
+                    label="docking evidence",
+                )
+            try:
+                connection.execute(
+                    "INSERT INTO docking_evidence VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        parent_id,
+                        engine_id,
+                        receptor_id,
+                        pose_rank,
+                        float(row["score"]),
+                        score_kind,
+                        direction,
+                    ),
+                )
+            except sqlite3.IntegrityError as error:
+                raise PluginError(
+                    "docking evidence contains a duplicate pose row",
+                    code="EVIDENCE_GATE_DUPLICATE_EVIDENCE",
+                    context={
+                        "parent_id": parent_id,
+                        "engine_id": engine_id,
+                        "receptor_id": receptor_id,
+                        "pose_rank": pose_rank,
+                    },
+                ) from error
+            count += 1
+    return count
+
+
 def _evaluate_prediction(
     connection: sqlite3.Connection,
     *,
@@ -706,6 +883,143 @@ def _evaluate_synthesis(
             )
             passed_count += int(passed)
     return passed_count, method_id, policy_id
+
+
+def _evaluate_docking(
+    connection: sqlite3.Connection,
+    *,
+    stage_id: str,
+    config: DockingScoreEvidenceGateConfig,
+) -> tuple[int, str, str, str]:
+    engine_id = _resolve_optional_identity(
+        connection,
+        configured=config.engine_id,
+        query=(
+            "SELECT DISTINCT e.engine_id FROM docking_evidence e "
+            "JOIN parents p ON p.parent_id = e.parent_id ORDER BY e.engine_id"
+        ),
+        parameters=(),
+        identity_name="engine_id",
+        label="docking evidence gate",
+    )
+    receptor_id = _resolve_optional_identity(
+        connection,
+        configured=config.receptor_id,
+        query=(
+            "SELECT DISTINCT e.receptor_id FROM docking_evidence e "
+            "JOIN parents p ON p.parent_id = e.parent_id "
+            "WHERE e.engine_id = ? ORDER BY e.receptor_id"
+        ),
+        parameters=(engine_id,),
+        identity_name="receptor_id for the configured engine",
+        label="docking evidence gate",
+    )
+    observed = connection.execute(
+        """
+        SELECT DISTINCT score_kind, direction
+        FROM docking_evidence
+        WHERE engine_id = ? AND receptor_id = ?
+        ORDER BY score_kind, direction
+        """,
+        (engine_id, receptor_id),
+    ).fetchmany(3)
+    mismatched = [
+        (str(row[0]), str(row[1]))
+        for row in observed
+        if str(row[0]) != config.expected_score_kind.value
+        or str(row[1]) != config.expected_direction.value
+    ]
+    if mismatched:
+        # Two distinct ways to be wrong -- the wrong scale, or the right scale
+        # read backwards -- and both turn a threshold into noise, so they share
+        # one refusal rather than being ranked against each other.
+        raise PluginError(
+            "docking evidence scale or direction conflicts with the configured policy",
+            code="EVIDENCE_GATE_SCORE_SEMANTICS_MISMATCH",
+            context={
+                "engine_id": engine_id,
+                "receptor_id": receptor_id,
+                "expected_score_kind": config.expected_score_kind.value,
+                "expected_direction": config.expected_direction.value,
+                "observed": [
+                    {"score_kind": kind, "direction": direction}
+                    for kind, direction in mismatched
+                ],
+            },
+        )
+    stronger = config.expected_direction is DockingScoreDirection.LOWER_STRONGER
+    policy_id = "docking-gate:sha256:" + canonical_sha256(
+        {
+            "implementation_version": 1,
+            "engine_id": engine_id,
+            "receptor_id": receptor_id,
+            "score_kind": config.expected_score_kind.value,
+            "direction": config.expected_direction.value,
+            "pose_policy": "BEST_POSE",
+            "minimum": config.minimum,
+            "maximum": config.maximum,
+            "bounds_inclusive": True,
+            "missing_policy": "REJECT",
+        }
+    )
+    passed_count = 0
+    cursor = connection.execute(
+        # The bare ``pose_rank`` is taken from the row the aggregate selected:
+        # SQLite defines that for a query with exactly one min() or max(), which
+        # is what makes it possible to record *which* pose decided the molecule
+        # without a second pass over the poses.
+        f"""
+        SELECT p.parent_id, p.identity_policy_id, p.parent_smiles,
+               p.registration_key, p.stereo_key, p.formula,
+               p.duplicate_count, p.input_rank, b.score, b.pose_rank, b.pose_count
+        FROM parents p
+        LEFT JOIN (
+            SELECT parent_id,
+                   {"MIN(score)" if stronger else "MAX(score)"} AS score,
+                   pose_rank,
+                   COUNT(*) AS pose_count
+            FROM docking_evidence
+            WHERE engine_id = ? AND receptor_id = ?
+            GROUP BY parent_id
+        ) b ON b.parent_id = p.parent_id
+        ORDER BY p.input_rank
+        """,
+        (engine_id, receptor_id),
+    )
+    while rows := cursor.fetchmany(config.batch_size):
+        for row in rows:
+            parent = tuple(row[:8])
+            value = None if row[8] is None else float(row[8])
+            passed, reason_code = _outcome_for_value(
+                value,
+                minimum=config.minimum,
+                maximum=config.maximum,
+                reason_prefix="DOCKING_SCORE",
+            )
+            _insert_result(
+                connection,
+                parent=parent,
+                stage_id=stage_id,
+                passed=passed,
+                reason_code=reason_code,
+                policy_id=policy_id,
+                detail={
+                    "engine_id": engine_id,
+                    "receptor_id": receptor_id,
+                    "score_kind": config.expected_score_kind.value,
+                    "direction": config.expected_direction.value,
+                    "score": value,
+                    "pose_rank": None if row[9] is None else int(row[9]),
+                    "pose_count": 0 if row[10] is None else int(row[10]),
+                    "minimum": config.minimum,
+                    "maximum": config.maximum,
+                    "bounds_inclusive": True,
+                    "pose_policy": "BEST_POSE",
+                    "not_affinity": True,
+                },
+            )
+            passed_count += int(passed)
+    return passed_count, engine_id, receptor_id, policy_id
 
 
 class NativePredictionEvidenceGatePlugin:
@@ -917,7 +1231,130 @@ class NativeSynthesisScoreEvidenceGatePlugin:
         )
 
 
+class NativeDockingScoreEvidenceGatePlugin:
+    """Filter parents on one engine's best pose against one receptor.
+
+    This is what makes a docking engine usable as a criterion rather than as a
+    terminal report.  An engine emits ``docking_score/v1`` and stops there --
+    deliberately, since where the cutoff belongs is a decision about the
+    campaign and not about the software -- so a parallel tier of engines needs
+    something that turns each engine's scores into a decision it can vote with.
+    ``_lower_tier`` refuses a parallel criterion that emits no decision, which
+    is the mechanism that makes 2-of-3 consensus docking work at all.
+    """
+
+    descriptor = PluginDescriptor(
+        id="docking.numeric_evidence_gate",
+        version="0.1.0",
+        kind=PluginKind.DOCK,
+        inputs=(PARENT_V1.id, DOCKING_SCORE_V1.id),
+        outputs=(PARENT_V1.id, DECISION_V1.id),
+        output_ports={"primary": PARENT_V1.id, "decisions": DECISION_V1.id},
+        cardinality=Cardinality.FILTER,
+        determinism=Determinism.DETERMINISTIC,
+        display_name="Docking-score evidence threshold gate",
+        description="Exact engine/receptor/scale window over the best pose, rejecting on absence.",
+    )
+    config_model = DockingScoreEvidenceGateConfig
+
+    def execute(self, request: StageRequest, context: StageContext) -> StageResponse:
+        config = _validated_config(
+            request,
+            DockingScoreEvidenceGateConfig,
+            label="docking evidence gate",
+        )
+        assert isinstance(config, DockingScoreEvidenceGateConfig)
+        parent_input, evidence_input = _classify_inputs(
+            dict(request.inputs),
+            evidence_contract=DOCKING_SCORE_V1,
+            label="docking evidence gate",
+        )
+        database_path = _prepare_staging(
+            context,
+            database_name=".docking-evidence-gate.sqlite3",
+        )
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = open_stage_database(database_path)
+            _create_common_schema(connection)
+            input_count = _insert_parents(
+                connection,
+                parent_input,
+                batch_size=config.batch_size,
+            )
+            evidence_count = _insert_docking_evidence(
+                connection,
+                evidence_input,
+                batch_size=config.batch_size,
+            )
+            retained_evidence_ignored_count = (
+                _retained_evidence_outside_current_population(
+                    connection,
+                    table="docking_evidence",
+                )
+            )
+            passed_count, engine_id, receptor_id, policy_id = _evaluate_docking(
+                connection,
+                stage_id=request.stage_id,
+                config=config,
+            )
+            _write_outputs(
+                connection,
+                context,
+                batch_size=config.batch_size,
+            )
+        except BaseException:
+            if connection is not None:
+                connection.close()
+                connection = None
+            _remove_work_files(context, database_path)
+            raise
+        finally:
+            if connection is not None:
+                connection.close()
+            database_path.unlink(missing_ok=True)
+            for suffix in ("-journal", "-wal", "-shm"):
+                Path(f"{database_path}{suffix}").unlink(missing_ok=True)
+
+        return StageResponse(
+            outputs={
+                "primary": PendingOutput(
+                    PARENT_V1.id,
+                    (_PARENT_PATH.as_posix(),),
+                    {"row_count": passed_count},
+                ),
+                "decisions": PendingOutput(
+                    DECISION_V1.id,
+                    (_DECISION_PATH.as_posix(),),
+                    {"row_count": input_count, "policy_id": policy_id},
+                ),
+            },
+            metadata={
+                "input_count": input_count,
+                # Poses, not molecules: an engine writes several rows per
+                # molecule and the count says how much evidence was read.
+                "evidence_count": evidence_count,
+                "retained_evidence_ignored_count": retained_evidence_ignored_count,
+                "output_count": passed_count,
+                "rejected_count": input_count - passed_count,
+                "engine_id": engine_id,
+                "receptor_id": receptor_id,
+                "score_kind": config.expected_score_kind.value,
+                "expected_direction": config.expected_direction.value,
+                "policy_id": policy_id,
+                "missing_policy": "REJECT",
+                "bounds_inclusive": True,
+                "pose_policy": "BEST_POSE",
+                "not_affinity": True,
+            },
+        )
+
+
 __all__ = [
+    "DockingScoreDirection",
+    "DockingScoreEvidenceGateConfig",
+    "DockingScoreKind",
+    "NativeDockingScoreEvidenceGatePlugin",
     "NativePredictionEvidenceGatePlugin",
     "NativeSynthesisScoreEvidenceGatePlugin",
     "PredictionEvidenceGateConfig",

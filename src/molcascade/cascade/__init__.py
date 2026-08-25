@@ -31,6 +31,7 @@ from molcascade.cascade.load import (
 from molcascade.cascade.lower import LoweredCascade, StageOrigin, lower_cascade
 from molcascade.cascade.models import (
     CASCADE_SCHEMA_VERSION,
+    BoxConfig,
     CascadeConfig,
     CriterionConfig,
     FinalizeConfig,
@@ -38,6 +39,7 @@ from molcascade.cascade.models import (
     LibraryConfig,
     LibraryFormat,
     StepConfig,
+    TargetConfig,
     TierConfig,
     TierMode,
 )
@@ -48,6 +50,7 @@ __all__ = [
     "CRITERIA_BY_ID",
     "STAGE_GROUPS",
     "BackendOption",
+    "BoxConfig",
     "CascadeConfig",
     "CriterionConfig",
     "CriterionSpec",
@@ -64,6 +67,7 @@ __all__ = [
     "StageGroup",
     "StageOrigin",
     "StepConfig",
+    "TargetConfig",
     "ThresholdField",
     "TierConfig",
     "TierMode",

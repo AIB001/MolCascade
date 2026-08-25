@@ -9,10 +9,17 @@ import pyarrow.parquet as pq
 import pytest
 
 from molcascade.artifacts import ArtifactRef
-from molcascade.contracts import DECISION_V1, PARENT_V1, PREDICTION_V1, SYNTHESIS_SCORE_V1
+from molcascade.contracts import (
+    DECISION_V1,
+    DOCKING_SCORE_V1,
+    PARENT_V1,
+    PREDICTION_V1,
+    SYNTHESIS_SCORE_V1,
+)
 from molcascade.errors import PluginError
 from molcascade.plugins.api import StageContext, StageInput, StageRequest
 from molcascade.plugins.builtin.evidence_gates import (
+    NativeDockingScoreEvidenceGatePlugin,
     NativePredictionEvidenceGatePlugin,
     NativeSynthesisScoreEvidenceGatePlugin,
 )
@@ -337,3 +344,315 @@ def test_numeric_gate_configuration_requires_at_least_one_bound(tmp_path: Path) 
             StageContext(tmp_path / "out"),
         )
     assert caught.value.code == "PLUGIN_CONFIG_INVALID"
+
+
+_RECEPTOR = "sha256:" + "d" * 64
+_OTHER_RECEPTOR = "sha256:" + "e" * 64
+
+
+def _pose(
+    parent_id: str,
+    score: float,
+    *,
+    pose_rank: int = 0,
+    engine_id: str = "unidock",
+    receptor_id: str = _RECEPTOR,
+    score_kind: str = "VINA_KCAL_MOL",
+    direction: str = "LOWER_STRONGER",
+) -> dict[str, object]:
+    return {
+        "parent_id": parent_id,
+        "engine_id": engine_id,
+        "receptor_id": receptor_id,
+        "pose_rank": pose_rank,
+        "score": score,
+        "score_kind": score_kind,
+        "direction": direction,
+        "secondary_score": None,
+        "pose_molblock": None,
+        "method_id": "docking:test",
+    }
+
+
+def _cnn(parent_id: str, score: float, *, pose_rank: int = 0) -> dict[str, object]:
+    """A GNINA-shaped row: the other scale, and the other direction."""
+
+    return _pose(
+        parent_id,
+        score,
+        pose_rank=pose_rank,
+        engine_id="gnina",
+        score_kind="CNN_AFFINITY",
+        direction="HIGHER_STRONGER",
+    )
+
+
+def _dock(
+    tmp_path: Path,
+    rows: list[dict[str, object]],
+    *,
+    config: dict[str, object],
+    stage_id: str = "docking_window",
+    name: str = "poses",
+) -> tuple[Path, object]:
+    output = tmp_path / f"out-{stage_id}"
+    # Named per call rather than shared, so a test can gate twice in one
+    # tmp_path -- comparing two receptors needs exactly that.
+    parents = _dataset(
+        tmp_path,
+        f"parents-{stage_id}",
+        PARENT_V1,
+        [_parent("p1"), _parent("p2"), _parent("p3")],
+        artifact_hex="a",
+    )
+    response = NativeDockingScoreEvidenceGatePlugin().execute(
+        StageRequest(
+            stage_id=stage_id,
+            inputs={
+                "parents": parents,
+                "scores": _dataset(tmp_path, name, DOCKING_SCORE_V1, rows, artifact_hex="c"),
+            },
+            config=config,
+        ),
+        StageContext(output),
+    )
+    return output, response
+
+
+def test_docking_gate_scores_the_best_pose_not_the_first_one(tmp_path: Path) -> None:
+    """The pose that decides a molecule is the strongest one, whatever its rank.
+
+    ``pose_rank`` is written best-first by every engine here, so on well-formed
+    evidence the two agree.  The test feeds evidence where they do not, because
+    a gate that reads rank 0 and calls it the answer would invert silently the
+    day an engine's ranking and the configured direction disagree -- keeping a
+    library's worst poses and reporting them as hits.
+    """
+
+    output, response = _dock(
+        tmp_path,
+        [
+            _pose("p1", -7.0, pose_rank=0),
+            _pose("p1", -9.5, pose_rank=1),
+            _pose("p2", -6.0),
+        ],
+        config={
+            "engine_id": "unidock",
+            "receptor_id": None,
+            "expected_score_kind": "VINA_KCAL_MOL",
+            "expected_direction": "LOWER_STRONGER",
+            "maximum": -8.0,
+            "batch_size": 2,
+        },
+    )
+
+    parents = _read(output, response, "primary")
+    decisions = _read(output, response, "decisions")
+    PARENT_V1.validate(parents)
+    DECISION_V1.validate(decisions)
+    assert [row["parent_id"] for row in parents.to_pylist()] == ["p1"]
+    by_parent = {row["entity_id"]: row for row in decisions.to_pylist()}
+    assert by_parent["p1"]["outcome"] == "PASS"
+    assert by_parent["p2"]["reason_code"] == "DOCKING_SCORE_ABOVE_MAXIMUM"
+    assert by_parent["p3"]["reason_code"] == "DOCKING_SCORE_MISSING"
+
+    detail = json.loads(by_parent["p1"]["detail"])
+    assert detail["score"] == -9.5
+    # Which pose decided it, and out of how many -- an audit reader can go back
+    # to the evidence artifact and find the geometry this number came from.
+    assert detail["pose_rank"] == 1
+    assert detail["pose_count"] == 2
+    assert detail["not_affinity"] is True
+    assert json.loads(by_parent["p3"]["detail"])["pose_count"] == 0
+    assert response.metadata["receptor_id"] == _RECEPTOR
+    assert response.metadata["evidence_count"] == 3
+    assert response.metadata["output_count"] == 1
+
+
+def test_docking_gate_takes_the_maximum_when_higher_is_stronger(tmp_path: Path) -> None:
+    output, response = _dock(
+        tmp_path,
+        [
+            _cnn("p1", 5.1, pose_rank=0),
+            _cnn("p1", 6.4, pose_rank=1),
+            _cnn("p2", 4.0),
+        ],
+        config={
+            "engine_id": "gnina",
+            "expected_score_kind": "CNN_AFFINITY",
+            "expected_direction": "HIGHER_STRONGER",
+            "minimum": 6.0,
+        },
+    )
+
+    # 6.4 is p1's best pose and 5.1 is the one ranked first; taking the maximum
+    # is the difference between keeping this molecule and dropping it.
+    assert [row["parent_id"] for row in _read(output, response, "primary").to_pylist()] == ["p1"]
+    by_parent = {
+        row["entity_id"]: row for row in _read(output, response, "decisions").to_pylist()
+    }
+    assert json.loads(by_parent["p1"]["detail"])["score"] == 6.4
+    assert by_parent["p2"]["reason_code"] == "DOCKING_SCORE_BELOW_MINIMUM"
+    assert response.metadata["score_kind"] == "CNN_AFFINITY"
+    assert response.metadata["output_count"] == 1
+
+
+@pytest.mark.parametrize(
+    ("expected_score_kind", "expected_direction"),
+    [
+        # The right scale read backwards: -9.5 would look like a rejection and
+        # -6.0 like a hit, and every number in the report would still be true.
+        ("VINA_KCAL_MOL", "HIGHER_STRONGER"),
+        # The wrong scale: a threshold of -8 kcal/mol against a 0-1 CNN score
+        # rejects the entire library and reads like a strict campaign.
+        ("CNN_SCORE", "LOWER_STRONGER"),
+    ],
+)
+def test_docking_gate_refuses_evidence_on_another_scale_or_direction(
+    tmp_path: Path,
+    expected_score_kind: str,
+    expected_direction: str,
+) -> None:
+    with pytest.raises(PluginError) as caught:
+        _dock(
+            tmp_path,
+            [_pose("p1", -9.5), _pose("p2", -6.0)],
+            config={
+                "engine_id": "unidock",
+                "expected_score_kind": expected_score_kind,
+                "expected_direction": expected_direction,
+                "maximum": -8.0,
+            },
+            stage_id="semantics",
+        )
+
+    assert caught.value.code == "EVIDENCE_GATE_SCORE_SEMANTICS_MISMATCH"
+    assert not (tmp_path / "out-semantics" / ".docking-evidence-gate.sqlite3").exists()
+
+
+def test_docking_gate_will_not_guess_between_two_engines(tmp_path: Path) -> None:
+    """Two engines in one evidence stream is the shape a parallel tier produces."""
+
+    with pytest.raises(PluginError) as caught:
+        _dock(
+            tmp_path,
+            [_pose("p1", -9.5), _cnn("p1", 6.4)],
+            config={
+                "expected_score_kind": "VINA_KCAL_MOL",
+                "expected_direction": "LOWER_STRONGER",
+                "maximum": -8.0,
+            },
+            stage_id="ambiguous-engine",
+        )
+
+    assert caught.value.code == "EVIDENCE_GATE_IDENTITY_AMBIGUOUS"
+    assert caught.value.context["observed_examples"] == ["gnina", "unidock"]
+
+
+def test_docking_gate_will_not_compare_across_receptors(tmp_path: Path) -> None:
+    """Two structures are two questions, and one threshold cannot answer both."""
+
+    with pytest.raises(PluginError) as caught:
+        _dock(
+            tmp_path,
+            [_pose("p1", -9.5), _pose("p2", -9.9, receptor_id=_OTHER_RECEPTOR)],
+            config={
+                "engine_id": "unidock",
+                "expected_score_kind": "VINA_KCAL_MOL",
+                "expected_direction": "LOWER_STRONGER",
+                "maximum": -8.0,
+            },
+            stage_id="ambiguous-receptor",
+        )
+
+    assert caught.value.code == "EVIDENCE_GATE_IDENTITY_AMBIGUOUS"
+    assert caught.value.context["identity"] == "receptor_id for the configured engine"
+
+
+def test_docking_gate_naming_the_engine_ignores_the_other_one(tmp_path: Path) -> None:
+    output, response = _dock(
+        tmp_path,
+        [_pose("p1", -9.5), _pose("p2", -6.0), _cnn("p1", 0.1), _cnn("p2", 9.9)],
+        config={
+            "engine_id": "unidock",
+            "receptor_id": _RECEPTOR,
+            "expected_score_kind": "VINA_KCAL_MOL",
+            "expected_direction": "LOWER_STRONGER",
+            "maximum": -8.0,
+        },
+        stage_id="one-engine",
+    )
+
+    assert [row["parent_id"] for row in _read(output, response, "primary").to_pylist()] == ["p1"]
+    assert response.metadata["engine_id"] == "unidock"
+
+
+def test_docking_gate_policy_id_is_bound_to_the_receptor_bytes(tmp_path: Path) -> None:
+    """Rescreening against a different structure is a different policy, by identity.
+
+    ``policy_id`` travels into every decision row as ``rule_id``.  If it did not
+    move with the receptor digest, two runs against two structures would record
+    the same rule for contradictory verdicts, and nothing downstream could tell
+    them apart.
+    """
+
+    config: dict[str, object] = {
+        "engine_id": "unidock",
+        "receptor_id": _RECEPTOR,
+        "expected_score_kind": "VINA_KCAL_MOL",
+        "expected_direction": "LOWER_STRONGER",
+        "maximum": -8.0,
+    }
+    _, first = _dock(
+        tmp_path,
+        [_pose("p1", -9.5)],
+        config=config,
+        stage_id="receptor-a",
+        name="poses-a",
+    )
+    _, second = _dock(
+        tmp_path,
+        [_pose("p1", -9.5, receptor_id=_OTHER_RECEPTOR)],
+        config={**config, "receptor_id": _OTHER_RECEPTOR},
+        stage_id="receptor-b",
+        name="poses-b",
+    )
+
+    assert first.metadata["policy_id"] != second.metadata["policy_id"]
+    assert str(first.metadata["policy_id"]).startswith("docking-gate:sha256:")
+
+
+def test_docking_gate_rejects_a_repeated_pose_rank(tmp_path: Path) -> None:
+    """Two rows claiming the same pose is a contract violation, not a tie."""
+
+    with pytest.raises(PluginError) as caught:
+        _dock(
+            tmp_path,
+            [_pose("p1", -9.5, pose_rank=0), _pose("p1", -9.4, pose_rank=0)],
+            config={
+                "engine_id": "unidock",
+                "expected_score_kind": "VINA_KCAL_MOL",
+                "expected_direction": "LOWER_STRONGER",
+                "maximum": -8.0,
+            },
+            stage_id="duplicate",
+        )
+
+    assert caught.value.code == "EVIDENCE_GATE_DUPLICATE_EVIDENCE"
+
+
+def test_docking_gate_rejects_a_non_finite_score(tmp_path: Path) -> None:
+    with pytest.raises(PluginError) as caught:
+        _dock(
+            tmp_path,
+            [_pose("p1", math.nan)],
+            config={
+                "engine_id": "unidock",
+                "expected_score_kind": "VINA_KCAL_MOL",
+                "expected_direction": "LOWER_STRONGER",
+                "maximum": -8.0,
+            },
+            stage_id="non-finite",
+        )
+
+    assert caught.value.code == "EVIDENCE_GATE_NON_FINITE"

@@ -13,8 +13,15 @@ from molcascade.plugins.builtin.diversity import (
     RDKitMurckoScaffoldPlugin,
     RDKitScaffoldGroupClusterPlugin,
 )
+from molcascade.plugins.builtin.docking import (
+    GninaPlugin,
+    KarmaDockPlugin,
+    RDKitLigandConformerPlugin,
+    UniDockPlugin,
+)
 from molcascade.plugins.builtin.druglikeness import RDKitDrugLikenessPlugin
 from molcascade.plugins.builtin.evidence_gates import (
+    NativeDockingScoreEvidenceGatePlugin,
     NativePredictionEvidenceGatePlugin,
     NativeSynthesisScoreEvidenceGatePlugin,
 )
@@ -73,6 +80,11 @@ BUILTIN_STAGE_PLUGINS: tuple[StagePlugin, ...] = (
     RDKitSAScorePlugin(),
     ScScorePlugin(),
     AiZynthFinderRoutePlugin(),
+    RDKitLigandConformerPlugin(),
+    UniDockPlugin(),
+    KarmaDockPlugin(),
+    GninaPlugin(),
+    NativeDockingScoreEvidenceGatePlugin(),
     ADMETAIV2PredictorPlugin(),
     ChempropCheckpointPlugin(),
     CustomModelPredictorPlugin(),

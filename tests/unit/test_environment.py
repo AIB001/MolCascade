@@ -407,7 +407,37 @@ def test_no_accelerator_disables_gpu_backends_explicitly() -> None:
     plan = detect_module._plan(_cpu(8), MemoryInfo(total_bytes=16 * _GIB), ())
 
     assert plan.device == "cpu"
+    assert plan.devices == ()
     assert plan.gpu_backends_runnable is False
+
+
+def test_every_card_on_a_multi_gpu_node_becomes_a_lane() -> None:
+    """The whole point of measuring four cards is to be able to use four cards.
+
+    ``device`` keeps naming one, because that is what a summary line holds; a
+    plan that stopped there would leave three quarters of the node idle.
+    """
+
+    gpus = tuple(
+        GpuDevice(index=index, vendor=AcceleratorVendor.NVIDIA, name="NVIDIA A100")
+        for index in range(4)
+    )
+
+    plan = detect_module._plan(_cpu(64), MemoryInfo(total_bytes=512 * _GIB), gpus)
+
+    assert plan.device == "cuda:0"
+    assert plan.devices == ("cuda:0", "cuda:1", "cuda:2", "cuda:3")
+    assert "4 execution lane(s)" in plan.rationale
+
+
+def test_a_card_cuda_cannot_address_is_one_lane_not_a_cuda_lane() -> None:
+    """A lane is pinned with ``CUDA_VISIBLE_DEVICES``, which an AMD card ignores."""
+
+    gpu = GpuDevice(index=0, vendor=AcceleratorVendor.AMD, name="Radeon Pro W7900")
+
+    plan = detect_module._plan(_cpu(16), MemoryInfo(total_bytes=64 * _GIB), (gpu,))
+
+    assert plan.devices == ("gpu:0",)
 
 
 def test_total_accelerator_memory_sums_across_a_multi_gpu_node() -> None:

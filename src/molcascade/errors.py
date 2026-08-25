@@ -81,6 +81,27 @@ class MolCascadeError(Exception):
         )
         self.context = info.context
 
+    def __reduce__(self) -> tuple[Any, tuple[Any, ...]]:
+        """Keep the code, hint and context when the error crosses a process.
+
+        The default reduction rebuilds an exception from ``args`` alone, which
+        for this hierarchy means everything after ``message`` is dropped and the
+        code falls back to the class default.  A worker process reporting
+        ``SCSCORE_FINGERPRINT_EMPTY`` would then reach its parent as a bare
+        ``PLUGIN_ERROR``, which is exactly the diagnosis the caller needed.
+        Every field here is JSON-compatible by construction, so nothing
+        unpicklable can be captured this way.
+        """
+
+        return _rebuild_error, (
+            type(self),
+            self.message,
+            self.code,
+            self.hint,
+            self.retryable,
+            self.context,
+        )
+
     def to_info(self) -> ErrorInfo:
         """Return the stable serializable form of this exception."""
 
@@ -97,6 +118,30 @@ class MolCascadeError(Exception):
         """Return a JSON-mode dictionary for CLI/API rendering."""
 
         return self.to_info().model_dump(mode="json")
+
+
+def _rebuild_error(
+    error_type: type[MolCascadeError],
+    message: str,
+    code: str,
+    hint: str | None,
+    retryable: bool,
+    context: dict[str, JsonValue],
+) -> MolCascadeError:
+    """Reconstruct an unpickled error through the keyword-only constructor.
+
+    Module-level and taking the class as an argument so every subclass reduces
+    the same way; no subclass in this project adds constructor parameters, and
+    one that did would have to say so here.
+    """
+
+    return error_type(
+        message,
+        code=code,
+        hint=hint,
+        retryable=retryable,
+        context=dict(context),
+    )
 
 
 class ConfigError(MolCascadeError):

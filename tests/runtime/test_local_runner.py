@@ -461,6 +461,35 @@ def test_success_persists_revision_state_audit_and_multi_output_artifact(
         assert isinstance(json.loads(line), dict)
 
 
+def test_permitted_copyleft_backends_are_named_in_the_audit_trail(tmp_path: Path) -> None:
+    """A run that linked GPL code has to be able to say which tool, under what.
+
+    Recording the flag instead of the tools would leave a methods section with
+    nothing to write: '--allow-copyleft was passed' does not tell a reader that
+    the poses were rescored by GNINA under GPL-2.0-or-later.  A run that permits
+    nothing records an empty mapping rather than omitting the key, so the
+    absence is a positive statement too.
+    """
+
+    registry = PluginRegistry([FakeSourcePlugin(), FakeGatePlugin()])
+    runner = LocalRunner(
+        tmp_path / "workspace",
+        plugins=registry,
+        permitted_licenses={"gnina": "GPL-2.0-or-later"},
+    )
+
+    result = runner.run(_pipeline(), run_id="run-licensed")
+
+    assert result.status is RunStatus.SUCCEEDED
+    started = runner.read_events("run-licensed")[0]
+    assert started.event_type == "RUN_STARTED"
+    assert started.details["permitted_licenses"] == {"gnina": "GPL-2.0-or-later"}
+
+    default_runner, _source, _gate = _runner(tmp_path / "default")
+    default_runner.run(_pipeline(), run_id="run-unlicensed")
+    assert default_runner.read_events("run-unlicensed")[0].details["permitted_licenses"] == {}
+
+
 def test_cache_hit_force_and_cache_key_are_deterministic(tmp_path: Path) -> None:
     runner, source, gate = _runner(tmp_path)
     first = runner.run(_pipeline(), run_id="run-one")

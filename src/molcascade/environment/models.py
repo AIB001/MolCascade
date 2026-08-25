@@ -174,6 +174,15 @@ class ExecutionPlan(_EnvModel):
     """
 
     device: str = Field(min_length=1, max_length=32)
+    devices: tuple[str, ...] = ()
+    """Every accelerator this machine can run a lane on, not just the first.
+
+    ``device`` names one device because a single string is what a summary line
+    and a form field can hold.  A four-card node, though, is four lanes, and a
+    plan that only ever says ``cuda:0`` is how three quarters of a machine goes
+    quietly unused.
+    """
+
     gpu_count: int = Field(ge=0, le=4095)
     recommended_workers: int = Field(ge=1, le=1024)
     recommended_batch_size: int = Field(ge=1, le=1_000_000)

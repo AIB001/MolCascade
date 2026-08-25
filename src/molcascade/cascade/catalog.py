@@ -99,6 +99,15 @@ class BackendOption:
     #: decision needs -- it turns on ratios between tools, not on absolutes.
     throughput_per_second: int | None = None
     recommended: bool = False
+    #: Whether running this tool requires the operator to accept its licence
+    #: terms explicitly, with ``--allow-copyleft``.
+    #:
+    #: A copyleft backend is not blocked because it is unavailable or unproven.
+    #: It is blocked because linking a screening pipeline to GPL code is a
+    #: decision about the pipeline, and one an organisation may have already
+    #: made either way.  MolCascade cannot make it, so it defaults to the
+    #: reversible answer and says which flag reverses it.
+    requires_license_optin: bool = False
 
     @property
     def executable(self) -> bool:
@@ -122,6 +131,7 @@ class BackendOption:
             "citation": self.citation,
             "throughput_per_second": self.throughput_per_second,
             "recommended": self.recommended,
+            "requires_license_optin": self.requires_license_optin,
             "executable": self.executable,
         }
 

@@ -18,6 +18,7 @@ import json
 import sys
 from collections import Counter
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -42,12 +43,17 @@ from molcascade.assets import (
 )
 from molcascade.assets.fetch import fetch_asset, render_manifest
 from molcascade.backends import Availability, ProbePolicy, create_backend_registry
-from molcascade.backends.preflight import preflight_backends
+from molcascade.backends.preflight import (
+    copyleft_backends,
+    preflight_backends,
+    preflight_docking_target,
+)
 from molcascade.cascade import (
     LibraryConfig,
     LibraryFormat,
     LoweredCascade,
     ScreeningConfig,
+    TargetConfig,
     TierMode,
     load_screening_config,
     lower_cascade,
@@ -55,10 +61,12 @@ from molcascade.cascade import (
 from molcascade.cascade.citations import render_citations, uncited_options
 from molcascade.cascade.funnel import build_funnel
 from molcascade.cascade.library import reader_settings
+from molcascade.cascade.target import docking_requirements, merge_target, resolve_target
 from molcascade.config import PipelineConfig
 from molcascade.environment import detect_environment
 from molcascade.errors import (
     AssetError,
+    ConfigError,
     ExecutionError,
     MolCascadeError,
     PipelineError,
@@ -66,6 +74,7 @@ from molcascade.errors import (
 )
 from molcascade.handoff import materialize_shortlist
 from molcascade.io.atomic import DestinationExistsError, atomic_write_bytes
+from molcascade.parallel import StageResources, count_completed_shards, describe_lanes, plan_lanes
 from molcascade.pipeline import CompiledStage, PipelineCompiler
 from molcascade.plugins import PluginKind, PluginRegistry, create_builtin_registry
 from molcascade.plugins.builtin.chemprop_model import (
@@ -144,6 +153,143 @@ def _render_error(error: MolCascadeError, *, as_json: bool) -> None:
         print(f"hint: {error.hint}", file=sys.stderr)
 
 
+def _parallel_parser_options(parser: argparse.ArgumentParser) -> None:
+    """Flags that decide how much of this machine a run may use.
+
+    Deliberately not configuration.  A cascade is a screening *policy* and is
+    meant to be shared; a worker count is a fact about one box.  Putting either
+    of these in the config file would also change ``stage_cache_key``, so the
+    same science would miss the cache on every machine it moved to.
+    """
+
+    parser.add_argument(
+        "--workers",
+        type=int,
+        help=(
+            "Parallel shards to run at once; default is one per detected GPU, "
+            "or usable cores minus one on CPU"
+        ),
+    )
+    parser.add_argument(
+        "--device",
+        default="auto",
+        help=(
+            "auto (default), cpu, cuda, or cuda:0,2. 'auto' falls back to CPU and "
+            "records why; an explicit request that cannot be honoured stops the run"
+        ),
+    )
+
+
+def _license_parser_options(parser: argparse.ArgumentParser) -> None:
+    """The one flag that changes which licences a run is allowed to link.
+
+    Also deliberately not configuration, and for a stronger reason than the
+    flags above.  A cascade travels between people and organisations; whether
+    linking GPL code into a screening pipeline is acceptable is a property of
+    the organisation running it, not of the science, and a config file that
+    carried the answer would be answering on someone else's behalf.
+    """
+
+    parser.add_argument(
+        "--allow-copyleft",
+        action="store_true",
+        help=(
+            "Permit copyleft-licensed backends such as GNINA (GPL-2.0). Off by "
+            "default; the run records that it was given"
+        ),
+    )
+
+
+def _target_parser_options(parser: argparse.ArgumentParser) -> None:
+    """Which protein this run docks into, supplied at the run rather than in it.
+
+    A cascade is a screening policy and is meant to be reused against many
+    targets; the receptor is the one thing about a docking run that changes
+    every time.  A cascade may still carry a ``target`` block -- these flags
+    override it -- but the shipped cascades do not, which is why a docking run
+    started without them stops before it reads a molecule and says so.
+    """
+
+    parser.add_argument(
+        "--receptor",
+        type=Path,
+        help="Protein structure to dock into, in PDB. Read and hashed, never edited",
+    )
+    parser.add_argument(
+        "--reference-ligand",
+        type=Path,
+        help=(
+            "A ligand bound in the site (mol2/sdf/mol). Its extent plus padding "
+            "becomes the search box"
+        ),
+    )
+    parser.add_argument(
+        "--pocket",
+        type=Path,
+        help="A PDB holding the residues that line the site, as an alternative to a ligand",
+    )
+    parser.add_argument(
+        "--box",
+        help="The site as six numbers directly: cx,cy,cz,sx,sy,sz in angstrom",
+    )
+    parser.add_argument(
+        "--receptor-pdbqt",
+        type=Path,
+        help=(
+            "A receptor already prepared as PDBQT for Uni-Dock, for when the "
+            "automatic meeko preparation cannot cope with the structure"
+        ),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _TargetArguments:
+    """The five target flags, carried as one value.
+
+    They are only ever used together -- a receptor without a site is an error
+    and a site without a receptor is a different one -- so threading them
+    through the entry points as five parameters would be five chances to pass
+    four.  The empty instance is what the forms that cannot spell them pass.
+    """
+
+    receptor: Path | None = None
+    reference_ligand: Path | None = None
+    pocket: Path | None = None
+    box: str | None = None
+    receptor_pdbqt: Path | None = None
+
+    @classmethod
+    def from_namespace(cls, arguments: argparse.Namespace) -> _TargetArguments:
+        return cls(
+            receptor=arguments.receptor,
+            reference_ligand=arguments.reference_ligand,
+            pocket=arguments.pocket,
+            box=arguments.box,
+            receptor_pdbqt=arguments.receptor_pdbqt,
+        )
+
+    def as_kwargs(self) -> dict[str, Any]:
+        return {
+            "receptor": self.receptor,
+            "reference_ligand": self.reference_ligand,
+            "pocket": self.pocket,
+            "box": self.box,
+            "receptor_pdbqt": self.receptor_pdbqt,
+        }
+
+
+def _probe_policy(*, allow_copyleft: bool) -> ProbePolicy:
+    """The licence policy a preflight applies, and nothing else.
+
+    ``run_version_commands`` stays off whatever the operator asked for: probing
+    a version means starting a subprocess, and a preflight on the way into a run
+    has no business doing that.  ``doctor`` is the one command where running
+    them is the point, and it builds its own policy.
+    """
+
+    return ProbePolicy(allow_copyleft=allow_copyleft, run_version_commands=False)
+
+
 def _execution_parser_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--molecules",
@@ -166,6 +312,9 @@ def _execution_parser_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--run-id", help="Portable run identifier used for resume/status")
     parser.add_argument("--resume", action="store_true", help="Resume a verified run")
     parser.add_argument("--force", action="store_true", help="Bypass reusable stage cache")
+    _parallel_parser_options(parser)
+    _license_parser_options(parser)
+    _target_parser_options(parser)
     parser.add_argument(
         "--json",
         action="store_true",
@@ -277,6 +426,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Opt in to local executable version probes",
     )
+    _license_parser_options(doctor)
 
     assets = commands.add_parser(
         "assets",
@@ -423,6 +573,9 @@ def build_parser() -> argparse.ArgumentParser:
     screen.add_argument("--run-id", help="Portable run identifier used for resume/status")
     screen.add_argument("--resume", action="store_true", help="Resume a verified run")
     screen.add_argument("--force", action="store_true", help="Bypass reusable stage cache")
+    _parallel_parser_options(screen)
+    _license_parser_options(screen)
+    _target_parser_options(screen)
     screen.add_argument(
         "--dry-run",
         action="store_true",
@@ -744,7 +897,7 @@ def _cite(output: Path | None) -> int:
     return 0
 
 
-def _doctor(*, as_json: bool, run_version_commands: bool) -> int:
+def _doctor(*, as_json: bool, run_version_commands: bool, allow_copyleft: bool) -> int:
     """Answer one question: is this machine ready to screen, and if not, why.
 
     Three things have to be true, and a backend can fail on any of them
@@ -754,7 +907,13 @@ def _doctor(*, as_json: bool, run_version_commands: bool) -> int:
     discovering that a model file was never downloaded.
     """
 
-    policy = ProbePolicy(run_version_commands=run_version_commands)
+    # The one command where running a version probe is the point rather than an
+    # unwanted side effect, so this policy is built here rather than shared with
+    # the preflights.
+    policy = ProbePolicy(
+        allow_copyleft=allow_copyleft,
+        run_version_commands=run_version_commands,
+    )
     statuses = create_backend_registry().probe_all(policy)
     rows = [status.model_dump(mode="json") for status in statuses]
     counts = Counter(status.availability.value for status in statuses)
@@ -765,6 +924,9 @@ def _doctor(*, as_json: bool, run_version_commands: bool) -> int:
     asset_specs = list(iter_assets())
     asset_states = [asset_status(spec) for spec in asset_specs]
     environment = detect_environment()
+    # The same function a run uses, so 'doctor' cannot report lanes that a run
+    # would then decline to use.
+    lanes = plan_lanes(environment)
     if as_json:
         _json_dump(
             {
@@ -773,6 +935,11 @@ def _doctor(*, as_json: bool, run_version_commands: bool) -> int:
                 "assets": [status.model_dump(mode="json") for status in asset_states],
                 "asset_root": str(default_asset_root()),
                 "environment": environment.model_dump(mode="json"),
+                "lanes": {
+                    "devices": list(lanes.devices),
+                    "workers": lanes.workers,
+                    "notes": list(lanes.notes),
+                },
             },
             sys.stdout,
         )
@@ -798,15 +965,28 @@ def _doctor(*, as_json: bool, run_version_commands: bool) -> int:
         print("  Provision with: molcascade assets fetch " + " ".join(unready))
     print()
     plan = environment.plan
-    accelerator = (
-        ", ".join(f"{gpu.name}" for gpu in environment.gpus) if environment.gpus else "none"
-    )
     print("Hardware:")
     print(
         f"  cpu {environment.cpu.usable_cores or '?'} usable core(s) · "
-        f"memory {_format_bytes(environment.memory.effective_total_bytes)} · "
-        f"accelerator {accelerator}"
+        f"memory {_format_bytes(environment.memory.effective_total_bytes)}"
     )
+    # Every card, one line each.  A summary that says "accelerator: NVIDIA A100"
+    # on a four-card node is the report a user reads just before wondering why
+    # only one of them ever gets warm.
+    if environment.gpus:
+        for gpu in environment.gpus:
+            memory = (
+                f"{gpu.memory_total_mib / 1024:,.1f} GiB"
+                if gpu.memory_total_mib is not None
+                else "memory unknown"
+            )
+            capability = f" · sm_{gpu.compute_capability}" if gpu.compute_capability else ""
+            print(f"  gpu {gpu.index}: {gpu.name} · {memory}{capability}")
+    else:
+        print("  gpu: none detected")
+    print(f"  lanes: {describe_lanes(lanes.devices)}")
+    for note in lanes.notes:
+        print(f"    note: {note}")
     print(
         f"  plan: device={plan.device}, workers={plan.recommended_workers}, "
         f"batch={plan.recommended_batch_size:,}"
@@ -1110,6 +1290,61 @@ def _pins(backend: str, *, models_dir: str | None, as_json: bool) -> int:
     return 0
 
 
+def _stage_resources(*, workers: int | None, device: str) -> StageResources:
+    """Turn one ``--device``/``--workers`` request into this run's lanes.
+
+    Measured once, here, rather than per stage: ``detect_environment`` shells
+    out to ``nvidia-smi``, and twenty tiers asking the same machine the same
+    question twenty times would be twenty subprocesses for one answer.
+    """
+
+    environment = detect_environment()
+    plan = plan_lanes(environment, device=device, workers=workers)
+    return StageResources(
+        workers=plan.workers,
+        devices=plan.devices,
+        device_request=device,
+        batch_size=environment.plan.recommended_batch_size,
+        notes=plan.notes,
+    )
+
+
+def _report_lanes(resources: StageResources) -> None:
+    """Say what the run is about to use, before it starts using it."""
+
+    print(f"Execution: {describe_lanes(resources.devices)}")
+    for note in resources.notes:
+        print(f"  note: {note}")
+
+
+def _permitted_licenses(
+    stages: Sequence[CompiledStage],
+    *,
+    allow_copyleft: bool,
+) -> dict[str, str]:
+    """Backend id to SPDX identifier for every copyleft tool this run may link.
+
+    Empty unless the operator asked for it, which is the point: an empty record
+    is a positive statement that nothing copyleft ran, and it is the default.
+    """
+
+    if not allow_copyleft:
+        return {}
+    return {spec.id: spec.license_spdx for spec in copyleft_backends(stages)}
+
+
+def _report_licenses(permitted: Mapping[str, str]) -> None:
+    """Say out loud what the licence flag actually turned on.
+
+    ``--allow-copyleft`` is a blanket permission, so the operator who passed it
+    does not necessarily know which tool in a twenty-tier cascade needed it.
+    Naming them is the difference between a permission and an informed one.
+    """
+
+    for backend_id, license_spdx in sorted(permitted.items()):
+        print(f"Licence: {backend_id} permitted under {license_spdx} (--allow-copyleft)")
+
+
 def _run_pipeline(
     config_path: Path,
     *,
@@ -1119,6 +1354,10 @@ def _run_pipeline(
     run_id: str | None,
     resume: bool,
     force: bool,
+    workers: int | None,
+    device: str,
+    allow_copyleft: bool,
+    target: _TargetArguments,
     as_json: bool,
 ) -> int:
     if resume and run_id is None:
@@ -1133,19 +1372,52 @@ def _run_pipeline(
         )
     screening = load_screening_config(config_path)
     registry = create_builtin_registry()
+    docking_target, target_notes = _docking_target(
+        screening,
+        registry,
+        workspace=workspace,
+        **target.as_kwargs(),
+    )
     if molecules is not None:
         config, _ = _prepare_screen(
             screening,
             molecules,
             registry,
             molecule_format=molecule_format,
+            target=docking_target,
         )
     elif screening.cascade is not None:
-        config = lower_cascade(screening.cascade, registry=registry).pipeline
+        config = lower_cascade(
+            screening.cascade, registry=registry, target=docking_target
+        ).pipeline
     else:
         assert screening.pipeline is not None  # ScreeningConfig always carries one kind
         config = screening.pipeline
-    runner = LocalRunner(workspace, plugins=registry)
+    # Ahead of the compiler on purpose.  Compilation validates each stage
+    # against its plugin's config model, so a docking stage with no receptor
+    # already fails -- with a Pydantic report that never mentions '--receptor'.
+    preflight_docking_target(config.stages, registry=registry)
+    # 'run' used to preflight neither assets nor packages, so the flat-graph
+    # entry point could reach the fourth tier before discovering that a weight
+    # file was never fetched -- the exact failure 'screen' refuses to ship.  The
+    # extra compile is free by comparison: it reads no molecules.
+    compiled = PipelineCompiler(registry).compile(config)
+    preflight_assets(compiled.stages)
+    preflight_backends(
+        compiled.stages, policy=_probe_policy(allow_copyleft=allow_copyleft)
+    )
+    permitted = _permitted_licenses(compiled.stages, allow_copyleft=allow_copyleft)
+    resources = _stage_resources(workers=workers, device=device)
+    if not as_json:
+        _report_target(docking_target, target_notes)
+        _report_licenses(permitted)
+        _report_lanes(resources)
+    runner = LocalRunner(
+        workspace,
+        plugins=registry,
+        resources=resources,
+        permitted_licenses=permitted,
+    )
     result = runner.run(
         config,
         run_id=run_id,
@@ -1213,6 +1485,73 @@ def _reader_overrides(arguments: argparse.Namespace) -> dict[str, Any]:
     return {name: value for name, value in typed.items() if value is not None}
 
 
+def _docking_target(
+    screening: ScreeningConfig,
+    registry: PluginRegistry,
+    *,
+    workspace: Path,
+    receptor: Path | None,
+    reference_ligand: Path | None,
+    pocket: Path | None,
+    box: str | None,
+    receptor_pdbqt: Path | None,
+) -> tuple[TargetConfig | None, tuple[str, ...]]:
+    """Settle what this run docks into before it compiles anything.
+
+    Everything expensive or fragile about a target happens here, once: meeko
+    turns the PDB into a PDBQT, a reference ligand becomes six numbers, and the
+    receptor's bytes are hashed.  Doing it now rather than inside the docking
+    stage is what stops a run from spending the whole funnel and then finding
+    out that meeko cannot read the structure.
+    """
+
+    merged = merge_target(
+        screening.cascade.target if screening.cascade is not None else None,
+        receptor=receptor,
+        reference_ligand=reference_ligand,
+        pocket=pocket,
+        box=box,
+        receptor_pdbqt=receptor_pdbqt,
+    )
+    if merged is None:
+        return None, ()
+    if screening.cascade is None:
+        raise ConfigError(
+            "the target flags configure a cascade's docking tier, and this "
+            "configuration is a flat pipeline",
+            code="CLI_TARGET_NOT_APPLICABLE",
+            hint=(
+                "A flat pipeline names its receptor in the docking stage's own "
+                "settings. Either set them there, or screen with a cascade."
+            ),
+        )
+    requirements = docking_requirements(screening.cascade, registry=registry)
+    if not requirements:
+        raise ConfigError(
+            "this cascade has no docking tier to point at a receptor",
+            code="CLI_TARGET_WITHOUT_DOCKING",
+            hint=(
+                "Nothing in the funnel reads a protein, so the target would be "
+                "silently ignored. Add a docking tier, or drop the target flags -- "
+                "the usual cause is the wrong configuration file."
+            ),
+            context={"config_name": screening.cascade.name},
+        )
+    resolved = resolve_target(merged, requirements=requirements, workspace=workspace)
+    assert resolved is not None  # merged is not None, so neither is this
+    return resolved.target, resolved.notes
+
+
+def _report_target(target: TargetConfig | None, notes: Sequence[str]) -> None:
+    """Say which protein, and say which numbers were computed rather than typed."""
+
+    if target is None:
+        return
+    print(f"Target: {target.name} ({target.receptor_path})")
+    for note in notes:
+        print(f"  {note}")
+
+
 def _prepare_screen(
     config: ScreeningConfig,
     library: Path,
@@ -1220,6 +1559,7 @@ def _prepare_screen(
     *,
     molecule_format: str,
     reader: Mapping[str, Any] | None = None,
+    target: TargetConfig | None = None,
 ) -> tuple[PipelineConfig, LoweredCascade | None]:
     """Bind a library to whichever configuration kind the user supplied."""
 
@@ -1239,6 +1579,7 @@ def _prepare_screen(
             registry=registry,
             library_path=str(library.expanduser()),
             library_format=_CLI_LIBRARY_FORMATS.get(molecule_format),
+            target=target,
         )
         return lowered.pipeline, lowered
     assert config.pipeline is not None  # ScreeningConfig always carries one kind
@@ -1262,6 +1603,10 @@ def _screen(
     run_id: str | None,
     resume: bool,
     force: bool,
+    workers: int | None,
+    device: str,
+    allow_copyleft: bool,
+    target: _TargetArguments,
     dry_run: bool,
     as_json: bool,
 ) -> int:
@@ -1272,13 +1617,24 @@ def _screen(
         )
     screening = load_screening_config(config_path)
     registry = create_builtin_registry()
+    docking_target, target_notes = _docking_target(
+        screening,
+        registry,
+        workspace=workspace,
+        **target.as_kwargs(),
+    )
     pipeline, lowered = _prepare_screen(
         screening,
         library,
         registry,
         molecule_format=molecule_format,
         reader=reader,
+        target=docking_target,
     )
+    # Ahead of the compiler on purpose.  Compilation validates each stage
+    # against its plugin's config model, so a docking stage with no receptor
+    # already fails -- with a Pydantic report that never mentions '--receptor'.
+    preflight_docking_target(pipeline.stages, registry=registry)
     compiled = PipelineCompiler(registry).compile(pipeline)
 
     # Before the first molecule is read, not when execution reaches the stage
@@ -1288,7 +1644,17 @@ def _screen(
     # And the same question about the packages those adapters import, which used
     # to be asked only by ``import_medchem()`` inside ``execute()`` -- four tiers
     # too late, with a run directory and a cache already written.
-    installed = preflight_backends(compiled.stages)
+    installed = preflight_backends(
+        compiled.stages, policy=_probe_policy(allow_copyleft=allow_copyleft)
+    )
+    # Which copyleft tools the operator actually let through, by name. Computed
+    # after the preflight passed, so the list describes a run that is going to
+    # happen rather than one that was merely asked for.
+    permitted = _permitted_licenses(compiled.stages, allow_copyleft=allow_copyleft)
+    # Before the dry-run branch as well: '--dry-run --device cuda' on a machine
+    # with no card is a question worth being able to ask, and the answer must be
+    # the same refusal a real run would give.
+    resources = _stage_resources(workers=workers, device=device)
 
     if dry_run:
         payload = {
@@ -1298,6 +1664,11 @@ def _screen(
             "stages": [stage.stage_id for stage in compiled.stages],
             "assets": list(provisioned),
             "backends": list(installed),
+            "execution_lanes": list(resources.devices),
+            "execution_notes": list(resources.notes),
+            "permitted_licenses": dict(permitted),
+            "target": None if docking_target is None else docking_target.model_dump(mode="json"),
+            "target_notes": list(target_notes),
         }
         if as_json:
             _json_dump(payload, sys.stdout)
@@ -1310,9 +1681,21 @@ def _screen(
                 print(f"Vendored assets ready: {', '.join(provisioned)}")
             if installed:
                 print(f"Backends ready: {', '.join(installed)}")
+            _report_target(docking_target, target_notes)
+            _report_licenses(permitted)
+            _report_lanes(resources)
         return 0
 
-    runner = LocalRunner(workspace, plugins=registry)
+    if not as_json:
+        _report_target(docking_target, target_notes)
+        _report_licenses(permitted)
+        _report_lanes(resources)
+    runner = LocalRunner(
+        workspace,
+        plugins=registry,
+        resources=resources,
+        permitted_licenses=permitted,
+    )
     result = runner.run(pipeline, run_id=run_id, resume=resume, force=force)
 
     funnel = None
@@ -1352,14 +1735,35 @@ def _print_planned_funnel(lowered: LoweredCascade | None, screening: ScreeningCo
     print(f"  Shortlist target: {cascade.finalize.target_count:,}")
 
 
-def _print_run_state(state: RunState) -> None:
+def _shard_counts(
+    checkpoints_root: Path | None,
+    stage: StageRunState,
+) -> tuple[int, int] | None:
+    """``(37, 40)`` for a stage that was interrupted part-way through.
+
+    Only meaningful while a stage is unfinished: the checkpoint directory is
+    removed the moment its artifact commits, so a succeeded stage correctly
+    reports nothing rather than reporting zero.
+    """
+
+    if checkpoints_root is None or stage.cache_key is None:
+        return None
+    if stage.status in {StageRunStatus.SUCCEEDED, StageRunStatus.CACHED}:
+        return None
+    complete, total = count_completed_shards(checkpoints_root / stage.cache_key)
+    return (complete, total) if total else None
+
+
+def _print_run_state(state: RunState, *, checkpoints_root: Path | None = None) -> None:
     print(f"Run {state.run_id}: {state.status.value}")
     print(f"Revision: {state.revision_id}")
     for stage in state.stages:
         artifact = stage.output_ref.artifact_id if stage.output_ref else "-"
+        counts = _shard_counts(checkpoints_root, stage)
+        shards = f" shards={counts[0]}/{counts[1]}" if counts else ""
         print(
             f"  {stage.stage_id:<24} {stage.status.value:<10} "
-            f"attempts={stage.attempts} artifact={artifact}"
+            f"attempts={stage.attempts} artifact={artifact}{shards}"
         )
     if state.output_ref is not None:
         print(f"Output: {state.output_ref.artifact_id}#{state.output_ref.port}")
@@ -1391,13 +1795,18 @@ def _status(
                 context={"run_id": checked_run_id},
             )
         events = _read_audit_events(event_path, state)
+    checkpoints_root = workspace_root / "checkpoints"
     if as_json:
         payload: dict[str, Any] = state.model_dump(mode="json")
+        for entry, stage in zip(payload["stages"], state.stages, strict=True):
+            counts = _shard_counts(checkpoints_root, stage)
+            if counts is not None:
+                entry["shards"] = {"complete": counts[0], "total": counts[1]}
         if include_events:
             payload["events"] = [event.model_dump(mode="json") for event in events]
         _json_dump(payload, sys.stdout)
     else:
-        _print_run_state(state)
+        _print_run_state(state, checkpoints_root=checkpoints_root)
         if include_events:
             print("Events:")
             for event in events:
@@ -1840,6 +2249,18 @@ def _dispatch_compatibility(
             run_id=arguments.compat_run_id,
             resume=arguments.compat_resume,
             force=arguments.compat_force,
+            # The compatibility form predates parallel execution and gains no
+            # flags; 'auto' is what it would have asked for had it been able to.
+            workers=None,
+            device="auto",
+            # It also predates the copyleft opt-in, and a form that cannot spell
+            # the permission is not a form that can grant it: linking GPL code
+            # is a decision someone has to make in the command they typed.
+            allow_copyleft=False,
+            # Same reasoning for the receptor: the legacy form has no flags to
+            # name one, so a cascade with a docking tier stops in the preflight
+            # and says which command does.
+            target=_TargetArguments(),
             as_json=arguments.compat_json,
         )
     legacy_values = (
@@ -1871,6 +2292,7 @@ def _dispatch_canonical(arguments: argparse.Namespace) -> int:
         return _doctor(
             as_json=arguments.json_output,
             run_version_commands=arguments.run_version_commands,
+            allow_copyleft=arguments.allow_copyleft,
         )
     if arguments.command == "assets":
         action = getattr(arguments, "asset_action", None)
@@ -1917,6 +2339,10 @@ def _dispatch_canonical(arguments: argparse.Namespace) -> int:
             run_id=arguments.run_id,
             resume=arguments.resume,
             force=arguments.force,
+            workers=arguments.workers,
+            device=arguments.device,
+            allow_copyleft=arguments.allow_copyleft,
+            target=_TargetArguments.from_namespace(arguments),
             dry_run=arguments.dry_run,
             as_json=arguments.json_output,
         )
@@ -1929,6 +2355,10 @@ def _dispatch_canonical(arguments: argparse.Namespace) -> int:
             run_id=arguments.run_id,
             resume=arguments.resume,
             force=arguments.force,
+            workers=arguments.workers,
+            device=arguments.device,
+            allow_copyleft=arguments.allow_copyleft,
+            target=_TargetArguments.from_namespace(arguments),
             as_json=arguments.json_output,
         )
     if arguments.command == "status":

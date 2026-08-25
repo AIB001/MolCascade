@@ -20,6 +20,7 @@ class Capability(StrEnum):
     PREDICT = "predict"
     APPLICABILITY = "applicability"
     SYNTHESIS = "synthesis"
+    DOCK = "dock"
     SCAFFOLD = "scaffold"
     CLUSTER = "cluster"
     SELECT = "select"

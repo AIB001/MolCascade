@@ -16,11 +16,13 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from pydantic import Field, ValidationError, model_validator
 
-from molcascade.chemistry.datasets import iter_contract_batches, require_single_input
+from molcascade.chemistry.datasets import require_single_input
+from molcascade.chemistry.sharding import shard_stage
 from molcascade.config.canonical import canonical_sha256
 from molcascade.config.models import StrictFrozenModel
 from molcascade.contracts import DECISION_V1, PARENT_V1
 from molcascade.errors import PluginError
+from molcascade.parallel import ShardOutcome, ShardTask, iter_shard_batches
 from molcascade.plugins.api import PendingOutput, StageContext, StageRequest, StageResponse
 from molcascade.plugins.manifest import (
     Cardinality,
@@ -64,6 +66,185 @@ class PropertyRangeGateConfig(StrictFrozenModel):
         return self
 
 
+def _policy_id(config: PropertyRangeGateConfig, backend_version: str) -> str:
+    """The identity of the window this gate applied, independent of batching.
+
+    ``batch_size`` is removed before hashing: it decides how many rows are held
+    in memory at once and nothing about which molecules pass, so two runs that
+    differ only in batching must produce the same policy identifier.
+    """
+
+    policy = config.model_dump(mode="json")
+    policy.pop("batch_size", None)
+    return "property-gate-policy:sha256:" + canonical_sha256(
+        {"backend": "rdkit", "backend_version": backend_version, "policy": policy}
+    )
+
+
+def _check(
+    value: float | int,
+    *,
+    name: str,
+    minimum: float | int | None,
+    maximum: float | int | None,
+) -> list[tuple[str, str]]:
+    findings: list[tuple[str, str]] = []
+    label = name.upper()
+    if minimum is not None and value < minimum:
+        findings.append(
+            (f"PROPERTY_{label}_BELOW_MIN", f"{name}={value!r} is below {minimum!r}")
+        )
+    if maximum is not None and value > maximum:
+        findings.append(
+            (f"PROPERTY_{label}_ABOVE_MAX", f"{name}={value!r} is above {maximum!r}")
+        )
+    return findings
+
+
+def _run_shard(task: ShardTask) -> ShardOutcome:
+    """Gate one contiguous range of parents, in whichever process owns it.
+
+    Module-level and self-contained on purpose: ``spawn`` re-imports this module
+    in a fresh interpreter and calls the function by name, so it may close over
+    nothing.  The config is re-validated here rather than trusted, which is
+    cheap and keeps a worker fail-closed on anything the pickle did not carry.
+    """
+
+    from rdkit import Chem, rdBase
+    from rdkit.Chem import Crippen, Descriptors, Lipinski, rdMolDescriptors
+
+    config = PropertyRangeGateConfig.model_validate(dict(task.config))
+    policy_id = _policy_id(config, rdBase.rdkitVersion)
+    rows_in = 0
+    passed_count = 0
+    decision_count = 0
+    with (
+        pq.ParquetWriter(
+            task.output_paths["primary"], PARENT_V1.schema, compression="zstd"
+        ) as parents,
+        pq.ParquetWriter(
+            task.output_paths["decisions"], DECISION_V1.schema, compression="zstd"
+        ) as decisions,
+    ):
+        for batch in iter_shard_batches(task, batch_size=config.batch_size):
+            passed: list[dict[str, Any]] = []
+            decision_rows: list[dict[str, Any]] = []
+            for row in batch.to_pylist():
+                rows_in += 1
+                parent_id = row.get("parent_id")
+                molecule = Chem.MolFromSmiles(
+                    row.get("parent_smiles")
+                    if isinstance(row.get("parent_smiles"), str)
+                    else ""
+                )
+                if molecule is None:
+                    raise PluginError(
+                        "registered parent cannot be parsed by RDKit property gate",
+                        code="PROPERTY_GATE_PARENT_INVALID",
+                        context={"parent_id": str(parent_id)},
+                    )
+                properties: dict[str, float | int] = {
+                    "mw": float(Descriptors.MolWt(molecule)),
+                    "clogp": float(Crippen.MolLogP(molecule)),
+                    "tpsa": float(rdMolDescriptors.CalcTPSA(molecule)),
+                    "hbd": int(rdMolDescriptors.CalcNumHBD(molecule)),
+                    "hba": int(rdMolDescriptors.CalcNumHBA(molecule)),
+                    "rotatable_bonds": int(Lipinski.NumRotatableBonds(molecule)),
+                    "heavy_atom_count": int(molecule.GetNumHeavyAtoms()),
+                    "absolute_formal_charge": abs(int(Chem.GetFormalCharge(molecule))),
+                }
+                if any(
+                    isinstance(value, float) and not math.isfinite(value)
+                    for value in properties.values()
+                ):
+                    raise PluginError(
+                        "RDKit produced a non-finite gate property",
+                        code="PROPERTY_GATE_NON_FINITE",
+                        context={"parent_id": str(parent_id)},
+                    )
+                findings: list[tuple[str, str]] = []
+                findings += _check(
+                    properties["mw"], name="mw", minimum=config.mw_min, maximum=config.mw_max
+                )
+                findings += _check(
+                    properties["clogp"],
+                    name="clogp",
+                    minimum=config.clogp_min,
+                    maximum=config.clogp_max,
+                )
+                findings += _check(
+                    properties["tpsa"],
+                    name="tpsa",
+                    minimum=config.tpsa_min,
+                    maximum=config.tpsa_max,
+                )
+                findings += _check(
+                    properties["hbd"], name="hbd", minimum=None, maximum=config.hbd_max
+                )
+                findings += _check(
+                    properties["hba"], name="hba", minimum=None, maximum=config.hba_max
+                )
+                findings += _check(
+                    properties["rotatable_bonds"],
+                    name="rotatable_bonds",
+                    minimum=None,
+                    maximum=config.rotatable_bonds_max,
+                )
+                findings += _check(
+                    properties["heavy_atom_count"],
+                    name="heavy_atom_count",
+                    minimum=config.heavy_atom_min,
+                    maximum=config.heavy_atom_max,
+                )
+                findings += _check(
+                    properties["absolute_formal_charge"],
+                    name="absolute_formal_charge",
+                    minimum=None,
+                    maximum=config.absolute_formal_charge_max,
+                )
+                if findings:
+                    for reason_code, detail in findings:
+                        decision_rows.append(
+                            {
+                                "entity_id": parent_id,
+                                "entity_kind": "PARENT",
+                                "stage_id": task.stage_id,
+                                "outcome": "REJECT",
+                                "reason_code": reason_code,
+                                "rule_id": policy_id,
+                                "detail": detail,
+                            }
+                        )
+                else:
+                    passed.append(row)
+                    passed_count += 1
+                    decision_rows.append(
+                        {
+                            "entity_id": parent_id,
+                            "entity_kind": "PARENT",
+                            "stage_id": task.stage_id,
+                            "outcome": "PASS",
+                            "reason_code": "PROPERTY_RANGE_PASS",
+                            "rule_id": policy_id,
+                            "detail": json.dumps(
+                                properties,
+                                ensure_ascii=False,
+                                allow_nan=False,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ),
+                        }
+                    )
+                decision_count += max(1, len(findings))
+            if passed:
+                parents.write_table(pa.Table.from_pylist(passed, schema=PARENT_V1.schema))
+            decisions.write_table(pa.Table.from_pylist(decision_rows, schema=DECISION_V1.schema))
+    return ShardOutcome(
+        rows_in=rows_in,
+        rows_out={"primary": passed_count, "decisions": decision_count},
+    )
+
+
 class RDKitPropertyRangeGatePlugin:
     descriptor = PluginDescriptor(
         id="chemistry.rdkit_property_range_gate",
@@ -82,29 +263,8 @@ class RDKitPropertyRangeGatePlugin:
     )
     config_model = PropertyRangeGateConfig
 
-    @staticmethod
-    def _check(
-        value: float | int,
-        *,
-        name: str,
-        minimum: float | int | None,
-        maximum: float | int | None,
-    ) -> list[tuple[str, str]]:
-        findings: list[tuple[str, str]] = []
-        label = name.upper()
-        if minimum is not None and value < minimum:
-            findings.append(
-                (f"PROPERTY_{label}_BELOW_MIN", f"{name}={value!r} is below {minimum!r}")
-            )
-        if maximum is not None and value > maximum:
-            findings.append(
-                (f"PROPERTY_{label}_ABOVE_MAX", f"{name}={value!r} is above {maximum!r}")
-            )
-        return findings
-
     def execute(self, request: StageRequest, context: StageContext) -> StageResponse:
-        from rdkit import Chem, rdBase
-        from rdkit.Chem import Crippen, Descriptors, Lipinski, rdMolDescriptors
+        from rdkit import rdBase
 
         try:
             config = self.config_model.model_validate(dict(request.config))
@@ -115,193 +275,48 @@ class RDKitPropertyRangeGatePlugin:
                 context={"error_count": error.error_count()},
             ) from error
         stage_input = require_single_input(request.inputs, contract_id=PARENT_V1.id)
-        context.staging_root.mkdir(parents=True, exist_ok=True)
-        for relative in (_PARENT_PATH, _DECISION_PATH):
-            destination = context.staging_root / relative
-            if destination.exists() or destination.is_symlink():
-                raise PluginError(
-                    f"property-gate output already exists: {relative.as_posix()}",
-                    code="PLUGIN_STAGING_NOT_EMPTY",
-                )
-            destination.parent.mkdir(parents=True, exist_ok=True)
-
-        policy = config.model_dump(mode="json")
-        policy.pop("batch_size", None)
-        policy_id = "property-gate-policy:sha256:" + canonical_sha256(
-            {
-                "backend": "rdkit",
-                "backend_version": rdBase.rdkitVersion,
-                "policy": policy,
-            }
+        policy_id = _policy_id(config, rdBase.rdkitVersion)
+        result = shard_stage(
+            worker=_run_shard,
+            stage_input=stage_input,
+            contract=PARENT_V1,
+            output_paths={
+                "primary": _PARENT_PATH.as_posix(),
+                "decisions": _DECISION_PATH.as_posix(),
+            },
+            context=context,
+            stage_id=request.stage_id,
+            config=config.model_dump(mode="json"),
         )
-        parent_destination = context.staging_root / _PARENT_PATH
-        decision_destination = context.staging_root / _DECISION_PATH
-        input_count = 0
-        passed_count = 0
-        decision_count = 0
-        try:
-            with (
-                pq.ParquetWriter(
-                    parent_destination, PARENT_V1.schema, compression="zstd"
-                ) as parents,
-                pq.ParquetWriter(
-                    decision_destination,
-                    DECISION_V1.schema,
-                    compression="zstd",
-                ) as decisions,
-            ):
-                for batch in iter_contract_batches(
-                    stage_input,
-                    PARENT_V1,
-                    batch_size=config.batch_size,
-                ):
-                    passed: list[dict[str, Any]] = []
-                    decision_rows: list[dict[str, Any]] = []
-                    for row in batch.to_pylist():
-                        input_count += 1
-                        parent_id = row.get("parent_id")
-                        molecule = Chem.MolFromSmiles(
-                            row.get("parent_smiles")
-                            if isinstance(row.get("parent_smiles"), str)
-                            else ""
-                        )
-                        if molecule is None:
-                            raise PluginError(
-                                "registered parent cannot be parsed by RDKit property gate",
-                                code="PROPERTY_GATE_PARENT_INVALID",
-                                context={"parent_id": str(parent_id)},
-                            )
-                        properties: dict[str, float | int] = {
-                            "mw": float(Descriptors.MolWt(molecule)),
-                            "clogp": float(Crippen.MolLogP(molecule)),
-                            "tpsa": float(rdMolDescriptors.CalcTPSA(molecule)),
-                            "hbd": int(rdMolDescriptors.CalcNumHBD(molecule)),
-                            "hba": int(rdMolDescriptors.CalcNumHBA(molecule)),
-                            "rotatable_bonds": int(Lipinski.NumRotatableBonds(molecule)),
-                            "heavy_atom_count": int(molecule.GetNumHeavyAtoms()),
-                            "absolute_formal_charge": abs(int(Chem.GetFormalCharge(molecule))),
-                        }
-                        if any(
-                            isinstance(value, float) and not math.isfinite(value)
-                            for value in properties.values()
-                        ):
-                            raise PluginError(
-                                "RDKit produced a non-finite gate property",
-                                code="PROPERTY_GATE_NON_FINITE",
-                                context={"parent_id": str(parent_id)},
-                            )
-                        findings: list[tuple[str, str]] = []
-                        findings += self._check(
-                            properties["mw"],
-                            name="mw",
-                            minimum=config.mw_min,
-                            maximum=config.mw_max,
-                        )
-                        findings += self._check(
-                            properties["clogp"],
-                            name="clogp",
-                            minimum=config.clogp_min,
-                            maximum=config.clogp_max,
-                        )
-                        findings += self._check(
-                            properties["tpsa"],
-                            name="tpsa",
-                            minimum=config.tpsa_min,
-                            maximum=config.tpsa_max,
-                        )
-                        findings += self._check(
-                            properties["hbd"], name="hbd", minimum=None, maximum=config.hbd_max
-                        )
-                        findings += self._check(
-                            properties["hba"], name="hba", minimum=None, maximum=config.hba_max
-                        )
-                        findings += self._check(
-                            properties["rotatable_bonds"],
-                            name="rotatable_bonds",
-                            minimum=None,
-                            maximum=config.rotatable_bonds_max,
-                        )
-                        findings += self._check(
-                            properties["heavy_atom_count"],
-                            name="heavy_atom_count",
-                            minimum=config.heavy_atom_min,
-                            maximum=config.heavy_atom_max,
-                        )
-                        findings += self._check(
-                            properties["absolute_formal_charge"],
-                            name="absolute_formal_charge",
-                            minimum=None,
-                            maximum=config.absolute_formal_charge_max,
-                        )
-                        if findings:
-                            for reason_code, detail in findings:
-                                decision_rows.append(
-                                    {
-                                        "entity_id": parent_id,
-                                        "entity_kind": "PARENT",
-                                        "stage_id": request.stage_id,
-                                        "outcome": "REJECT",
-                                        "reason_code": reason_code,
-                                        "rule_id": policy_id,
-                                        "detail": detail,
-                                    }
-                                )
-                        else:
-                            passed.append(row)
-                            passed_count += 1
-                            decision_rows.append(
-                                {
-                                    "entity_id": parent_id,
-                                    "entity_kind": "PARENT",
-                                    "stage_id": request.stage_id,
-                                    "outcome": "PASS",
-                                    "reason_code": "PROPERTY_RANGE_PASS",
-                                    "rule_id": policy_id,
-                                    "detail": json.dumps(
-                                        properties,
-                                        ensure_ascii=False,
-                                        allow_nan=False,
-                                        sort_keys=True,
-                                        separators=(",", ":"),
-                                    ),
-                                }
-                            )
-                        decision_count += max(1, len(findings))
-                    if passed:
-                        parents.write_table(pa.Table.from_pylist(passed, schema=PARENT_V1.schema))
-                    decisions.write_table(
-                        pa.Table.from_pylist(decision_rows, schema=DECISION_V1.schema)
-                    )
-            if input_count == 0:
-                raise PluginError(
-                    "property-gate input contains no parents",
-                    code="PROPERTY_GATE_EMPTY_INPUT",
-                )
-        except BaseException:
-            parent_destination.unlink(missing_ok=True)
-            decision_destination.unlink(missing_ok=True)
-            raise
+        if result.rows_in == 0:
+            raise PluginError(
+                "property-gate input contains no parents",
+                code="PROPERTY_GATE_EMPTY_INPUT",
+            )
+        passed_count = result.rows_out["primary"]
+        decision_count = result.rows_out["decisions"]
         return StageResponse(
             outputs={
                 "primary": PendingOutput(
                     PARENT_V1.id,
-                    (_PARENT_PATH.as_posix(),),
+                    result.file_paths["primary"],
                     {"row_count": passed_count},
                 ),
                 "decisions": PendingOutput(
                     DECISION_V1.id,
-                    (_DECISION_PATH.as_posix(),),
+                    result.file_paths["decisions"],
                     {"row_count": decision_count, "policy_id": policy_id},
                 ),
             },
             metadata={
-                "input_count": input_count,
+                "input_count": result.rows_in,
                 "output_count": passed_count,
-                "reject_count": input_count - passed_count,
+                "reject_count": result.rows_in - passed_count,
                 "decision_count": decision_count,
                 "policy_id": policy_id,
                 "backend": "rdkit",
                 "backend_version": rdBase.rdkitVersion,
+                **result.response_metadata(),
             },
         )
 

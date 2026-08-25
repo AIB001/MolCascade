@@ -17,6 +17,7 @@ from molcascade.artifacts.models import (
     ArtifactRef,
     validate_relative_artifact_path,
 )
+from molcascade.parallel.models import StageResources
 from molcascade.plugins.manifest import PluginDescriptor
 
 _PORT_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,127}$")
@@ -92,13 +93,23 @@ class StageRequest:
 
 @dataclass(frozen=True, slots=True)
 class StageContext:
-    """Runner-owned filesystem context for one isolated stage attempt.
+    """Runner-owned filesystem and machine context for one isolated stage attempt.
 
     Every output file is written beneath the same ``staging_root``.  Plugins do
     not publish, rename, or calculate final artifact identities.
+
+    ``resources`` says how much of this machine the stage may use -- worker
+    count, GPU lanes, and where it may leave completed shards so an interrupted
+    run can resume.  It travels here rather than in the stage's config because
+    ``stage_cache_key`` hashes the config: a worker count in there would give
+    the same science a different cache key on every machine, and a cache that
+    never hits is not a cache.  The default is the historical single-worker,
+    CPU-only, no-checkpoint behaviour, so every plugin and test that predates
+    parallel execution keeps working and keeps producing the same bytes.
     """
 
     staging_root: Path
+    resources: StageResources = field(default_factory=StageResources)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "staging_root", Path(self.staging_root))
@@ -204,5 +215,6 @@ __all__ = [
     "StageOutput",
     "StagePlugin",
     "StageRequest",
+    "StageResources",
     "StageResponse",
 ]
