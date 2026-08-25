@@ -2,6 +2,7 @@
 
 from molcascade.plugins.api import StagePlugin
 from molcascade.plugins.builtin.admet import ADMETAIV2PredictorPlugin
+from molcascade.plugins.builtin.aizynthfinder import AiZynthFinderRoutePlugin
 from molcascade.plugins.builtin.chembl_check import ChemblStructureCheckPlugin
 from molcascade.plugins.builtin.chemprop_model import ChempropCheckpointPlugin
 from molcascade.plugins.builtin.custom_model import CustomModelPredictorPlugin
@@ -71,6 +72,7 @@ BUILTIN_STAGE_PLUGINS: tuple[StagePlugin, ...] = (
     Fpsim2ReferenceSimilarityPlugin(),
     RDKitSAScorePlugin(),
     ScScorePlugin(),
+    AiZynthFinderRoutePlugin(),
     ADMETAIV2PredictorPlugin(),
     ChempropCheckpointPlugin(),
     CustomModelPredictorPlugin(),

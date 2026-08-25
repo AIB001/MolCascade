@@ -31,11 +31,22 @@ what is missing and the exact command a human can decide to run.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import os
+import stat
+from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import TYPE_CHECKING
 
+from pydantic import JsonValue
+
 from molcascade.backends.catalog import BUILTIN_BACKEND_SPECS
-from molcascade.backends.models import Availability, BackendSpec, ProbePolicy
+from molcascade.backends.models import (
+    Availability,
+    BackendSpec,
+    BackendStatus,
+    BackendTier,
+    ProbePolicy,
+)
 from molcascade.backends.registry import probe_backend
 from molcascade.errors import PluginError
 
@@ -100,6 +111,69 @@ def required_backends(
     return tuple(found)
 
 
+def _isolated_status(
+    spec: BackendSpec,
+    config: Mapping[str, object],
+) -> BackendStatus:
+    """Check an isolated backend where it actually lives: the stage's own config.
+
+    ``shutil.which`` is the right probe for every other CLI backend and the
+    wrong one here.  An isolated backend is isolated *because* its dependency
+    set conflicts with this environment's, so its ``bin`` directory is not on
+    this process's ``PATH`` -- and if it were, a PATH lookup would be finding
+    the very installation that must not be imported.  What decides whether the
+    run can proceed is the absolute path the stage was configured with, so that
+    is what gets stat'ed, and ``executable_config_key`` says which key holds it
+    without this module having to know one backend's vocabulary.
+    """
+
+    key = spec.executable_config_key
+    assert key is not None  # guarded by the caller
+    evidence: dict[str, JsonValue] = {
+        "config_key": key,
+        "tier": str(spec.tier),
+    }
+    configured = config.get(key)
+    if not isinstance(configured, str) or not configured.strip():
+        return BackendStatus(
+            spec=spec,
+            availability=Availability.UNAVAILABLE,
+            reason=f"the stage does not say where to find {spec.command[0]} ('{key}' is unset)",
+            evidence=evidence,
+        )
+    path = Path(configured).expanduser()
+    evidence["executable"] = str(path)
+    if not path.is_absolute():
+        return BackendStatus(
+            spec=spec,
+            availability=Availability.UNAVAILABLE,
+            reason=f"'{key}' must be an absolute path, not a command name to resolve on PATH",
+            evidence=evidence,
+        )
+    try:
+        info = path.stat()
+    except OSError:
+        return BackendStatus(
+            spec=spec,
+            availability=Availability.UNAVAILABLE,
+            reason=f"nothing exists at the configured '{key}': {path}",
+            evidence=evidence,
+        )
+    if not stat.S_ISREG(info.st_mode) or not os.access(path, os.X_OK):
+        return BackendStatus(
+            spec=spec,
+            availability=Availability.UNAVAILABLE,
+            reason=f"the configured '{key}' is not an executable file: {path}",
+            evidence=evidence,
+        )
+    return BackendStatus(
+        spec=spec,
+        availability=Availability.AVAILABLE,
+        reason="isolated executable found at the configured path",
+        evidence=evidence,
+    )
+
+
 def _install_command(missing: Sequence[BackendSpec]) -> str | None:
     """The single pip command that would satisfy every missing package."""
 
@@ -148,8 +222,17 @@ def preflight_backends(
     ready: list[str] = []
     problems: list[str] = []
     missing: list[BackendSpec] = []
+    configs = {stage.stage_id: stage.config for stage in stages}
     for stage_id, spec in required_backends(stages):
         status = probe_backend(spec, selected_policy)
+        if (
+            spec.tier is BackendTier.ISOLATED
+            and spec.executable_config_key is not None
+            and status.availability is not Availability.BLOCKED
+        ):
+            # A licence or platform refusal stands whatever the stage says; only
+            # the "is it installed" half of the verdict moves off PATH.
+            status = _isolated_status(spec, configs.get(stage_id, {}))
         if status.availability in (Availability.AVAILABLE, Availability.DEGRADED):
             if spec.id not in ready:
                 ready.append(spec.id)
@@ -168,6 +251,18 @@ def preflight_backends(
         command = _install_command(missing)
         if command:
             hint = f"{command}; {hint}"
+        isolated = [spec for spec in missing if spec.tier is BackendTier.ISOLATED]
+        if isolated:
+            # These are not pip installs into this environment -- installing one
+            # here is the thing that would break the run -- so the instruction is
+            # different in kind, not just in wording.
+            names = ", ".join(spec.display_name for spec in isolated)
+            hint = (
+                f"{names} runs in an environment of its own because its dependencies "
+                "conflict with this one's. Create that environment separately, then "
+                "give the stage the absolute path to the executable inside it. "
+                f"{hint}"
+            )
         raise PluginError(
             f"{len(problems)} stage(s) need a backend that is not usable on "
             f"this machine:\n{detail}",

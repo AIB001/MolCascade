@@ -91,6 +91,18 @@ class BackendSpec(StrictFrozenModel):
     #: pyproject by test instead.
     extra: str | None = Field(default=None, min_length=1, max_length=64)
     command: tuple[str, ...] = ()
+    #: For an :attr:`BackendTier.ISOLATED` backend, the stage-config key that
+    #: names its executable.
+    #:
+    #: An isolated backend lives in an environment MolCascade is not running in
+    #: and must not be on this one's ``PATH``: the whole reason it is isolated is
+    #: that its dependency set conflicts with this one.  So ``shutil.which`` is
+    #: not the authoritative probe for it -- the absolute path in the stage's own
+    #: configuration is -- and the preflight needs to know which key holds it.
+    #: The alternative, hard-coding the key next to the plugin id in the
+    #: preflight, would put one backend's vocabulary in a module that otherwise
+    #: knows nothing about any particular backend.
+    executable_config_key: str | None = Field(default=None, min_length=1, max_length=64)
     plugin_ref: str | None = Field(default=None, min_length=1, max_length=512)
     platforms: tuple[str, ...] = ("windows", "linux", "darwin")
     offline: bool = True
@@ -147,6 +159,10 @@ class BackendSpec(StrictFrozenModel):
             raise ValueError("CLI/Java backend requires a command probe")
         if self.distribution and not self.module:
             raise ValueError("distribution version probe requires a Python module")
+        if self.executable_config_key and self.tier is not BackendTier.ISOLATED:
+            raise ValueError(
+                "only an isolated backend takes its executable from stage configuration"
+            )
         return self
 
 

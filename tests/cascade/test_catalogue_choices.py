@@ -190,19 +190,23 @@ def test_no_choice_field_offers_a_duplicate_or_empty_value() -> None:
                 assert len(set(labels)) == len(labels), f"{where} repeats a label"
 
 
-def test_only_the_two_known_criteria_have_no_runnable_backend() -> None:
+def test_only_the_one_known_criterion_has_no_runnable_backend() -> None:
     """A criterion with no executable option is a tier the user cannot fill.
 
-    Two ship that way on purpose: route search needs an isolated environment
-    because AiZynthFinder pins RDKit and NumPy backwards, and the affinity head
-    needs a GPU.  Both are listed so a project can see the option exists.  This
-    locks the pair rather than asserting the set is empty, so a third appearing
-    -- which would mean an adapter regressed, not that a plan was made -- shows
-    up as a failure.
+    One ships that way on purpose: the affinity head needs a GPU and a trained
+    model that is not ours to distribute.  It is listed so a project can see the
+    option exists.  This locks the single id rather than asserting the set is
+    empty, so a second appearing -- which would mean an adapter regressed, not
+    that a plan was made -- shows up as a failure.
+
+    Route search used to be the other one.  It is runnable now, through
+    ``aizynthcli`` in an environment of the user's own making, which is why
+    "runnable" here means "an adapter is registered for it" and not "it will
+    work on this machine without further setup".
     """
 
     empty = sorted(criterion.id for criterion in CRITERIA if not criterion.executable_options)
-    assert empty == ["binding_affinity", "retrosynthesis_routes"]
+    assert empty == ["binding_affinity"]
 
 
 def test_every_criterion_resolves_to_a_default_backend() -> None:

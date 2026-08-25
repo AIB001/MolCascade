@@ -43,12 +43,17 @@ def _normalize(requirement: str) -> str:
     return re.sub(r"[-_.]+", "-", name).lower()
 
 
-def _stage(stage_id: str, plugin_key: str) -> CompiledStage:
-    """A compiled stage stripped to the two fields the preflight reads.
+def _stage(
+    stage_id: str,
+    plugin_key: str,
+    config: dict[str, object] | None = None,
+) -> CompiledStage:
+    """A compiled stage stripped to the three fields the preflight reads.
 
     Building one through the compiler would need a whole valid pipeline for
-    each case; the preflight only ever looks at ``stage_id`` and ``plugin_key``,
-    and a descriptor it never touches is not worth constructing.
+    each case; the preflight only ever looks at ``stage_id``, ``plugin_key``
+    and -- for an isolated backend -- ``config``, and a descriptor it never
+    touches is not worth constructing.
     """
 
     descriptor = create_builtin_registry().entries()[0].descriptor
@@ -57,7 +62,7 @@ def _stage(stage_id: str, plugin_key: str) -> CompiledStage:
         slot="gate",
         plugin_key=plugin_key,
         descriptor=descriptor,
-        config={},
+        config=config or {},
         input_contract=None,
         output_contract="molcascade.decision.v1",
         input_port=None,
@@ -219,4 +224,69 @@ def test_every_selectable_optional_backend_names_the_extra_that_installs_it() ->
         assert spec.extra is not None, (
             f"{spec.id} is selectable in a cascade but names no extra; "
             f"add one to pyproject and declare it on the spec"
+        )
+
+
+def test_an_isolated_backend_is_found_where_it_lives_not_on_path(tmp_path: Path) -> None:
+    """PATH is the one place an isolated backend must never be looked up.
+
+    ``aizynthfinder`` is isolated precisely because its RDKit and NumPy pins
+    conflict with this environment's.  Its ``bin`` is therefore not on this
+    process's ``PATH`` -- and if it were, a lookup would be finding the very
+    installation that must not be imported.  What decides the verdict is the
+    absolute path the stage carries.
+    """
+
+    executable = tmp_path / "aizynthcli"
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o755)
+    stages = (
+        _stage(
+            "t7_routes",
+            "synthesis.aizynthfinder@0.1.0",
+            {"executable": str(executable), "config_path": str(tmp_path / "config.yml")},
+        ),
+    )
+    assert preflight_backends(stages) == ("aizynthfinder",)
+
+
+def test_an_isolated_backend_with_no_configured_path_stops_the_run() -> None:
+    """The stage has not been told where the other environment is."""
+
+    stages = (_stage("t7_routes", "synthesis.aizynthfinder@0.1.0"),)
+    with pytest.raises(PluginError) as raised:
+        preflight_backends(stages)
+    error = raised.value
+    assert error.code == "BACKEND_PREFLIGHT_FAILED"
+    assert "'executable' is unset" in str(error)
+    # The instruction differs in kind from every other missing backend: pip
+    # installing this one *here* is the thing that would break the run.
+    assert error.hint is not None
+    assert "environment of its own" in error.hint
+    assert "pip install" not in error.hint.split("environment of its own")[0]
+
+
+def test_an_isolated_backend_will_not_accept_a_bare_command_name(tmp_path: Path) -> None:
+    stages = (
+        _stage("t7_routes", "synthesis.aizynthfinder@0.1.0", {"executable": "aizynthcli"}),
+    )
+    with pytest.raises(PluginError) as raised:
+        preflight_backends(stages)
+    assert "absolute path" in str(raised.value)
+
+
+def test_every_isolated_backend_with_an_adapter_says_where_its_executable_lives() -> None:
+    """Otherwise the preflight would fall back to the PATH probe and be wrong.
+
+    A ``BackendTier.ISOLATED`` spec that is selectable in a cascade but does not
+    name its config key would be checked with ``shutil.which``, which reports
+    the correctly-isolated case as missing and a wrongly-installed one as fine.
+    """
+
+    for spec in BUILTIN_BACKEND_SPECS:
+        if spec.tier is not BackendTier.ISOLATED or spec.plugin_ref is None:
+            continue
+        assert spec.executable_config_key is not None, (
+            f"{spec.id} has an adapter and is isolated, so it must declare "
+            f"executable_config_key"
         )

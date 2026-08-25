@@ -184,6 +184,33 @@ same readiness for backends, weights and hardware without running anything, and 
 validate` reports both without failing, so you can check a cascade on the laptop it will not
 run on.
 
+### Retrosynthesis: a tool that must not be installed here
+
+One backend is the exception to "pip install it and it works". AiZynthFinder pins RDKit back
+to 2023.09 and NumPy back to 1.26; resolving it into this environment would change every
+descriptor, every fingerprint, every policy digest and every ADMET checkpoint in the cascade
+so that its last tier could run. So it goes in an environment of its own, and MolCascade
+talks to it through `aizynthcli`:
+
+```bash
+conda create -n aizynth "python>=3.10,<3.13"
+conda run -n aizynth python -m pip install aizynthfinder
+conda run -n aizynth download_public_data ~/aizynth-data   # policy + stock, ~1 GB
+conda run -n aizynth which aizynthcli                      # the path the stage needs
+```
+
+The **Retrosynthesis route search** block then asks for two absolute paths: that `aizynthcli`,
+and the `config.yml` that `download_public_data` wrote. Nothing is resolved on `PATH` — the
+whole point is that this environment cannot see that one — and both paths are checked before
+the first molecule is read, so a wrong one costs a second rather than a tier.
+
+Two things are worth knowing before you enable it. Tree search is **seconds to minutes per
+molecule**, so it belongs at the very bottom of the funnel; the stage refuses more than
+`max_molecules` (1,000 by default) rather than quietly starting a week of compute. And the
+score is a step count, so a molecule with no route to your stock cannot simply be left
+blank — it is recorded as a large sentinel, flagged `ROUTE_NOT_FOUND`, and dropped by the
+step threshold rather than ranked as if it were easy.
+
 ### Authoring a flat pipeline directly
 
 `molcascade generate config --pipeline` emits the older node-and-port graph editor, which

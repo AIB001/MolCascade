@@ -1887,22 +1887,132 @@ CRITERIA: tuple[CriterionSpec, ...] = (
                     "for retrosynthetic planning. J Cheminform. 2020;12:70. "
                     "doi:10.1186/s13321-020-00472-1"
                 ),
-                requires=("aizynthfinder",),
+                plugin_ref="synthesis.aizynthfinder@0.1.0",
+                gate_plugin="synthesis.numeric_evidence_gate@0.1.0",
+                # Deliberately empty. Every other option lists the packages it
+                # imports, and this one imports nothing: aizynthfinder must *not*
+                # be installed in this environment, so probing for it here would
+                # report the healthy case as broken and the broken case as fine.
+                # What has to exist is an executable somewhere else, and only the
+                # stage's own settings know where.
+                requires=(),
+                defaults={
+                    "schema_version": 1,
+                    "executable": "",
+                    "config_path": "",
+                    "max_molecules": 1000,
+                    "timeout_per_molecule_seconds": 600.0,
+                    "unsolved_score": 99.0,
+                },
+                gate_defaults={
+                    "schema_version": 1,
+                    "expected_direction": "HIGHER_HARDER",
+                    "maximum": 6.0,
+                },
                 notes=(
-                    "Reviewed research option; no MolCascade adapter is registered "
-                    "yet, and it will need an isolated worker rather than a plugin "
-                    "in this process.\n\n"
-                    "Measured, not assumed: resolving aizynthfinder 4.4.1 into this "
-                    "environment would downgrade RDKit from 2026.03 to 2023.09 and "
-                    "NumPy from 2.x to 1.26, which changes every descriptor, every "
-                    "policy digest and every ADMET checkpoint in the cascade -- and "
-                    "pulls in Jupyter, dask, metaflow and boto3 besides. Route search "
-                    "therefore has to run in its own environment behind a process "
-                    "boundary, which is a piece of architecture rather than a "
-                    "dependency.\n\n"
-                    "Cost also argues for placing it last: tree search is seconds per "
-                    "molecule, so it belongs on the few thousand that survive "
-                    "everything else, never on the library."
+                    "Runs in its own environment, which you create once and "
+                    "MolCascade never touches. Measured, not assumed: resolving "
+                    "aizynthfinder 4.4.1 into this environment would downgrade RDKit "
+                    "from 2026.03 to 2023.09 and NumPy from 2.x to 1.26, which "
+                    "changes every descriptor, every policy digest and every ADMET "
+                    "checkpoint in the cascade -- and pulls in Jupyter, dask, "
+                    "metaflow and boto3 besides. So the adapter talks to aizynthcli "
+                    "across a process boundary instead.\n\n"
+                    "Set it up once:\n"
+                    "  conda create -n aizynth \"python>=3.10,<3.13\"\n"
+                    "  conda run -n aizynth python -m pip install aizynthfinder\n"
+                    "  conda run -n aizynth download_public_data <folder>\n"
+                    "Then paste the path that 'conda run -n aizynth which aizynthcli' "
+                    "prints, and the path to the config.yml that download_public_data "
+                    "wrote. MolCascade fetches neither the package nor the policy and "
+                    "stock files; the run stops before the first molecule if either "
+                    "path is wrong.\n\n"
+                    "Cost argues for placing it last: tree search is seconds to "
+                    "minutes per molecule, so it belongs on the few hundred or "
+                    "thousand that survive everything else, never on the library. "
+                    "The stage refuses more than 'max_molecules' inputs for that "
+                    "reason.\n\n"
+                    "The score is the number of reactions in the top-scored route. A "
+                    "target with no route to your stock cannot be left blank -- the "
+                    "column is not nullable -- so it is recorded as the unsolved "
+                    "sentinel, far outside any real step count, and flagged "
+                    "ROUTE_NOT_FOUND so the threshold below rejects it rather than "
+                    "ranking it."
+                ),
+                thresholds=(
+                    ThresholdField(
+                        name="executable",
+                        label="aizynthcli path",
+                        kind="text",
+                        help=(
+                            "Absolute path to aizynthcli inside the environment you "
+                            "made for it. Not a bare command name: that environment is "
+                            "deliberately not on this one's PATH."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="config_path",
+                        label="AiZynthFinder config file",
+                        kind="text",
+                        help=(
+                            "Absolute path to the YAML naming your expansion policy "
+                            "and stock. Its bytes are hashed into the method identity, "
+                            "so changing the policy changes the recorded method."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="max_molecules",
+                        label="Most molecules to search",
+                        kind="number",
+                        minimum=1,
+                        maximum=100_000,
+                        step=100,
+                        help=(
+                            "The stage stops before the first search if the tier hands "
+                            "it more than this. Raise it only once you have timed one "
+                            "molecule and multiplied."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="timeout_per_molecule_seconds",
+                        label="Time budget per molecule",
+                        kind="number",
+                        unit="s",
+                        minimum=1,
+                        maximum=86_400,
+                        step=30,
+                        help=(
+                            "Multiplied by the molecules each worker sees to cap the "
+                            "whole call. A deadlock guard on top of the search budget "
+                            "in your AiZynthFinder config, not a replacement for it."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="unsolved_score",
+                        label="Score for an unsolved target",
+                        kind="number",
+                        minimum=0,
+                        maximum=1_000_000,
+                        step=1,
+                        help=(
+                            "Recorded when no route to stock is found. Keep it above "
+                            "the step limit below so unsolved molecules are rejected."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="maximum",
+                        label="Most steps allowed",
+                        kind="number",
+                        target="gate",
+                        minimum=1,
+                        maximum=20,
+                        step=1,
+                        nullable=True,
+                        help=(
+                            "Molecules whose shortest found route is longer than this "
+                            "are dropped, as are those with no route at all."
+                        ),
+                    ),
                 ),
             ),
             BackendOption(

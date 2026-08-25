@@ -55,10 +55,12 @@ reaction-trained score (SCScore) calls it tractable, and is dropped only when
 two methods that disagree by construction both say it is hard.
 
 **What is deliberately absent.**  Similarity to reference leads needs a lead
-file only the project has, so it cannot ship as a default; ADMET endpoints and
-retrosynthesis route searches wait for their backends to be provisioned.  All
-three are one click away in the builder, and belong at the bottom of the funnel
-where the population is small enough to afford them.
+file only the project has, so it cannot ship as a default; ADMET endpoints wait
+for their weights to be fetched; and AiZynthFinder route search waits for an
+environment of its own, because installing it beside this one would silently
+re-score every tier above it.  All three are one click away in the builder, and
+belong at the bottom of the funnel where the population is small enough to
+afford them -- route search most of all, at seconds to minutes per molecule.
 
 References
 
