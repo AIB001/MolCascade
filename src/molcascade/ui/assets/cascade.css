@@ -698,14 +698,22 @@ input[type="checkbox"] {
  * read as one continuous flow rather than three unrelated pieces of furniture,
  * and each one only overrides the few variables that differ.
  *
- * The drawing is a solid rail with brighter marks travelling along it.  The
- * marks ride on top of the rail rather than being cut out of it: a gapped rail
- * looks broken, because half the time its lower end is a gap and the arrowhead
- * floats detached from the stem.
+ * The drawing is a faint rail with brighter marks travelling along it.  Each
+ * mark is a comet rather than a dash: it ramps up from nothing along its
+ * trailing edge and stops dead at its leading one, so a still frame already
+ * says which way the population is moving and the animation only confirms it.
+ * The marks ride on top of the rail rather than being cut out of it: a gapped
+ * rail looks broken, because half the time its lower end is a gap and the
+ * arrowhead floats detached from the stem.
  *
  * The gradient repeats on its own period, so shifting the background by exactly
  * one --flow-tile returns it to where it started.  That makes the loop seamless
- * at any height, which matters because these run from 12px to 26px. */
+ * at any length, which matters because these run from 12px to 38px.
+ *
+ * Every site picks its own --flow-tile and --flow-period, but they are chosen
+ * together to hold one speed -- about 44px per second everywhere.  A tier
+ * connector and the spine of a block are the same current at the same rate, so
+ * the eye follows it from one into the next instead of reading two animations. */
 @keyframes flow-drift {
   from {
     background-position-y: 0;
@@ -716,6 +724,18 @@ input[type="checkbox"] {
   }
 }
 
+/* The same comet laid on its side, for the inlet rail that feeds the parallel
+ * arms of a tier: there the population travels across before it turns down. */
+@keyframes flow-drift-x {
+  from {
+    background-position-x: 0;
+  }
+
+  to {
+    background-position-x: var(--flow-tile);
+  }
+}
+
 /* Declared on the elements, not on the ::before that draws the rail, because
  * the arrowhead is a second pseudo-element and a pseudo inherits only from its
  * originating element -- never from its sibling pseudo. */
@@ -723,11 +743,37 @@ input[type="checkbox"] {
 .chain,
 .tier-gap {
   --flow-tile: 13px;
-  --flow-mark-length: 5px;
+  --flow-mark-length: 9px;
+  --flow-period: 300ms;
   /* --accent-deep is declared on the elements that receive --accent, so it does
-   * not resolve out here between them; these two are page-level by necessity. */
-  --flow-rail: var(--ink-faint);
+   * not resolve out here between them; these two are page-level by necessity.
+   * The rail is a wash of the mark's own hue rather than grey: a grey stub with
+   * a coloured cap reads as two objects, and the stem should read as the faint
+   * trace the comets are running along. */
+  --flow-rail: color-mix(in srgb, var(--periwinkle-deep) 20%, transparent);
   --flow-mark: var(--periwinkle-deep);
+}
+
+/* Arrowhead geometry.  The head is a square rotated onto its corner, and two
+ * numbers follow from that which are not guessable by eye:
+ *
+ *   - a square of side s rotated 45deg stands s*sqrt(2) tall and its point lands
+ *     at the bottom of that box -- 0.2071*s below the unrotated box's own
+ *     bottom edge -- so that offset is what puts the point on the arrow's end;
+ *   - along the centre line the two drawn borders meet in a corner whose
+ *     diagonal is stroke*sqrt(2), which is the ink the head already contributes
+ *     to the stem, and therefore exactly how far short of the end the rail may
+ *     stop without leaving a hole.
+ *
+ * Both are derived from --flow-head for one reason: hand-tuned offsets drift.
+ * The previous pair disagreed by 8px on a 26px arrow, which left a third of the
+ * stem missing and the head visibly floating off the end of it. */
+.flow-arrow,
+.tier-gap {
+  --flow-head: 10px;
+  --flow-head-stroke: 2.5px;
+  --flow-head-drop: calc(var(--flow-head) * 0.2071);
+  --flow-head-back: calc(var(--flow-head-stroke) * 1.4142);
 }
 
 .flow-arrow::before,
@@ -736,30 +782,35 @@ input[type="checkbox"] {
   background-color: var(--flow-rail);
   background-image: repeating-linear-gradient(
     180deg,
-    var(--flow-mark) 0,
+    transparent 0,
     var(--flow-mark) var(--flow-mark-length),
-    transparent var(--flow-mark-length),
+    transparent calc(var(--flow-mark-length) + 0.5px),
     transparent var(--flow-tile)
   );
   background-repeat: repeat-y;
   border-radius: 2px;
-  animation: flow-drift 900ms linear infinite;
+  animation: flow-drift var(--flow-period) linear infinite;
 }
 
 /* The rail is a pseudo-element rather than the box's own background so it can
- * stop above the head.  Painted on the box it runs the full height and the
- * grey stub shows through the open V of the chevron. */
+ * stop inside the head.  Painted on the box it would run past the point and out
+ * the other side.  38px, not 26: at the old length a single comet was on the
+ * rail at a time, which reads as a dash sitting still rather than as a stream. */
 .flow-arrow {
   align-self: center;
   width: 3px;
-  height: 26px;
+  height: 38px;
   position: relative;
 }
 
+/* Down into the back of the head, not short of it.  The overlap pixel is hidden
+ * because ::after paints over ::before -- both are positioned and neither sets
+ * z-index, so document order decides -- and it absorbs the subpixel rounding
+ * that would otherwise leave a hairline between stem and chevron. */
 .flow-arrow::before {
   content: "";
   position: absolute;
-  inset: 0 0 8px;
+  inset: 0 0 calc(var(--flow-head-back) - 1px);
 }
 
 /* The head is a square rotated onto its corner with two edges drawn, which is
@@ -771,17 +822,14 @@ input[type="checkbox"] {
   content: "";
   position: absolute;
   left: 50%;
-  width: 9px;
-  height: 9px;
-  margin-left: -4.5px;
-  border-right: 2.5px solid var(--flow-mark);
-  border-bottom: 2.5px solid var(--flow-mark);
+  bottom: var(--flow-head-drop);
+  width: var(--flow-head);
+  height: var(--flow-head);
+  margin-left: calc(var(--flow-head) / -2);
+  border-right: var(--flow-head-stroke) solid var(--flow-mark);
+  border-bottom: var(--flow-head-stroke) solid var(--flow-mark);
   border-bottom-right-radius: 3px;
   transform: rotate(45deg);
-}
-
-.flow-arrow::after {
-  bottom: -2px;
 }
 
 /* Fixed endpoints -- library, standardization, shortlist -- are drawn as flat
@@ -1016,15 +1064,36 @@ input[type="checkbox"] {
 
 /* The inlet rail is the population entering the tier.  Every parallel block
  * taps the same rail, which is the whole difference from a serial chain: no
- * block can filter the molecules another one is about to look at. */
+ * block can filter the molecules another one is about to look at.  It carries
+ * the same comets as the connectors, turned on their side, so the arrival from
+ * the tier above and the spread across the arms are visibly one movement. */
 .socket.parallel::before {
+  --flow-tile: 14px;
+  --flow-mark-length: 10px;
+  --flow-mark: var(--accent-deep);
+
   content: "";
   position: absolute;
   left: 12px;
   right: 12px;
   top: 6px;
-  height: 0;
-  border-top: 2.5px solid var(--accent-deep);
+  height: 2.5px;
+  border-radius: 2px;
+  /* Nearly opaque, unlike the connectors' wash of a rail.  The inlet has to
+   * stay visibly *solid* where the outlet below it is dashed -- that contrast
+   * is what says one population arrives whole and several verdicts leave
+   * uncombined -- so the comets here brighten a line that is already there
+   * rather than being the only thing drawn on it. */
+  background-color: color-mix(in srgb, var(--accent-deep) 62%, transparent);
+  background-image: repeating-linear-gradient(
+    90deg,
+    transparent 0,
+    var(--flow-mark) var(--flow-mark-length),
+    transparent calc(var(--flow-mark-length) + 0.5px),
+    transparent var(--flow-tile)
+  );
+  background-repeat: repeat-x;
+  animation: flow-drift-x 320ms linear infinite;
 }
 
 .socket.parallel > .block {
@@ -1033,14 +1102,28 @@ input[type="checkbox"] {
   position: relative;
 }
 
+/* The tap turning off the inlet rail and down into one arm. */
 .socket.parallel > .block::after {
+  --flow-tile: 9px;
+  --flow-mark-length: 6px;
+  --flow-mark: var(--accent-deep);
+
   content: "";
   position: absolute;
   left: 50%;
   top: -10px;
   width: 2.5px;
   height: 10px;
-  background: var(--accent-deep);
+  background-color: color-mix(in srgb, var(--accent-deep) 55%, transparent);
+  background-image: repeating-linear-gradient(
+    180deg,
+    transparent 0,
+    var(--flow-mark) var(--flow-mark-length),
+    transparent calc(var(--flow-mark-length) + 0.5px),
+    transparent var(--flow-tile)
+  );
+  background-repeat: repeat-y;
+  animation: flow-drift 205ms linear infinite;
 }
 
 .empty-socket {
@@ -1103,13 +1186,31 @@ input[type="checkbox"] {
   transition: box-shadow 120ms ease, border-color 120ms ease, transform 90ms ease;
 }
 
+/* The spine carries the same current through the inside of the block, which is
+ * the point: a block is a stage the population passes through, not a box it
+ * stops in.  It runs slower and at lower contrast than the connectors -- the
+ * marks are the block's own accent deepened, not the page's periwinkle -- so
+ * that a dozen of them on screen stay a texture and the connectors stay the
+ * thing the eye follows.  Only on the canvas: .brick is the tray's shape. */
 .block::before {
+  --flow-tile: 17px;
+  --flow-mark-length: 12px;
+
   content: "";
   position: absolute;
   inset: 0 auto 0 0;
   width: 5px;
   border-radius: var(--radius-sm) 0 0 var(--radius-sm);
-  background: var(--accent);
+  background-color: var(--accent);
+  background-image: repeating-linear-gradient(
+    180deg,
+    transparent 0,
+    color-mix(in srgb, var(--accent-deep) 62%, transparent) var(--flow-mark-length),
+    transparent calc(var(--flow-mark-length) + 0.5px),
+    transparent var(--flow-tile)
+  );
+  background-repeat: repeat-y;
+  animation: flow-drift 560ms linear infinite;
 }
 
 .block:hover {
@@ -1229,14 +1330,31 @@ input[type="checkbox"] {
   border-top: 2.5px dashed var(--ink-faint);
 }
 
+/* The drop from the outlet rail into the join.  The rail above it stays static
+ * because nothing is moving along it yet -- the arms have finished and their
+ * verdicts are waiting -- but the drop is the combined population going on, so
+ * it flows like every other segment. */
 .join-wrap::after {
+  --flow-tile: 10px;
+  --flow-mark-length: 7px;
+  --flow-mark: var(--violet);
+
   content: "";
   position: absolute;
   left: 50%;
   top: 0;
   width: 2.5px;
   height: 14px;
-  background: var(--ink-faint);
+  background-color: color-mix(in srgb, var(--violet) 26%, transparent);
+  background-image: repeating-linear-gradient(
+    180deg,
+    transparent 0,
+    var(--flow-mark) var(--flow-mark-length),
+    transparent calc(var(--flow-mark-length) + 0.5px),
+    transparent var(--flow-tile)
+  );
+  background-repeat: repeat-y;
+  animation: flow-drift 230ms linear infinite;
 }
 
 .join-block {
@@ -1274,14 +1392,18 @@ input[type="checkbox"] {
  * has only 12px to say it in, so the marks run at half the pitch to keep more
  * than one of them on the rail at a time. */
 .chain {
-  --flow-tile: 7px;
-  --flow-mark-length: 3px;
-  --flow-rail: color-mix(in srgb, var(--accent-deep) 34%, transparent);
+  --flow-tile: 8px;
+  --flow-mark-length: 5.5px;
+  /* 8px per 185ms is the same 43px/s the tier connectors run at.  Matching the
+   * speed rather than the period is what makes the current read as continuous
+   * across a boundary where the pitch has to change. */
+  --flow-period: 185ms;
+  --flow-rail: color-mix(in srgb, var(--accent-deep) 26%, transparent);
   --flow-mark: var(--accent-deep);
 
   align-self: center;
   width: 2.5px;
-  height: 12px;
+  height: 20px;
   flex: none;
 }
 
@@ -1291,7 +1413,7 @@ input[type="checkbox"] {
  * thing as "this is where the population would flow". */
 .tier-gap {
   position: relative;
-  height: 26px;
+  height: 38px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1299,25 +1421,26 @@ input[type="checkbox"] {
   transition: background 110ms ease, height 110ms ease;
 }
 
+/* Runs into the back of the arrowhead, which --flow-head-back measures; see the
+ * derivation above the head geometry. */
 .tier-gap::before {
   content: "";
   position: absolute;
   left: 50%;
-  top: 3px;
-  /* Stops short of the bottom so the rail meets the back of the arrowhead
-   * rather than running through it and out the point. */
-  bottom: 9px;
+  top: 0;
+  bottom: calc(var(--flow-head-back) - 1px);
   width: 3px;
   margin-left: -1.5px;
 }
 
-.tier-gap::after {
-  bottom: 2px;
-}
-
 /* The outermost gaps are still drop targets, but they connect nothing: above
  * the first tier the arrow out of the library already draws the flow, and below
- * the last one comes the "add tier" button, which is not part of it. */
+ * the last one comes the "add tier" button, which is not part of it.  Drawing
+ * nothing, they have no reason to reserve a connector's worth of height. */
+.tier-gap.edge {
+  height: 16px;
+}
+
 .tier-gap.edge::before,
 .tier-gap.edge::after,
 .tier-gap.is-over::before,
@@ -1684,9 +1807,11 @@ input[type="checkbox"] {
 @media (prefers-reduced-motion: reduce) {
   * {
     transition: none !important;
-    /* The connectors are the only animation on the page, and stopping them
-     * costs nothing: the marks freeze mid-rail and read as a dashed line, which
-     * still points the same way it did while it was moving. */
+    /* The travelling marks are the only animation on the page -- connectors,
+     * inlet rails, taps and block spines, all of them one drift keyframe -- and
+     * stopping them costs nothing.  Each comet is drawn asymmetrically, soft at
+     * the tail and cut off at the head, so frozen at position zero it still
+     * points the way it was going. */
     animation: none !important;
   }
 }

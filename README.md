@@ -10,12 +10,98 @@ deliberate handoff boundaries for downstream software such as PRISM.
 > Status: early alpha (`0.1.0a0`). Contracts are versioned, but public compatibility is not
 > guaranteed before the first stable release.
 
-## Quick start
+## Installing
 
 Python 3.11 or newer is required.
 
 ```bash
+git clone https://github.com/AIB001/MolCascade.git
+cd MolCascade
 python -m pip install .
+```
+
+That installs MolCascade and the six packages it cannot run without. They are declared in
+`pyproject.toml` and pip resolves them for you; the table is here so you know what is being
+pulled in and why, not because you have to install them by hand.
+
+| Package | Why it is mandatory |
+| --- | --- |
+| `rdkit>=2024.9` | The chemistry engine. Parsing, standardization and identity registration, plus every default block: structural validity, the physicochemical window, Rule of Five and QED, PAINS/BRENK/NIH/ZINC alerts, Morgan fingerprints, Murcko scaffolds, SA Score and the diversity picker. Nothing screens without it. |
+| `numpy>=1.26` | Descriptor arithmetic, and the SCScore backend, which is evaluated in numpy rather than a framework so that a synthesizability score costs no extra install. |
+| `pyarrow>=17,<26` | The artifact format every stage reads and writes, and the Parquet library reader. |
+| `pydantic>=2.10,<3` | Configuration and contract schemas. Unknown fields and duplicate keys are rejected here rather than surfacing mid-run. |
+| `PyYAML>=6,<7` | YAML configurations. |
+| `openpyxl>=3.1,<4` | The streaming XLSX reader, for libraries that arrive as a spreadsheet. |
+
+RDKit is the one worth installing deliberately. `pip install rdkit` works on all three
+platforms, but if you already keep a conda environment for chemistry, install it there first
+and let pip find it:
+
+```bash
+conda create -n molcascade python=3.11
+conda activate molcascade
+conda install -c conda-forge rdkit
+python -m pip install .
+```
+
+### Screening tools installed per criterion
+
+Everything below is optional and none of it is installed by the command above. Each one
+backs a specific block in the builder, and one extra covers one criterion, named after the
+criterion rather than after the package — you pick a *filter* in the HTML, and the extra is
+what turns that choice into an install.
+
+| Builder block | Install | Package | What it adds |
+| --- | --- | --- | --- |
+| PAINS and reactivity alerts · Rule of Five and QED · ADMET property rules | `pip install "molcascade[alerts]"` | `medchem>=2.0` | 22 named published rule sets and about 2,400 curated SMARTS across 23 alert collections, including the NIBR rules |
+| ADMET endpoint | `pip install "molcascade[admet]"` | `admet-ai>=2.0` | Local multi-endpoint ADMET prediction. Brings `chemprop`, `lightning` and `torch` with it — around 900 MB, most of it torch |
+| Physicochemical window (Mordred option) | `pip install "molcascade[descriptors]"` | `mordredcommunity>=2.0` | 1,613 2D descriptors, for windows RDKit does not compute |
+| Structural validity (ChEMBL option) | `pip install "molcascade[standardize]"` | `chembl_structure_pipeline>=1.2` | EBI's curation checker on its published 0–9 penalty scale — a second toolkit's opinion, not RDKit's |
+| Similarity to reference leads (indexed option) | `pip install "molcascade[similarity]"` | `FPSim2>=0.7` | Popcount-bounded nearest-reference search; worth switching to above roughly 1,000 references |
+| Custom model prediction | `pip install "molcascade[custom-model]"` | `onnxruntime>=1.17` | Runs your own model from an ONNX bundle. ONNX is a data format, so nothing in the bundle executes as Python |
+
+`pip install "molcascade[all-backends]"` installs all six at once, which is the right choice
+for a machine that has to run whatever a user assembles in the builder. The quotes matter:
+an unquoted bracket is a glob in most shells.
+
+You do not have to work this table out in advance. A cascade that names a tool you have not
+installed is refused **before the run reads its first molecule**, and the error names every
+missing package at once together with the single `pip install` that fixes all of them —
+see [Missing tools and weights](#missing-tools-and-weights).
+
+### Open Babel
+
+Open Babel is *not* in any extra, and this is deliberate rather than an oversight. Two
+backends are catalogued against it — format rescue and its descriptor set — but Open Babel
+is GPL-2.0, and the default deployment policy refuses copyleft backends:
+
+```
+$ molcascade doctor
+  blocked     bitbirch                       — deployment policy blocks copyleft backends
+  blocked     openbabel.descriptors          — deployment policy blocks copyleft backends
+  blocked     openbabel.rescue               — deployment policy blocks copyleft backends
+```
+
+Nothing in the shipped cascade needs it: RDKit reads every format the library readers accept,
+and the descriptor criterion is served by RDKit and Mordred. If your project's licensing
+allows GPL dependencies, `pip install openbabel-wheel` and relax the policy; if it does not,
+you lose nothing by leaving it out.
+
+### If you want a CUDA build of torch
+
+Install it **before** the ADMET extra. Ask pip for `admet-ai` first and it resolves `torch`
+to the CPU wheel — 712 MB that then has to be replaced:
+
+```bash
+python -m pip install torch --index-url https://download.pytorch.org/whl/cu124
+python -m pip install "molcascade[admet]"
+```
+
+`molcascade doctor` prints what it found, including whether torch sees a GPU.
+
+## Quick start
+
+```bash
 molcascade generate config --output molcascade-builder.html
 ```
 
@@ -52,20 +138,51 @@ molcascade report screen-001 --workspace .molcascade --output screen-001.html
 molcascade export screen-001 --workspace .molcascade --output shortlist
 ```
 
-### External weights and rule tables
+### Missing tools and weights
 
-Some tools need data files that are not shipped in the package: they are large, and they
-carry their own licences. They are fetched once, into a local folder, and verified against a
-pinned SHA-256:
+A cascade is a *policy*, and it is normal to author one on a laptop and run it somewhere
+else. So a cascade may well name a tool the current machine does not have. Two things can be
+missing, and both are checked together, before the run reads its first molecule:
+
+**A Python package is not installed.** The run stops immediately, names every stage that
+wanted it, and prints the one command that fixes all of them at once:
+
+```
+$ molcascade screen --config cascade.json --library molecules.csv
+molcascade: error [BACKEND_PREFLIGHT_FAILED]: 2 stage(s) need a backend that is not usable
+on this machine:
+  druglike_oral_consensus (medchem published rule sets): Python module is not installed: medchem
+  alerts_medchem (medchem alert collections and NIBR rules): Python module is not installed: medchem
+hint: pip install "molcascade[alerts]"; MolCascade never installs anything during a screening
+run, so install these first, then start the run again. Removing the block from the cascade is
+the other way out.
+```
+
+The package goes wherever your environment puts packages — site-packages, or conda's
+`lib/python3.11/site-packages`. MolCascade does not manage it and does not need to: once
+it is installed there, every later run imports it and nothing is downloaded again.
+
+**A weight file or rule table is missing.** These are not shipped in the package — they are
+large and carry their own licences — so they are fetched once into a folder MolCascade owns
+and verified against a pinned SHA-256:
 
 ```bash
 molcascade assets status          # what is needed, what is present
 molcascade assets fetch --all     # download and verify everything missing
 ```
 
-Downloads only ever happen here. A screening run never reaches the network, and it checks
-every asset it will need *before* reading the first molecule rather than failing halfway
-down the funnel. `molcascade doctor` reports the same readiness for backends and hardware.
+That folder is `vendor/` when you are running from a clone, the platform user-data directory
+when you installed a wheel (`%LOCALAPPDATA%\molcascade\assets` on Windows,
+`~/.local/share/molcascade/assets` elsewhere), and whatever you point `MOLCASCADE_ASSET_ROOT`
+at if you want the weights on a shared volume. Fetching writes a `.molcascade-verified.json`
+stamp recording each file's size, mtime and digest, so a later run confirms the tree without
+re-hashing several gigabytes — and never re-downloads.
+
+Downloads happen only in `molcascade assets fetch`, never in a screening run: no stage in the
+pipeline can even import the module that reaches the network. `molcascade doctor` reports the
+same readiness for backends, weights and hardware without running anything, and `molcascade
+validate` reports both without failing, so you can check a cascade on the laptop it will not
+run on.
 
 ### Authoring a flat pipeline directly
 

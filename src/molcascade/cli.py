@@ -42,6 +42,7 @@ from molcascade.assets import (
 )
 from molcascade.assets.fetch import fetch_asset, render_manifest
 from molcascade.backends import Availability, ProbePolicy, create_backend_registry
+from molcascade.backends.preflight import preflight_backends
 from molcascade.cascade import (
     LibraryConfig,
     LibraryFormat,
@@ -56,7 +57,13 @@ from molcascade.cascade.funnel import build_funnel
 from molcascade.cascade.library import reader_settings
 from molcascade.config import PipelineConfig
 from molcascade.environment import detect_environment
-from molcascade.errors import AssetError, ExecutionError, MolCascadeError, PipelineError
+from molcascade.errors import (
+    AssetError,
+    ExecutionError,
+    MolCascadeError,
+    PipelineError,
+    PluginError,
+)
 from molcascade.handoff import materialize_shortlist
 from molcascade.io.atomic import DestinationExistsError, atomic_write_bytes
 from molcascade.pipeline import CompiledStage, PipelineCompiler
@@ -624,6 +631,14 @@ def _validate(config_path: Path, *, as_json: bool) -> int:
     except AssetError as error:
         provisioned = ()
         asset_note = error.hint or str(error)
+    # Same rule for the packages: naming the pip command here is the whole point
+    # of validating on the machine that will not run the cascade.
+    try:
+        installed = preflight_backends(compiled.stages)
+        backend_note: str | None = None
+    except PluginError as error:
+        installed = ()
+        backend_note = error.hint or str(error)
     payload = {
         "valid": True,
         "kind": screening.kind,
@@ -631,6 +646,8 @@ def _validate(config_path: Path, *, as_json: bool) -> int:
         "library_required": placeholder_library,
         "assets_ready": list(provisioned),
         "assets_note": asset_note,
+        "backends_ready": list(installed),
+        "backends_note": backend_note,
         "revision_id": compiled.revision_id,
         "stages": [
             {
@@ -663,6 +680,10 @@ def _validate(config_path: Path, *, as_json: bool) -> int:
             print(f"Vendored assets ready: {', '.join(provisioned)}")
         if asset_note is not None:
             print(f"Not runnable here yet: {asset_note}")
+        if installed:
+            print(f"Backends ready: {', '.join(installed)}")
+        if backend_note is not None:
+            print(f"Not runnable here yet: {backend_note}")
     return 0
 
 
@@ -1264,6 +1285,10 @@ def _screen(
     # that opens the file.  An adapter discovering its weights are missing
     # halfway down the funnel has already spent the expensive part of the run.
     provisioned = preflight_assets(compiled.stages)
+    # And the same question about the packages those adapters import, which used
+    # to be asked only by ``import_medchem()`` inside ``execute()`` -- four tiers
+    # too late, with a run directory and a cache already written.
+    installed = preflight_backends(compiled.stages)
 
     if dry_run:
         payload = {
@@ -1272,6 +1297,7 @@ def _screen(
             "revision_id": compiled.revision_id,
             "stages": [stage.stage_id for stage in compiled.stages],
             "assets": list(provisioned),
+            "backends": list(installed),
         }
         if as_json:
             _json_dump(payload, sys.stdout)
@@ -1282,6 +1308,8 @@ def _screen(
             _print_planned_funnel(lowered, screening)
             if provisioned:
                 print(f"Vendored assets ready: {', '.join(provisioned)}")
+            if installed:
+                print(f"Backends ready: {', '.join(installed)}")
         return 0
 
     runner = LocalRunner(workspace, plugins=registry)

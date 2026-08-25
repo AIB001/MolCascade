@@ -76,6 +76,20 @@ class BackendSpec(StrictFrozenModel):
     license_class: LicenseClass
     module: str | None = Field(default=None, min_length=1, max_length=256)
     distribution: str | None = Field(default=None, min_length=1, max_length=256)
+    #: The MolCascade extra that installs :attr:`distribution`, if one does.
+    #:
+    #: ``pip install medchem`` and ``pip install "molcascade[alerts]"`` both work,
+    #: but only the second carries the version floor the adapter was written
+    #: against, and only the second keeps working when that floor moves.  Left
+    #: unset for core dependencies, which are never missing, and for reviewed
+    #: backends with no adapter behind them, which nothing can select.
+    #:
+    #: Declared here rather than read from installed metadata at run time:
+    #: ``importlib.metadata`` reports the extras of the *installed* dist-info,
+    #: which in an editable checkout can be several pyproject edits old and will
+    #: happily name an extra that no longer exists.  The pairing is held to
+    #: pyproject by test instead.
+    extra: str | None = Field(default=None, min_length=1, max_length=64)
     command: tuple[str, ...] = ()
     plugin_ref: str | None = Field(default=None, min_length=1, max_length=512)
     platforms: tuple[str, ...] = ("windows", "linux", "darwin")
