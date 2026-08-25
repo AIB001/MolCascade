@@ -702,9 +702,16 @@ input[type="checkbox"] {
  * mark is a comet rather than a dash: it ramps up from nothing along its
  * trailing edge and stops dead at its leading one, so a still frame already
  * says which way the population is moving and the animation only confirms it.
- * The marks ride on top of the rail rather than being cut out of it: a gapped
- * rail looks broken, because half the time its lower end is a gap and the
- * arrowhead floats detached from the stem.
+ * The marks ride on top of the rail rather than being cut out of it, so the
+ * rail never has a gap at either end and always meets the block it connects.
+ *
+ * There is no arrowhead, and that is the point.  A chevron drawn in CSS is a
+ * square rotated onto its corner, so its ink starts partway down its own box
+ * and the stem has to stop short by a different amount again -- two offsets
+ * that have to agree to the pixel at every zoom level the browser is asked to
+ * render at, which they did not.  Direction is carried by the comets instead:
+ * every mark points the same way the population moves, all the way along the
+ * line, so there is nothing left to align.
  *
  * The gradient repeats on its own period, so shifting the background by exactly
  * one --flow-tile returns it to where it started.  That makes the loop seamless
@@ -736,9 +743,9 @@ input[type="checkbox"] {
   }
 }
 
-/* Declared on the elements, not on the ::before that draws the rail, because
- * the arrowhead is a second pseudo-element and a pseudo inherits only from its
- * originating element -- never from its sibling pseudo. */
+/* Declared on the elements rather than on the ::before that draws the rail, so
+ * one override on the element retunes both the rail and anything else the site
+ * chooses to draw from the same variables. */
 .flow-arrow,
 .chain,
 .tier-gap {
@@ -752,28 +759,6 @@ input[type="checkbox"] {
    * trace the comets are running along. */
   --flow-rail: color-mix(in srgb, var(--periwinkle-deep) 20%, transparent);
   --flow-mark: var(--periwinkle-deep);
-}
-
-/* Arrowhead geometry.  The head is a square rotated onto its corner, and two
- * numbers follow from that which are not guessable by eye:
- *
- *   - a square of side s rotated 45deg stands s*sqrt(2) tall and its point lands
- *     at the bottom of that box -- 0.2071*s below the unrotated box's own
- *     bottom edge -- so that offset is what puts the point on the arrow's end;
- *   - along the centre line the two drawn borders meet in a corner whose
- *     diagonal is stroke*sqrt(2), which is the ink the head already contributes
- *     to the stem, and therefore exactly how far short of the end the rail may
- *     stop without leaving a hole.
- *
- * Both are derived from --flow-head for one reason: hand-tuned offsets drift.
- * The previous pair disagreed by 8px on a 26px arrow, which left a third of the
- * stem missing and the head visibly floating off the end of it. */
-.flow-arrow,
-.tier-gap {
-  --flow-head: 10px;
-  --flow-head-stroke: 2.5px;
-  --flow-head-drop: calc(var(--flow-head) * 0.2071);
-  --flow-head-back: calc(var(--flow-head-stroke) * 1.4142);
 }
 
 .flow-arrow::before,
@@ -792,10 +777,8 @@ input[type="checkbox"] {
   animation: flow-drift var(--flow-period) linear infinite;
 }
 
-/* The rail is a pseudo-element rather than the box's own background so it can
- * stop inside the head.  Painted on the box it would run past the point and out
- * the other side.  38px, not 26: at the old length a single comet was on the
- * rail at a time, which reads as a dash sitting still rather than as a stream. */
+/* 38px, not 26: at the old length only one comet was on the rail at a time,
+ * which reads as a single dash sitting still rather than as a stream. */
 .flow-arrow {
   align-self: center;
   width: 3px;
@@ -803,33 +786,13 @@ input[type="checkbox"] {
   position: relative;
 }
 
-/* Down into the back of the head, not short of it.  The overlap pixel is hidden
- * because ::after paints over ::before -- both are positioned and neither sets
- * z-index, so document order decides -- and it absorbs the subpixel rounding
- * that would otherwise leave a hairline between stem and chevron. */
+/* ``inset: 0``, with nothing subtracted at either end.  The rail spans the
+ * whole gap and meets the block above and the block below, which is the entire
+ * job now that there is no head to leave room for. */
 .flow-arrow::before {
   content: "";
   position: absolute;
-  inset: 0 0 calc(var(--flow-head-back) - 1px);
-}
-
-/* The head is a square rotated onto its corner with two edges drawn, which is
- * the only way to get a chevron without an image.  Rounding the joint keeps it
- * from ending in the one hairline-sharp point in an interface built entirely
- * out of soft-cornered planes. */
-.flow-arrow::after,
-.tier-gap::after {
-  content: "";
-  position: absolute;
-  left: 50%;
-  bottom: var(--flow-head-drop);
-  width: var(--flow-head);
-  height: var(--flow-head);
-  margin-left: calc(var(--flow-head) / -2);
-  border-right: var(--flow-head-stroke) solid var(--flow-mark);
-  border-bottom: var(--flow-head-stroke) solid var(--flow-mark);
-  border-bottom-right-radius: 3px;
-  transform: rotate(45deg);
+  inset: 0;
 }
 
 /* Fixed endpoints -- library, standardization, shortlist -- are drawn as flat
@@ -1421,30 +1384,29 @@ input[type="checkbox"] {
   transition: background 110ms ease, height 110ms ease;
 }
 
-/* Runs into the back of the arrowhead, which --flow-head-back measures; see the
- * derivation above the head geometry. */
+/* Edge to edge: the gap is the distance between two tiers, so a rail that runs
+ * all of it is a rail that touches both. */
 .tier-gap::before {
   content: "";
   position: absolute;
   left: 50%;
   top: 0;
-  bottom: calc(var(--flow-head-back) - 1px);
+  bottom: 0;
   width: 3px;
   margin-left: -1.5px;
 }
 
-/* The outermost gaps are still drop targets, but they connect nothing: above
- * the first tier the arrow out of the library already draws the flow, and below
- * the last one comes the "add tier" button, which is not part of it.  Drawing
- * nothing, they have no reason to reserve a connector's worth of height. */
+/* The last gap still draws its rail -- what survives the final tier is on its
+ * way to the shortlist and the line should say so -- but it has no tier below
+ * it to separate itself from, only the "add tier" button, so it reserves less
+ * height than a gap between two tiers. */
 .tier-gap.edge {
   height: 16px;
 }
 
-.tier-gap.edge::before,
-.tier-gap.edge::after,
-.tier-gap.is-over::before,
-.tier-gap.is-over::after {
+/* While a tier is being dragged over it the gap turns into hatching, and a rail
+ * running through that reads as two things at once. */
+.tier-gap.is-over::before {
   display: none;
 }
 
@@ -1459,10 +1421,14 @@ input[type="checkbox"] {
   );
 }
 
+/* No padding: the button sits directly on the line between the last tier and
+ * the shortlist, which is exactly where the tier it adds would go.  Padding
+ * here would put blank page between the rail and the button and read as the
+ * flow stopping. */
 .add-tier-row {
   display: flex;
   justify-content: center;
-  padding: 18px 0 6px;
+  padding: 0;
 }
 
 /* -------------------------------------------------------------- inspector */

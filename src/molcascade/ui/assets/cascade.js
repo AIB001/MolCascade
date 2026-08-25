@@ -1179,10 +1179,14 @@
   }
 
   function tierGap(index) {
-    // The gaps at both ends accept a dropped tier like any other, but they draw
-    // no connector: nothing flows into the first tier from above it, and the
-    // "add tier" button below the last one is not part of the cascade.
-    const edge = index === 0 || index === state.tiers.length;
+    // Only the last gap is an edge.  The first one is not: molecules arrive
+    // into tier 1 from standardization directly above it, so it carries the
+    // connector like every other gap -- it used to draw nothing and have a
+    // separate arrow stacked above it instead, which left a blank 16px seam
+    // between the end of that arrow and the top of the tier.  Below the last
+    // tier comes the "add tier" button, which is not part of the cascade, so
+    // that gap still draws nothing.
+    const edge = index === state.tiers.length;
     return dropZone(
       el("div", {
         class: "tier-gap" + (edge ? " edge" : ""),
@@ -1235,7 +1239,6 @@
     }
 
     state.tiers.forEach((tier, index) => {
-      nodes.push(index === 0 ? arrow() : null);
       nodes.push(tierGap(index));
       nodes.push(tierCard(tier, index + 1));
     });
@@ -1253,7 +1256,10 @@
       ])
     );
 
+    // Whatever survives the last tier still has somewhere to go, so the funnel
+    // is drawn as arriving at the shortlist rather than stopping at the button.
     const steps = state.finalize.steps.filter((step) => step.enabled);
+    nodes.push(arrow());
     nodes.push(
       fixedNode(
         { kind: "finalize" },
