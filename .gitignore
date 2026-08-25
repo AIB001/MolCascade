@@ -23,12 +23,14 @@ workspace*/
 molcascade-builder*.html
 molcascade-builder*.png
 
-# Vendored model weights.  ``vendor/MANIFEST.md`` and each asset's CITATION.md
-# and LICENSE are tracked -- they are the provenance record and are small.  The
-# weights themselves are not: they are pinned by SHA-256 and fetched with
-# ``molcascade assets fetch``, which is the only supported way to obtain them.
-# Committing 21 MB of binary weights would put a second, unverified copy in
-# every clone.
+# Vendored model weights.  The line is drawn at size, not at provenance: every
+# vendored file is pinned by SHA-256 and verified on resolve regardless of
+# whether it arrived by clone or by ``molcascade assets fetch``, so a committed
+# copy is exactly as trustworthy as a downloaded one.  The small members --
+# MANIFEST.md, each asset's CITATION.md and LICENSE, the rule tables and the
+# reference implementations -- are therefore tracked, and a fresh clone can run
+# those backends without reaching the network at all.  The 21 MB of weights are
+# not worth putting in every clone's history, so they stay fetched.
 vendor/*/models/
 
 # The requirements document this project was written against.  Untracked
