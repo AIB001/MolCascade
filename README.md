@@ -178,9 +178,9 @@ molcascade doctor --run-version-commands
 
 The backend catalogue covers alternatives such as the ChEMBL Structure Pipeline, Open
 Babel, Lilly Medchem Rules, MordredCommunity, Chemprop, ADMET-AI, FPSim2, RAscore,
-AiZynthFinder, scaffold tooling, and multi-objective selection libraries. See
-[`docs/research/0005-open-source-backend-landscape.md`](docs/research/0005-open-source-backend-landscape.md)
-for the capability and adapter-status review.
+AiZynthFinder, scaffold tooling, and multi-objective selection libraries. `molcascade
+doctor` reports which of them can run on this machine and what each missing one needs;
+`molcascade cite` prints the whole catalogue with the paper behind every entry.
 
 There is no universal “SOTA” tool, threshold, or screening order across targets. Rule of
 Five, QED, structural alerts, ADMET models, similarity, SA score, and retrosynthesis answer
@@ -194,8 +194,8 @@ costs must be reviewed before a model score becomes a rejection rule.
 The ADMET-AI adapter is deliberately strict: it does not download models or install
 packages. Before enabling it, inspect and pin both the installed package code and complete
 model tree, review the configured endpoints, and explicitly acknowledge trusted local
-Torch checkpoint deserialization. See
-[`docs/research/0006-admet-ai-v2-local-adapter.md`](docs/research/0006-admet-ai-v2-local-adapter.md).
+Torch checkpoint deserialization — a checkpoint runs code when it loads, and pinning its
+digest records which bytes ran rather than making running them safe.
 
 ### Your own model
 
@@ -213,9 +213,11 @@ which is the part an ONNX bundle cannot express. Loading a Chemprop checkpoint e
 code, so it additionally requires an explicit trust acknowledgement — a digest says which
 bytes ran, not that running them is safe.
 
-See [`docs/model-bundles.md`](docs/model-bundles.md) for the manifest fields, the
-multitask `task_index` rule, and how unscoreable molecules are reported rather than
-dropped.
+`molcascade model-bundle` is also the reference for the manifest itself: it validates every
+field and names what is wrong, so pointing it at an incomplete directory is the fastest way
+to learn the format. A multitask model must say which output column it means with
+`task_index`, and a molecule the model cannot score is reported as unscoreable rather than
+quietly dropped.
 
 ## Vendored assets
 
@@ -253,14 +255,14 @@ A screen ends in a methods section, and the methods section has to name the tool
 which molecules survived — not MolCascade, which orchestrates them.
 
 ```bash
-molcascade cite                            # print every reference
-molcascade cite --output docs/citations.md # regenerate the checked-in copy
+molcascade cite                         # print every reference
+molcascade cite --output citations.md   # write a copy to drop beside a manuscript
 ```
 
-[`docs/citations.md`](docs/citations.md) covers every backend the builder can place in a
-cascade and every vendored weight file, with its licence, its pip requirement, and its paper.
-It is generated from the catalogue, and a test fails if the checked-in copy drifts or if any
-option is added without a reference.
+The output covers every backend the builder can place in a cascade and every vendored weight
+file, with its licence, its pip requirement, and its paper. It is generated from the
+catalogue rather than maintained by hand, and a test fails if any option is added without a
+reference — so the bibliography cannot quietly fall behind the tools.
 
 ## Reproducibility and safety
 
@@ -274,10 +276,10 @@ option is added without a reference.
   them; a run stops on an absent or altered asset rather than fetching one.
 - Duplicate YAML keys, unknown configuration fields, unknown plugins, contract mismatches,
   cycles, path escapes, and untrusted executable adapters fail closed.
+- Assets a run will need are resolved before the first molecule is read, so a missing weight
+  file costs nothing instead of surfacing halfway down the funnel.
 - No package manager, model downloader, docking engine, or remote service is invoked by the
   HTML builder.
-
-Architecture and implementation-round records are in [`docs/`](docs/).
 
 ## Development
 

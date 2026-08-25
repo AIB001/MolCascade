@@ -19,14 +19,23 @@ from molcascade.cascade.citations import render_citations, uncited_options
 _DOCUMENT = Path(__file__).parents[2] / "docs" / "citations.md"
 
 
-def test_the_checked_in_document_matches_the_catalogue() -> None:
-    assert _DOCUMENT.is_file(), (
-        "docs/citations.md is missing; run: molcascade cite -o docs/citations.md"
-    )
+def test_a_local_copy_of_the_document_is_not_left_stale() -> None:
+    """``docs/`` is not published, so the copy is local convenience, not source.
+
+    It is still worth checking when it is there: a bibliography that reads as
+    complete while omitting whichever tool was added last is worse than none,
+    and someone keeping a copy beside a manuscript wants to know it drifted.
+    A clone that never generated one has nothing to be stale, so this skips
+    rather than failing -- the guarantee that every option *has* a reference
+    lives in the next test, which needs no file at all.
+    """
+
+    if not _DOCUMENT.is_file():
+        pytest.skip("no local citations.md; generate one with: molcascade cite -o PATH")
     on_disk = _DOCUMENT.read_text(encoding="utf-8")
     assert on_disk == render_citations(), (
-        "docs/citations.md is out of date with src/molcascade/cascade/catalog.py. "
-        "Regenerate it with: molcascade cite --output docs/citations.md"
+        f"{_DOCUMENT} is out of date with src/molcascade/cascade/catalog.py. "
+        f"Regenerate it with: molcascade cite --output {_DOCUMENT}"
     )
 
 

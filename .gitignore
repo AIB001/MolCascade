@@ -38,12 +38,13 @@ vendor/*/models/
 # make, not a side effect of pushing the code.  Delete this line to include it.
 plan/
 
-# Development process notes: one file per working round, recording what was
-# built and what was found wrong.  They are about how the project was made, not
-# about how it works, and they go stale the moment the code moves past them.
-# The decision records in docs/research/ stay tracked -- those justify choices a
-# reader of the code will question, and the README links to them.
-docs/iterations/
+# Working documentation: iteration notes, decision records, and the generated
+# bibliography.  Kept local rather than published.  The README is the published
+# documentation, and it points at commands -- ``molcascade doctor``, ``cite``,
+# ``assets status``, ``model-bundle`` -- rather than at files here, because a
+# command reports the state of the machine it runs on and a checked-in document
+# reports the state of whoever last regenerated it.
+docs/
 
 # Scratch verification artefacts.  Screenshots taken to check a rendering, CSVs
 # extracted from a test library, one-off probe scripts.  Every one of them is a
