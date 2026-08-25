@@ -1,0 +1,41 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+dist/
+build/
+*.log
+
+# Run outputs.  A workspace holds artifacts, revisions, the event log and the
+# content-addressed cache for one or more runs; it is reproducible from the
+# configuration that produced it and nothing in it is source.
+workspace/
+workspace*/
+
+# Generated build products.  The builder is emitted by
+# ``molcascade --generate config``, so a copy in version control is a snapshot
+# that silently goes stale against the catalogue it was generated from.
+molcascade-builder*.html
+molcascade-builder*.png
+
+# Vendored model weights.  ``vendor/MANIFEST.md`` and each asset's CITATION.md
+# and LICENSE are tracked -- they are the provenance record and are small.  The
+# weights themselves are not: they are pinned by SHA-256 and fetched with
+# ``molcascade assets fetch``, which is the only supported way to obtain them.
+# Committing 21 MB of binary weights would put a second, unverified copy in
+# every clone.
+vendor/*/models/
+
+# The requirements document this project was written against.  Untracked
+# because publishing someone's internal planning document is their decision to
+# make, not a side effect of pushing the code.  Delete this line to include it.
+plan/
+
+# Local verification stamps.  A cache of (size, mtime) per verified file, so a
+# repeat check does not re-hash gigabytes.  Machine-local by construction.
+.molcascade-verified.json

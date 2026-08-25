@@ -1,0 +1,127 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "molcascade"
+version = "0.1.0a0"
+description = "Auditable, modular hierarchical screening for molecular libraries"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "MolCascade contributors" }]
+dependencies = [
+  # numpy arrives with rdkit and pyarrow anyway, but molcascade.chemistry
+  # imports it directly, so it is declared rather than borrowed.
+  "numpy>=1.26",
+  "openpyxl>=3.1,<4",
+  "pydantic>=2.10,<3",
+  "pyarrow>=17,<26",
+  "PyYAML>=6,<7",
+  "rdkit>=2024.9",
+]
+
+[project.optional-dependencies]
+analytics = ["duckdb>=1.1,<2"]
+# Optional backends the user chooses in the builder.  Nothing here is
+# installed, downloaded, or imported unless a cascade actually selects it, and
+# every adapter fails closed with an install hint when its package is absent.
+#
+# One extra per criterion the builder offers, named after the criterion rather
+# than the package, because the user picks a *filter* in the HTML and then has
+# to work out what to install.  Every entry below backs an adapter that is
+# actually registered; an extra that installs something no adapter imports is
+# worse than no extra, since it reads as support that does not exist.
+custom-model = ["onnxruntime>=1.17"]
+# 'mordredcommunity', emphatically not 'mordred': the latter is the abandoned
+# 2018 original and does not run against a current RDKit.
+descriptors = ["mordredcommunity>=2.0"]
+alerts = ["medchem>=2.0"]
+standardize = ["chembl_structure_pipeline>=1.2"]
+# The indexed nearest-reference backend. scikit-fingerprints was listed here
+# previously and no adapter imports it -- its only appearance is a reviewed
+# backend entry with no plugin behind it.
+similarity = ["FPSim2>=0.7"]
+# ADMET-AI brings chemprop, lightning and torch with it. Without this extra the
+# whole ADMET endpoint criterion had no documented way to be installed.
+admet = ["admet-ai>=2.0"]
+# Everything above, for the deployment machine that will run whatever a user
+# assembles in the builder rather than one known cascade.
+all-backends = [
+  "FPSim2>=0.7",
+  "admet-ai>=2.0",
+  "chembl_structure_pipeline>=1.2",
+  "medchem>=2.0",
+  "mordredcommunity>=2.0",
+  "onnxruntime>=1.17",
+]
+dev = [
+  "hypothesis>=6.100,<7",
+  "mypy>=1.13,<2",
+  "pytest>=8,<10",
+  "pytest-cov>=6,<8",
+  "ruff>=0.9,<1",
+  "types-PyYAML>=6,<7",
+]
+
+[project.scripts]
+molcascade = "molcascade.cli:app"
+
+[project.entry-points."molcascade.plugins"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+# Every package here has an __init__.py.  Leaving namespace discovery on meant a
+# directory whose sources had been deleted -- and which held nothing but stale
+# bytecode -- was still discovered and shipped in the wheel as an empty package.
+namespaces = false
+
+[tool.setuptools.package-data]
+"molcascade.ui.assets" = ["*.css", "*.js"]
+# PEP 561.  Without this marker mypy refuses to check the package at all --
+# including the ``python -m mypy`` in the README -- and an installed wheel
+# silently gives its callers no types despite every public surface being
+# annotated.
+"molcascade" = ["py.typed"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-config --strict-markers"
+testpaths = ["tests"]
+# So that shared panels under tests/fixtures import the same way from every
+# test directory.  Without it each test file only sees its own directory, and
+# calibration data ends up copied per file and drifting between copies.
+pythonpath = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+packages = ["molcascade"]
+
+# Scientific Python ships almost no type information: RDKit, PyArrow, Chemprop,
+# medchem, Mordred, FPSim2, Open Babel and the ChEMBL pipeline all lack stubs,
+# and PyYAML's are partial.  Without these overrides mypy reports 67 errors
+# about other people's packages, which is enough noise to hide the errors about
+# ours.  This silences the missing stubs only -- calls into these libraries are
+# still checked against whatever the runtime objects turn out to be, so an
+# adapter that misuses one is not excused here.
+[[tool.mypy.overrides]]
+module = [
+    "FPSim2.*",
+    "chembl_structure_pipeline.*",
+    "chemprop.*",
+    "medchem.*",
+    "mordred.*",
+    "onnxruntime.*",
+    "openbabel.*",
+    "openpyxl.*",
+    "pyarrow.*",
+    "rdkit.*",
+    "yaml.*",
+]
+ignore_missing_imports = true

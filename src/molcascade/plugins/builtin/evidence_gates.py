@@ -1,0 +1,926 @@
+"""Bounded, fail-closed gates over typed numeric evidence datasets.
+
+Prediction and synthesis plugins deliberately emit evidence rather than silently
+turning a score into policy.  The plugins here make that policy explicit while
+keeping the join disk-backed and producing one auditable decision per parent.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import sqlite3
+from enum import StrEnum
+from pathlib import Path
+from typing import Any, Self
+
+from pydantic import Field, ValidationError, field_validator, model_validator
+
+from molcascade.chemistry.datasets import (
+    iter_contract_batches,
+    open_stage_database,
+    write_query_parquet,
+)
+from molcascade.config.canonical import canonical_sha256
+from molcascade.config.models import StrictFrozenModel
+from molcascade.contracts import (
+    DECISION_V1,
+    PARENT_V1,
+    PREDICTION_V1,
+    SYNTHESIS_SCORE_V1,
+    DataContract,
+)
+from molcascade.errors import PluginError
+from molcascade.plugins.api import (
+    PendingOutput,
+    StageContext,
+    StageInput,
+    StageRequest,
+    StageResponse,
+)
+from molcascade.plugins.manifest import (
+    Cardinality,
+    Determinism,
+    PluginDescriptor,
+    PluginKind,
+)
+
+_PARENT_PATH = Path("datasets/passed_parents/part-00000.parquet")
+_DECISION_PATH = Path("datasets/decisions/part-00000.parquet")
+
+
+class SynthesisScoreDirection(StrEnum):
+    """Direction values defined by ``synthesis_score/v1``."""
+
+    HIGHER_EASIER = "HIGHER_EASIER"
+    HIGHER_HARDER = "HIGHER_HARDER"
+
+
+class _NumericBoundsConfig(StrictFrozenModel):
+    schema_version: int = Field(default=1, ge=1, le=1)
+    minimum: float | None = None
+    maximum: float | None = None
+    batch_size: int = Field(default=16_384, ge=1, le=250_000)
+
+    @field_validator("minimum", "maximum")
+    @classmethod
+    def _bounds_are_finite(cls, value: float | None) -> float | None:
+        if value is not None and not math.isfinite(value):
+            raise ValueError("numeric evidence bounds must be finite")
+        return value
+
+    @model_validator(mode="after")
+    def _bounds_are_explicit_and_ordered(self) -> Self:
+        if self.minimum is None and self.maximum is None:
+            raise ValueError("at least one of minimum or maximum is required")
+        if (
+            self.minimum is not None
+            and self.maximum is not None
+            and self.minimum > self.maximum
+        ):
+            raise ValueError("minimum must be no greater than maximum")
+        return self
+
+
+class PredictionEvidenceGateConfig(_NumericBoundsConfig):
+    """Bind one endpoint/model prediction to an inclusive numeric window."""
+
+    endpoint_id: str = Field(min_length=1, max_length=256)
+    model_id: str | None = Field(default=None, min_length=1, max_length=4096)
+    semantics_label: str = Field(min_length=1, max_length=1024)
+
+    @field_validator("endpoint_id", "model_id", "semantics_label")
+    @classmethod
+    def _labels_are_unambiguous(cls, value: str | None) -> str | None:
+        if value is not None and (
+            value != value.strip() or any(character in value for character in "\r\n\x00")
+        ):
+            raise ValueError(
+                "identifier and semantics labels must not contain surrounding or "
+                "control whitespace"
+            )
+        return value
+
+
+class SynthesisScoreEvidenceGateConfig(_NumericBoundsConfig):
+    """Bind one synthesis method and its declared direction to a score window."""
+
+    method_id: str | None = Field(default=None, min_length=1, max_length=4096)
+    expected_direction: SynthesisScoreDirection
+
+    @field_validator("method_id")
+    @classmethod
+    def _method_is_unambiguous(cls, value: str | None) -> str | None:
+        if value is not None and (
+            value != value.strip() or any(character in value for character in "\r\n\x00")
+        ):
+            raise ValueError("method_id must not contain surrounding or control whitespace")
+        return value
+
+    @field_validator("expected_direction", mode="before")
+    @classmethod
+    def _parse_direction(cls, value: Any) -> Any:
+        return SynthesisScoreDirection(value) if isinstance(value, str) else value
+
+
+def _validated_config(
+    request: StageRequest,
+    model: type[PredictionEvidenceGateConfig] | type[SynthesisScoreEvidenceGateConfig],
+    *,
+    label: str,
+) -> PredictionEvidenceGateConfig | SynthesisScoreEvidenceGateConfig:
+    try:
+        return model.model_validate(dict(request.config))
+    except ValidationError as error:
+        raise PluginError(
+            f"invalid {label} configuration: {error}",
+            code="PLUGIN_CONFIG_INVALID",
+            context={"error_count": error.error_count()},
+        ) from error
+
+
+def _classify_inputs(
+    inputs: dict[str, StageInput],
+    *,
+    evidence_contract: DataContract,
+    label: str,
+) -> tuple[StageInput, StageInput]:
+    allowed = {PARENT_V1.id, evidence_contract.id}
+    unsupported = sorted(
+        port for port, stage_input in inputs.items() if stage_input.contract_id not in allowed
+    )
+    if unsupported:
+        raise PluginError(
+            f"{label} received unsupported input contracts",
+            code="EVIDENCE_GATE_INPUT_CONTRACT_INVALID",
+            context={"request_ports": unsupported},
+        )
+    parents = [value for value in inputs.values() if value.contract_id == PARENT_V1.id]
+    evidence = [
+        value for value in inputs.values() if value.contract_id == evidence_contract.id
+    ]
+    if len(parents) != 1 or len(evidence) != 1 or len(inputs) != 2:
+        raise PluginError(
+            f"{label} requires exactly one parent and one evidence input",
+            code="EVIDENCE_GATE_INPUT_CARDINALITY_INVALID",
+            context={
+                "parent_input_count": len(parents),
+                "evidence_input_count": len(evidence),
+                "request_input_count": len(inputs),
+            },
+        )
+    return parents[0], evidence[0]
+
+
+def _prepare_staging(context: StageContext, *, database_name: str) -> Path:
+    context.staging_root.mkdir(parents=True, exist_ok=True)
+    database_path = context.staging_root / database_name
+    paths = (
+        database_path,
+        context.staging_root / _PARENT_PATH,
+        context.staging_root / _DECISION_PATH,
+    )
+    existing = next((path for path in paths if path.exists() or path.is_symlink()), None)
+    if existing is not None:
+        raise PluginError(
+            "evidence-gate staging path already exists",
+            code="PLUGIN_STAGING_NOT_EMPTY",
+            context={"path": str(existing.relative_to(context.staging_root))},
+        )
+    return database_path
+
+
+def _create_common_schema(connection: sqlite3.Connection) -> None:
+    connection.executescript(
+        """
+        CREATE TABLE parents (
+            parent_id TEXT PRIMARY KEY NOT NULL,
+            identity_policy_id TEXT NOT NULL,
+            parent_smiles TEXT NOT NULL,
+            registration_key TEXT NOT NULL,
+            stereo_key TEXT,
+            formula TEXT,
+            duplicate_count INTEGER NOT NULL,
+            input_rank INTEGER UNIQUE NOT NULL
+        );
+        CREATE TABLE passed AS SELECT * FROM parents WHERE 0;
+        CREATE UNIQUE INDEX passed_parent_id ON passed (parent_id);
+        CREATE TABLE decisions (
+            entity_id TEXT NOT NULL,
+            entity_kind TEXT NOT NULL,
+            stage_id TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            reason_code TEXT NOT NULL,
+            rule_id TEXT,
+            detail TEXT,
+            PRIMARY KEY (entity_id, entity_kind, stage_id, reason_code)
+        );
+        """
+    )
+
+
+def _insert_parents(
+    connection: sqlite3.Connection,
+    stage_input: StageInput,
+    *,
+    batch_size: int,
+) -> int:
+    count = 0
+    for batch in iter_contract_batches(stage_input, PARENT_V1, batch_size=batch_size):
+        for row in batch.to_pylist():
+            parent_id = str(row["parent_id"])
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO parents (
+                        parent_id, identity_policy_id, parent_smiles, registration_key,
+                        stereo_key, formula, duplicate_count, input_rank
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        parent_id,
+                        row["identity_policy_id"],
+                        row["parent_smiles"],
+                        row["registration_key"],
+                        row["stereo_key"],
+                        row["formula"],
+                        row["duplicate_count"],
+                        count,
+                    ),
+                )
+            except sqlite3.IntegrityError as error:
+                raise PluginError(
+                    "parent input contains duplicate identifiers",
+                    code="EVIDENCE_GATE_DUPLICATE_PARENT_ID",
+                    context={"parent_id": parent_id},
+                ) from error
+            count += 1
+    if count == 0:
+        raise PluginError(
+            "evidence gate parent input contains no rows",
+            code="EVIDENCE_GATE_EMPTY_PARENT_INPUT",
+        )
+    return count
+
+
+def _ensure_finite(value: object, *, field: str, parent_id: str, label: str) -> None:
+    if value is not None and not math.isfinite(float(value)):
+        raise PluginError(
+            f"{label} contains a non-finite numeric value",
+            code="EVIDENCE_GATE_NON_FINITE",
+            context={"field": field, "parent_id": parent_id},
+        )
+
+
+def _resolve_optional_identity(
+    connection: sqlite3.Connection,
+    *,
+    configured: str | None,
+    query: str,
+    parameters: tuple[object, ...],
+    identity_name: str,
+    label: str,
+) -> str:
+    if configured is not None:
+        return configured
+    observed = connection.execute(query, parameters).fetchmany(2)
+    if len(observed) != 1:
+        raise PluginError(
+            f"{label} requires exactly one observed {identity_name} when none is configured",
+            code="EVIDENCE_GATE_IDENTITY_AMBIGUOUS",
+            context={
+                "identity": identity_name,
+                "observed_count": len(observed),
+                "observed_examples": [str(row[0]) for row in observed],
+            },
+        )
+    return str(observed[0][0])
+
+
+def _detail_json(value: dict[str, Any]) -> str:
+    return json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _retained_evidence_outside_current_population(
+    connection: sqlite3.Connection,
+    *,
+    table: str,
+) -> int:
+    """Count valid upstream evidence rows ignored after an earlier serial filter."""
+
+    if table not in {"prediction_evidence", "synthesis_evidence"}:
+        raise ValueError("unknown internal evidence table")
+    row = connection.execute(
+        f"""
+        SELECT COUNT(*)
+        FROM {table} e
+        LEFT JOIN parents p ON p.parent_id = e.parent_id
+        WHERE p.parent_id IS NULL
+        """
+    ).fetchone()
+    assert row is not None
+    return int(row[0])
+
+
+def _outcome_for_value(
+    value: float | None,
+    *,
+    minimum: float | None,
+    maximum: float | None,
+    reason_prefix: str,
+) -> tuple[bool, str]:
+    if value is None:
+        return False, f"{reason_prefix}_MISSING"
+    if minimum is not None and value < minimum:
+        return False, f"{reason_prefix}_BELOW_MINIMUM"
+    if maximum is not None and value > maximum:
+        return False, f"{reason_prefix}_ABOVE_MAXIMUM"
+    return True, f"{reason_prefix}_PASS"
+
+
+def _insert_result(
+    connection: sqlite3.Connection,
+    *,
+    parent: tuple[Any, ...],
+    stage_id: str,
+    passed: bool,
+    reason_code: str,
+    policy_id: str,
+    detail: dict[str, Any],
+) -> None:
+    if passed:
+        connection.execute("INSERT INTO passed VALUES (?, ?, ?, ?, ?, ?, ?, ?)", parent)
+    connection.execute(
+        """
+        INSERT INTO decisions (
+            entity_id, entity_kind, stage_id, outcome, reason_code, rule_id, detail
+        ) VALUES (?, 'PARENT', ?, ?, ?, ?, ?)
+        """,
+        (
+            str(parent[0]),
+            stage_id,
+            "PASS" if passed else "REJECT",
+            reason_code,
+            policy_id,
+            _detail_json(detail),
+        ),
+    )
+
+
+def _write_outputs(
+    connection: sqlite3.Connection,
+    context: StageContext,
+    *,
+    batch_size: int,
+) -> None:
+    write_query_parquet(
+        connection,
+        """
+        SELECT parent_id, identity_policy_id, parent_smiles, registration_key,
+               stereo_key, formula, duplicate_count
+        FROM passed ORDER BY input_rank
+        """,
+        schema=PARENT_V1.schema,
+        destination=context.staging_root / _PARENT_PATH,
+        batch_size=batch_size,
+    )
+    write_query_parquet(
+        connection,
+        """
+        SELECT entity_id, entity_kind, stage_id, outcome, reason_code, rule_id, detail
+        FROM decisions d
+        JOIN parents p ON p.parent_id = d.entity_id
+        ORDER BY p.input_rank, d.entity_kind, d.stage_id, d.reason_code
+        """,
+        schema=DECISION_V1.schema,
+        destination=context.staging_root / _DECISION_PATH,
+        batch_size=batch_size,
+    )
+
+
+def _remove_work_files(context: StageContext, database_path: Path) -> None:
+    """Remove unpublished output and SQLite files after failure or completion."""
+
+    (context.staging_root / _PARENT_PATH).unlink(missing_ok=True)
+    (context.staging_root / _DECISION_PATH).unlink(missing_ok=True)
+    database_path.unlink(missing_ok=True)
+    for suffix in ("-journal", "-wal", "-shm"):
+        Path(f"{database_path}{suffix}").unlink(missing_ok=True)
+
+
+def _insert_prediction_evidence(
+    connection: sqlite3.Connection,
+    stage_input: StageInput,
+    *,
+    batch_size: int,
+) -> int:
+    connection.execute(
+        """
+        CREATE TABLE prediction_evidence (
+            parent_id TEXT NOT NULL,
+            endpoint_id TEXT NOT NULL,
+            model_id TEXT NOT NULL,
+            prediction_mean REAL NOT NULL,
+            PRIMARY KEY (parent_id, endpoint_id, model_id)
+        ) WITHOUT ROWID
+        """
+    )
+    count = 0
+    for batch in iter_contract_batches(stage_input, PREDICTION_V1, batch_size=batch_size):
+        for row in batch.to_pylist():
+            parent_id = str(row["parent_id"])
+            endpoint_id = str(row["endpoint_id"])
+            model_id = str(row["model_id"])
+            if not endpoint_id or not model_id:
+                raise PluginError(
+                    "prediction evidence contains a blank endpoint or model identity",
+                    code="EVIDENCE_GATE_IDENTITY_INVALID",
+                    context={"parent_id": parent_id},
+                )
+            for field in (
+                "prediction_mean",
+                "prediction_std",
+                "interval_lower",
+                "interval_upper",
+            ):
+                _ensure_finite(
+                    row.get(field),
+                    field=field,
+                    parent_id=parent_id,
+                    label="prediction evidence",
+                )
+            lower = row.get("interval_lower")
+            upper = row.get("interval_upper")
+            if lower is not None and upper is not None and float(lower) > float(upper):
+                raise PluginError(
+                    "prediction evidence contains an inverted interval",
+                    code="EVIDENCE_GATE_INTERVAL_INVALID",
+                    context={"parent_id": parent_id},
+                )
+            try:
+                connection.execute(
+                    "INSERT INTO prediction_evidence VALUES (?, ?, ?, ?)",
+                    (parent_id, endpoint_id, model_id, float(row["prediction_mean"])),
+                )
+            except sqlite3.IntegrityError as error:
+                raise PluginError(
+                    "prediction evidence contains a duplicate endpoint/model row",
+                    code="EVIDENCE_GATE_DUPLICATE_EVIDENCE",
+                    context={
+                        "parent_id": parent_id,
+                        "endpoint_id": endpoint_id,
+                        "model_id": model_id,
+                    },
+                ) from error
+            count += 1
+    return count
+
+
+def _insert_synthesis_evidence(
+    connection: sqlite3.Connection,
+    stage_input: StageInput,
+    *,
+    batch_size: int,
+) -> int:
+    connection.execute(
+        """
+        CREATE TABLE synthesis_evidence (
+            parent_id TEXT NOT NULL,
+            method_id TEXT NOT NULL,
+            score REAL NOT NULL,
+            direction TEXT NOT NULL,
+            PRIMARY KEY (parent_id, method_id)
+        ) WITHOUT ROWID
+        """
+    )
+    count = 0
+    allowed_directions = {item.value for item in SynthesisScoreDirection}
+    for batch in iter_contract_batches(
+        stage_input,
+        SYNTHESIS_SCORE_V1,
+        batch_size=batch_size,
+    ):
+        for row in batch.to_pylist():
+            parent_id = str(row["parent_id"])
+            method_id = str(row["method_id"])
+            direction = str(row["direction"])
+            if not method_id or direction not in allowed_directions:
+                raise PluginError(
+                    "synthesis evidence contains an invalid method identity or direction",
+                    code="EVIDENCE_GATE_IDENTITY_INVALID",
+                    context={
+                        "parent_id": parent_id,
+                        "method_id": method_id,
+                        "direction": direction,
+                    },
+                )
+            _ensure_finite(
+                row.get("score"),
+                field="score",
+                parent_id=parent_id,
+                label="synthesis evidence",
+            )
+            try:
+                connection.execute(
+                    "INSERT INTO synthesis_evidence VALUES (?, ?, ?, ?)",
+                    (parent_id, method_id, float(row["score"]), direction),
+                )
+            except sqlite3.IntegrityError as error:
+                raise PluginError(
+                    "synthesis evidence contains a duplicate method row",
+                    code="EVIDENCE_GATE_DUPLICATE_EVIDENCE",
+                    context={"parent_id": parent_id, "method_id": method_id},
+                ) from error
+            count += 1
+    return count
+
+
+def _evaluate_prediction(
+    connection: sqlite3.Connection,
+    *,
+    stage_id: str,
+    config: PredictionEvidenceGateConfig,
+) -> tuple[int, str, str]:
+    model_id = _resolve_optional_identity(
+        connection,
+        configured=config.model_id,
+        query=(
+            "SELECT DISTINCT e.model_id FROM prediction_evidence e "
+            "JOIN parents p ON p.parent_id = e.parent_id "
+            "WHERE e.endpoint_id = ? ORDER BY e.model_id"
+        ),
+        parameters=(config.endpoint_id,),
+        identity_name="model_id for the configured endpoint",
+        label="prediction evidence gate",
+    )
+    policy_id = "prediction-gate:sha256:" + canonical_sha256(
+        {
+            "implementation_version": 1,
+            "endpoint_id": config.endpoint_id,
+            "model_id": model_id,
+            "semantics_label": config.semantics_label,
+            "minimum": config.minimum,
+            "maximum": config.maximum,
+            "bounds_inclusive": True,
+            "missing_policy": "REJECT",
+        }
+    )
+    passed_count = 0
+    cursor = connection.execute(
+        """
+        SELECT p.parent_id, p.identity_policy_id, p.parent_smiles,
+               p.registration_key, p.stereo_key, p.formula,
+               p.duplicate_count, p.input_rank, e.prediction_mean
+        FROM parents p
+        LEFT JOIN prediction_evidence e
+          ON e.parent_id = p.parent_id
+         AND e.endpoint_id = ?
+         AND e.model_id = ?
+        ORDER BY p.input_rank
+        """,
+        (config.endpoint_id, model_id),
+    )
+    while rows := cursor.fetchmany(config.batch_size):
+        for row in rows:
+            parent = tuple(row[:8])
+            value = None if row[8] is None else float(row[8])
+            passed, reason_code = _outcome_for_value(
+                value,
+                minimum=config.minimum,
+                maximum=config.maximum,
+                reason_prefix="PREDICTION",
+            )
+            _insert_result(
+                connection,
+                parent=parent,
+                stage_id=stage_id,
+                passed=passed,
+                reason_code=reason_code,
+                policy_id=policy_id,
+                detail={
+                    "endpoint_id": config.endpoint_id,
+                    "model_id": model_id,
+                    "prediction_mean": value,
+                    "minimum": config.minimum,
+                    "maximum": config.maximum,
+                    "bounds_inclusive": True,
+                    "semantics_label": config.semantics_label,
+                },
+            )
+            passed_count += int(passed)
+    return passed_count, model_id, policy_id
+
+
+def _evaluate_synthesis(
+    connection: sqlite3.Connection,
+    *,
+    stage_id: str,
+    config: SynthesisScoreEvidenceGateConfig,
+) -> tuple[int, str, str]:
+    method_id = _resolve_optional_identity(
+        connection,
+        configured=config.method_id,
+        query=(
+            "SELECT DISTINCT e.method_id FROM synthesis_evidence e "
+            "JOIN parents p ON p.parent_id = e.parent_id ORDER BY e.method_id"
+        ),
+        parameters=(),
+        identity_name="method_id",
+        label="synthesis evidence gate",
+    )
+    observed_directions = connection.execute(
+        "SELECT DISTINCT direction FROM synthesis_evidence WHERE method_id = ?",
+        (method_id,),
+    ).fetchmany(2)
+    unexpected = [
+        str(row[0])
+        for row in observed_directions
+        if str(row[0]) != config.expected_direction.value
+    ]
+    if unexpected:
+        raise PluginError(
+            "synthesis evidence direction conflicts with the configured policy",
+            code="EVIDENCE_GATE_DIRECTION_MISMATCH",
+            context={
+                "method_id": method_id,
+                "expected_direction": config.expected_direction.value,
+                "observed_directions": [str(row[0]) for row in observed_directions],
+            },
+        )
+    policy_id = "synthesis-gate:sha256:" + canonical_sha256(
+        {
+            "implementation_version": 1,
+            "method_id": method_id,
+            "expected_direction": config.expected_direction,
+            "minimum": config.minimum,
+            "maximum": config.maximum,
+            "bounds_inclusive": True,
+            "missing_policy": "REJECT",
+        }
+    )
+    passed_count = 0
+    cursor = connection.execute(
+        """
+        SELECT p.parent_id, p.identity_policy_id, p.parent_smiles,
+               p.registration_key, p.stereo_key, p.formula,
+               p.duplicate_count, p.input_rank, e.score
+        FROM parents p
+        LEFT JOIN synthesis_evidence e
+          ON e.parent_id = p.parent_id AND e.method_id = ?
+        ORDER BY p.input_rank
+        """,
+        (method_id,),
+    )
+    while rows := cursor.fetchmany(config.batch_size):
+        for row in rows:
+            parent = tuple(row[:8])
+            value = None if row[8] is None else float(row[8])
+            passed, reason_code = _outcome_for_value(
+                value,
+                minimum=config.minimum,
+                maximum=config.maximum,
+                reason_prefix="SYNTHESIS_SCORE",
+            )
+            _insert_result(
+                connection,
+                parent=parent,
+                stage_id=stage_id,
+                passed=passed,
+                reason_code=reason_code,
+                policy_id=policy_id,
+                detail={
+                    "method_id": method_id,
+                    "direction": config.expected_direction.value,
+                    "score": value,
+                    "minimum": config.minimum,
+                    "maximum": config.maximum,
+                    "bounds_inclusive": True,
+                    "proxy_not_route": True,
+                },
+            )
+            passed_count += int(passed)
+    return passed_count, method_id, policy_id
+
+
+class NativePredictionEvidenceGatePlugin:
+    """Filter parents using one exact ``prediction/v1`` endpoint and model."""
+
+    descriptor = PluginDescriptor(
+        id="prediction.numeric_evidence_gate",
+        version="0.1.0",
+        kind=PluginKind.PREDICTOR,
+        inputs=(PARENT_V1.id, PREDICTION_V1.id),
+        outputs=(PARENT_V1.id, DECISION_V1.id),
+        output_ports={"primary": PARENT_V1.id, "decisions": DECISION_V1.id},
+        cardinality=Cardinality.FILTER,
+        determinism=Determinism.DETERMINISTIC,
+        display_name="Prediction evidence threshold gate",
+        description="Exact endpoint/model numeric window with fail-closed missing evidence.",
+    )
+    config_model = PredictionEvidenceGateConfig
+
+    def execute(self, request: StageRequest, context: StageContext) -> StageResponse:
+        config = _validated_config(
+            request,
+            PredictionEvidenceGateConfig,
+            label="prediction evidence gate",
+        )
+        assert isinstance(config, PredictionEvidenceGateConfig)
+        parent_input, evidence_input = _classify_inputs(
+            dict(request.inputs),
+            evidence_contract=PREDICTION_V1,
+            label="prediction evidence gate",
+        )
+        database_path = _prepare_staging(
+            context,
+            database_name=".prediction-evidence-gate.sqlite3",
+        )
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = open_stage_database(database_path)
+            _create_common_schema(connection)
+            input_count = _insert_parents(
+                connection,
+                parent_input,
+                batch_size=config.batch_size,
+            )
+            evidence_count = _insert_prediction_evidence(
+                connection,
+                evidence_input,
+                batch_size=config.batch_size,
+            )
+            retained_evidence_ignored_count = (
+                _retained_evidence_outside_current_population(
+                    connection,
+                    table="prediction_evidence",
+                )
+            )
+            passed_count, model_id, policy_id = _evaluate_prediction(
+                connection,
+                stage_id=request.stage_id,
+                config=config,
+            )
+            _write_outputs(
+                connection,
+                context,
+                batch_size=config.batch_size,
+            )
+        except BaseException:
+            if connection is not None:
+                connection.close()
+                connection = None
+            _remove_work_files(context, database_path)
+            raise
+        finally:
+            if connection is not None:
+                connection.close()
+            database_path.unlink(missing_ok=True)
+            for suffix in ("-journal", "-wal", "-shm"):
+                Path(f"{database_path}{suffix}").unlink(missing_ok=True)
+
+        return StageResponse(
+            outputs={
+                "primary": PendingOutput(
+                    PARENT_V1.id,
+                    (_PARENT_PATH.as_posix(),),
+                    {"row_count": passed_count},
+                ),
+                "decisions": PendingOutput(
+                    DECISION_V1.id,
+                    (_DECISION_PATH.as_posix(),),
+                    {"row_count": input_count, "policy_id": policy_id},
+                ),
+            },
+            metadata={
+                "input_count": input_count,
+                "evidence_count": evidence_count,
+                "retained_evidence_ignored_count": retained_evidence_ignored_count,
+                "output_count": passed_count,
+                "rejected_count": input_count - passed_count,
+                "endpoint_id": config.endpoint_id,
+                "model_id": model_id,
+                "policy_id": policy_id,
+                "missing_policy": "REJECT",
+                "bounds_inclusive": True,
+            },
+        )
+
+
+class NativeSynthesisScoreEvidenceGatePlugin:
+    """Filter parents using one exact ``synthesis_score/v1`` method."""
+
+    descriptor = PluginDescriptor(
+        id="synthesis.numeric_evidence_gate",
+        version="0.1.0",
+        kind=PluginKind.SYNTHESIS,
+        inputs=(PARENT_V1.id, SYNTHESIS_SCORE_V1.id),
+        outputs=(PARENT_V1.id, DECISION_V1.id),
+        output_ports={"primary": PARENT_V1.id, "decisions": DECISION_V1.id},
+        cardinality=Cardinality.FILTER,
+        determinism=Determinism.DETERMINISTIC,
+        display_name="Synthesis-score evidence threshold gate",
+        description="Exact method/direction numeric window with fail-closed missing evidence.",
+    )
+    config_model = SynthesisScoreEvidenceGateConfig
+
+    def execute(self, request: StageRequest, context: StageContext) -> StageResponse:
+        config = _validated_config(
+            request,
+            SynthesisScoreEvidenceGateConfig,
+            label="synthesis evidence gate",
+        )
+        assert isinstance(config, SynthesisScoreEvidenceGateConfig)
+        parent_input, evidence_input = _classify_inputs(
+            dict(request.inputs),
+            evidence_contract=SYNTHESIS_SCORE_V1,
+            label="synthesis evidence gate",
+        )
+        database_path = _prepare_staging(
+            context,
+            database_name=".synthesis-evidence-gate.sqlite3",
+        )
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = open_stage_database(database_path)
+            _create_common_schema(connection)
+            input_count = _insert_parents(
+                connection,
+                parent_input,
+                batch_size=config.batch_size,
+            )
+            evidence_count = _insert_synthesis_evidence(
+                connection,
+                evidence_input,
+                batch_size=config.batch_size,
+            )
+            retained_evidence_ignored_count = (
+                _retained_evidence_outside_current_population(
+                    connection,
+                    table="synthesis_evidence",
+                )
+            )
+            passed_count, method_id, policy_id = _evaluate_synthesis(
+                connection,
+                stage_id=request.stage_id,
+                config=config,
+            )
+            _write_outputs(
+                connection,
+                context,
+                batch_size=config.batch_size,
+            )
+        except BaseException:
+            if connection is not None:
+                connection.close()
+                connection = None
+            _remove_work_files(context, database_path)
+            raise
+        finally:
+            if connection is not None:
+                connection.close()
+            database_path.unlink(missing_ok=True)
+            for suffix in ("-journal", "-wal", "-shm"):
+                Path(f"{database_path}{suffix}").unlink(missing_ok=True)
+
+        return StageResponse(
+            outputs={
+                "primary": PendingOutput(
+                    PARENT_V1.id,
+                    (_PARENT_PATH.as_posix(),),
+                    {"row_count": passed_count},
+                ),
+                "decisions": PendingOutput(
+                    DECISION_V1.id,
+                    (_DECISION_PATH.as_posix(),),
+                    {"row_count": input_count, "policy_id": policy_id},
+                ),
+            },
+            metadata={
+                "input_count": input_count,
+                "evidence_count": evidence_count,
+                "retained_evidence_ignored_count": retained_evidence_ignored_count,
+                "output_count": passed_count,
+                "rejected_count": input_count - passed_count,
+                "method_id": method_id,
+                "expected_direction": config.expected_direction.value,
+                "policy_id": policy_id,
+                "missing_policy": "REJECT",
+                "bounds_inclusive": True,
+                "proxy_not_route": True,
+            },
+        )
+
+
+__all__ = [
+    "NativePredictionEvidenceGatePlugin",
+    "NativeSynthesisScoreEvidenceGatePlugin",
+    "PredictionEvidenceGateConfig",
+    "SynthesisScoreDirection",
+    "SynthesisScoreEvidenceGateConfig",
+]

@@ -1,0 +1,70 @@
+{
+  "cases": {
+    "atrop_a": {
+      "formula": "C18H20N4O2",
+      "input_smiles": "Cc1cc2c(C(N)=O)c(N)n(-c3c(C)ccc(O)c3C)c2nc1C |wD:10.9|",
+      "parent_id": "parent:sha256:996a15e04c7a897883f5614d92bde64b2f54358a0c17d3dbeb88a74f14bffa00",
+      "parent_smiles": "Cc1cc2c(C(N)=O)c(N)n(-c3c(C)ccc(O)c3C)c2nc1C |wU:10.20|",
+      "registration_key": "4df98bb83e0dbf66b4e210e271d27314b4a91393",
+      "stereo_key": "6b5f68835f07c01ebad3959243fd91d8a5c8feb8"
+    },
+    "atrop_b": {
+      "formula": "C18H20N4O2",
+      "input_smiles": "Cc1cc2c(C(N)=O)c(N)n(-c3c(C)ccc(O)c3C)c2nc1C |wD:10.20|",
+      "parent_id": "parent:sha256:3dd71294843a418f87d75cc3894ccc83f3e41f23fc9b4bea254a864794f9cc91",
+      "parent_smiles": "Cc1cc2c(C(N)=O)c(N)n(-c3c(C)ccc(O)c3C)c2nc1C |wU:10.9|",
+      "registration_key": "4df98bb83e0dbf66b4e210e271d27314b4a91393",
+      "stereo_key": "d402d3b705aa186cbf93b0024b59ee007bf09016"
+    },
+    "broad_tautomer_a": {
+      "formula": "C6H6N4",
+      "input_smiles": "C=C1N=C(N)C(C#N)=CN1",
+      "parent_id": "parent:sha256:bc81a1d49315fd4603cd034d2f10841e4af3c903719df3b9943f864cd626370a",
+      "parent_smiles": "Cc1ncc(C#N)c(N)n1",
+      "registration_key": "f1f7ac24a2dda37d699d212c7c1252b72384f77a",
+      "stereo_key": "5dec76851c08eea569474a024a4e4636dd0b4842"
+    },
+    "broad_tautomer_b": {
+      "formula": "C6H6N4",
+      "input_smiles": "C=C1N=CC(C#N)C(=N)N1",
+      "parent_id": "parent:sha256:a413171584e1f96dcef4cd46df71d5e41886353b13c23b2a3eddb6320b6d3f89",
+      "parent_smiles": "CC1=NC(=N)C(C#N)C=N1",
+      "registration_key": "f1f7ac24a2dda37d699d212c7c1252b72384f77a",
+      "stereo_key": "782ff35576aa95d9067bc144d95a069b72af279f"
+    },
+    "ethanol": {
+      "formula": "C2H6O",
+      "input_smiles": "OCC",
+      "parent_id": "parent:sha256:9ae44333d9fcc30632a0a188c6ecffd77e9db9009da1566364ff9166c9b811ff",
+      "parent_smiles": "CCO",
+      "registration_key": "378e7bfa5a57df5f4bf6465147d8a9ea434d0580",
+      "stereo_key": "b418f9d7ded2601fb980750040a1aebf2877209e"
+    },
+    "isotope": {
+      "formula": "CH4O",
+      "input_smiles": "[13CH3]O",
+      "parent_id": "parent:sha256:fda2d6d032f050c27654e6a5caf3574f6f7b0c09bbb76fadc0ab3b9537fd958f",
+      "parent_smiles": "[13CH3]O",
+      "registration_key": "7fa1f683212695843c207f57adb910713737c0d9",
+      "stereo_key": "7a4d23b7a259ffbb637eb61beb39360714bc5735"
+    },
+    "pyridone_enol": {
+      "formula": "C5H5NO",
+      "input_smiles": "Oc1ncccc1",
+      "parent_id": "parent:sha256:f2dcdd86ab5eabba828179f34ea7fc929db4aac4a985a8f6e0c26d5d34497e2f",
+      "parent_smiles": "O=c1cccc[nH]1",
+      "registration_key": "f04efbe99662c7c2819acdacdb0e5380f243e4f4",
+      "stereo_key": "5f9df819e19209c2c9c3752ec91fe83bf4d4a431"
+    },
+    "stereo_r": {
+      "formula": "CHBrClF",
+      "input_smiles": "F[C@H](Cl)Br",
+      "parent_id": "parent:sha256:abe9b0cbddcd9c3624857851aa924d539b41967371439ca9adda50efa27fc862",
+      "parent_smiles": "F[C@H](Cl)Br",
+      "registration_key": "ba8718df74c0fc8f64c83797caea645f69ddba15",
+      "stereo_key": "9e88036659ad4e31f034f10949eb2a45a3af777a"
+    }
+  },
+  "identity_policy_id": "identity-policy:sha256:29092cf2cb0ad319c695015fb4213d65e4d9267f178c6e8e303cc124945a125d",
+  "rdkit_version": "2026.03.1"
+}
