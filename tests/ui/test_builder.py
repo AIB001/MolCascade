@@ -62,7 +62,13 @@ def test_builder_payload_contains_strict_default_and_multiple_local_tools() -> N
     assert payload["builder_schema_version"] == 3
     assert config.stages[0].slot == "source"
     assert compiled.stages[-1].plugin_key == "export.native_smiles_shortlist@0.1.0"
-    assert config.metadata["docking_included"] is False
+    # Pinned against the compiled graph, not against False.  The default screen
+    # has no docking tier today, so both sides are False -- but if one is ever
+    # added to the defaults, this fails instead of quietly exporting provenance
+    # that says no docking happened.
+    assert config.metadata["docking_included"] is any(
+        stage.descriptor.kind is PluginKind.DOCK for stage in compiled.stages
+    )
     assert config.metadata["builder_view"] == "node_canvas/v2"
     layout = config.metadata["builder_layout"]
     assert layout["schema_version"] == 2

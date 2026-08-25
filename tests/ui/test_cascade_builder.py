@@ -317,6 +317,27 @@ def test_a_scripted_browser_session_exports_an_executable_cascade(
     assert twin.gate.settings["maximum"] == original.gate.settings["maximum"]
     assert twin.gate.settings["maximum"] != added.gate.settings["maximum"]
 
+    # 7. A block whose configuration cannot be completed in this file says so
+    #    on the tier that holds it.  The receptor belongs to the campaign, not
+    #    to the screening policy, so the builder's job is to make the debt
+    #    visible now rather than to let the run discover it later.
+    needs = steps["runTimeNeeds"]
+    assert needs["offeredDisabled"] is False
+    assert needs["before"] == []
+    assert len(needs["after"]) == 1
+    line = needs["after"][0]
+    assert "At run time" in line
+    assert "--receptor" in line
+    # Naming only the receptor would be half the requirement: the engines also
+    # need to be told where on the protein to look.
+    assert "--reference-ligand" in line and "--pocket" in line and "--box" in line
+    # Turning the block off withdraws the demand, because a tier that compiles
+    # into no stage is not what the preflight will be looking at.
+    assert needs["whenTurnedOff"] == []
+    # And it is a property of the blocks in that tier, not decoration on every
+    # tier card.
+    assert all(other == [] for other in needs["elsewhere"])
+
 
 def test_the_canvas_shows_exactly_the_stages_that_will_run(tmp_path: Path) -> None:
     """The blocks on screen are the run, in order -- not an illustration of it.

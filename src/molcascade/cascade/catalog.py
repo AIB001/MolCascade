@@ -87,8 +87,15 @@ class BackendOption:
     #: Kept as one formatted reference ending in a DOI or URL: the value is
     #: read by people writing a methods section, not parsed.
     citation: str = ""
-    #: Measured single-core throughput in molecules per second, or ``None`` when
-    #: nobody has measured it.  ``None`` means unknown, *not* fast.
+    #: Throughput in molecules per second on one lane, or ``None`` when nobody
+    #: has a figure.  ``None`` means unknown, *not* fast.
+    #:
+    #: A lane is one core for the tools that run in this environment and one
+    #: card for the isolated GPU engines, which is the unit the pool hands out
+    #: in either case.  Those engine numbers are the ones their own papers
+    #: report rather than something measured here -- measuring them needs the
+    #: hardware and the licence, and the ``notes`` say which figure came from
+    #: where.  Everything else was timed on one core.
     #:
     #: This is here because tier position is the most consequential decision the
     #: builder lets someone make and the cost of getting it wrong is invisible
@@ -97,7 +104,12 @@ class BackendOption:
     #: million while the same check below three cheap tiers is minutes.  The
     #: numbers are order-of-magnitude and machine-dependent, which is all the
     #: decision needs -- it turns on ratios between tools, not on absolutes.
-    throughput_per_second: int | None = None
+    #:
+    #: Fractional on purpose: a CNN rescoring pass is seconds per ligand, and
+    #: rounding it to a whole number would round it to zero, which every
+    #: consumer here reads as "unknown" -- silencing the warning on the most
+    #: expensive tool in the catalogue.
+    throughput_per_second: float | None = None
     recommended: bool = False
     #: Whether running this tool requires the operator to accept its licence
     #: terms explicitly, with ``--allow-copyleft``.
@@ -186,6 +198,15 @@ class StageGroup:
     # group inherits, and it is the builder's neutral periwinkle so an
     # unstyled group still belongs to the same drawing.
     accent: str = "#6785b9"
+    #: Something the run needs that this file cannot hold.
+    #:
+    #: A receptor belongs to a campaign, not to a screening policy -- the whole
+    #: point of a cascade is that it is reused against the next target -- so the
+    #: docking groups are configured here and completed at the command line.
+    #: ``preflight_docking_target`` refuses to start without it, and this string
+    #: is what puts that refusal in front of the person writing the cascade
+    #: rather than the person running it an hour later.
+    run_time_requirement: str = ""
 
     def as_json(self) -> dict[str, Any]:
         return {
@@ -195,6 +216,7 @@ class StageGroup:
             "purpose": self.purpose,
             "default_mode": self.default_mode,
             "accent": self.accent,
+            "run_time_requirement": self.run_time_requirement,
         }
 
 
@@ -263,6 +285,48 @@ STAGE_GROUPS: tuple[StageGroup, ...] = (
         ),
         default_mode="serial",
         accent="#9bceb8",
+    ),
+    StageGroup(
+        id="ligand_prep",
+        title="Ligand 3D preparation",
+        subtitle="One geometry, shared by every engine",
+        purpose=(
+            "Embed 3D conformers once, above the docking tier, so the engines below "
+            "score the same molecule rather than three separate guesses at it."
+        ),
+        default_mode="serial",
+        accent="#5fb0c9",
+    ),
+    StageGroup(
+        id="docking",
+        title="Structure-based docking",
+        subtitle="Pose and score against your receptor",
+        purpose=(
+            "Two engines in parallel with 'at least K' is consensus docking: a "
+            "molecule survives only where independent methods agree, which is "
+            "worth more than either engine's own number."
+        ),
+        default_mode="all",
+        accent="#12808c",
+        run_time_requirement=(
+            "A receptor, named when the run starts: --receptor protein.pdb, plus "
+            "--reference-ligand, --pocket or --box to say where on it."
+        ),
+    ),
+    StageGroup(
+        id="docking_rescore",
+        title="CNN rescoring",
+        subtitle="A network's opinion on what survived",
+        purpose=(
+            "Seconds per ligand rather than tenths. It belongs after a docking "
+            "threshold has already cut the population, never over a library."
+        ),
+        default_mode="serial",
+        accent="#8c5a2b",
+        run_time_requirement=(
+            "The same receptor as the docking tier above it, and GNINA's licence "
+            "accepted: --allow-copyleft."
+        ),
     ),
     StageGroup(
         id="similarity",
@@ -2038,6 +2102,691 @@ CRITERIA: tuple[CriterionSpec, ...] = (
                 ),
                 requires=("syntheseus",),
                 notes="Reviewed research option; no MolCascade adapter is registered yet.",
+            ),
+        ),
+    ),
+    CriterionSpec(
+        id="ligand_conformers",
+        label="3D conformer generation",
+        question="What geometry do the docking engines start from?",
+        stage="ligand_prep",
+        evidence="ligand_conformer",
+        filters=False,
+        summary=(
+            "Embeds one 3D structure per molecule and keeps it as evidence. It "
+            "rejects nothing; molecules RDKit cannot embed are recorded as such "
+            "and are simply absent from the engines' input below."
+        ),
+        options=(
+            BackendOption(
+                id="rdkit_etkdgv3",
+                label="RDKit ETKDGv3",
+                engine="RDKit",
+                summary=(
+                    "Distance geometry with experimental torsion preferences, "
+                    "optionally relaxed with MMFF94s."
+                ),
+                plugin_ref="docking.rdkit_conformers@0.1.0",
+                license_spdx="BSD-3-Clause",
+                citation=(
+                    "Wang S, Witek J, Landrum GA, Riniker S. Improving conformer "
+                    "generation for small rings and macrocycles based on distance "
+                    "geometry and experimental torsional-angle preferences. J Chem "
+                    "Inf Model. 2020;60(4):2044-2058. doi:10.1021/acs.jcim.0c00025"
+                ),
+                requires=("rdkit",),
+                recommended=True,
+                # Measured on this machine over twenty drug-like molecules:
+                # 10.5/s embedding alone, 5.3/s with MMFF94s on top. The
+                # minimisation is worth roughly half the tier's cost, which is
+                # why it is a switch rather than an assumption.
+                throughput_per_second=5,
+                defaults={
+                    "schema_version": 1,
+                    "conformers_per_molecule": 1,
+                    "embed_attempts": 3,
+                    "minimize": True,
+                    "max_minimize_iterations": 500,
+                    "prune_rms_threshold": 0.5,
+                },
+                notes=(
+                    "Put this above the docking tier and nowhere else. It exists so "
+                    "that a consensus between two engines is a consensus about one "
+                    "molecule: each engine reads the same conformer table, joined on "
+                    "parent_id, instead of embedding its own.\n\n"
+                    "The seed is part of the recorded method and each molecule's own "
+                    "seed is derived from its identity, not from its row, so the same "
+                    "library embeds to the same coordinates however the work was "
+                    "split across workers or resumed after an interruption.\n\n"
+                    "Vina-family search re-generates torsions itself, so one conformer "
+                    "is the honest default; more of them costs linearly and buys little "
+                    "unless a pose predictor downstream is treating the input geometry "
+                    "as the answer."
+                ),
+                thresholds=(
+                    ThresholdField(
+                        name="conformers_per_molecule",
+                        label="Conformers per molecule",
+                        kind="integer",
+                        minimum=1,
+                        maximum=64,
+                        step=1,
+                        help=(
+                            "Kept per molecule. Above one, the engines below still dock "
+                            "the conformer named in their own settings; the rest are "
+                            "evidence."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="minimize",
+                        label="Relax with MMFF94s",
+                        kind="boolean",
+                        help=(
+                            "Roughly halves throughput -- 10/s becomes 5/s on one core, "
+                            "measured. Leave it on unless the tier is the bottleneck."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="embed_attempts",
+                        label="Embedding attempts",
+                        kind="integer",
+                        minimum=1,
+                        maximum=20,
+                        step=1,
+                        help=(
+                            "ETKDG occasionally needs several tries for macrocycles and "
+                            "heavily bridged systems before it finds a valid geometry."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="prune_rms_threshold",
+                        label="Prune below RMSD",
+                        kind="number",
+                        unit="Å",
+                        minimum=0.0,
+                        maximum=5.0,
+                        step=0.1,
+                        help=(
+                            "Discards a conformer closer than this to one already kept. "
+                            "Ignored when only one conformer is requested."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="seed",
+                        label="Random seed",
+                        kind="integer",
+                        minimum=0,
+                        maximum=2_147_483_647,
+                        step=1,
+                        help=(
+                            "Changing it changes every coordinate, so it is part of the "
+                            "recorded method rather than a run-time convenience."
+                        ),
+                    ),
+                    _BATCH,
+                ),
+            ),
+        ),
+    ),
+    CriterionSpec(
+        id="docking_score",
+        label="Docking score",
+        question="Does this molecule fit the binding site, and how well?",
+        stage="docking",
+        evidence="docking_score",
+        summary=(
+            "Docks against a receptor named at run time with '--receptor', not in "
+            "this file: the cascade is the screening policy and is meant to be "
+            "reused, while the protein is what changes between campaigns. Needs a "
+            "3D conformer tier above it."
+        ),
+        options=(
+            BackendOption(
+                id="unidock",
+                label="Uni-Dock",
+                engine="Uni-Dock",
+                summary=(
+                    "AutoDock Vina's search as a CUDA kernel: the same scoring "
+                    "functions and the same box, thousands of ligands resident on the "
+                    "card at once."
+                ),
+                plugin_ref="docking.unidock@0.1.0",
+                gate_plugin="docking.numeric_evidence_gate@0.1.0",
+                license_spdx="Apache-2.0",
+                citation=(
+                    "Yu Y, Cai C, Wang J, Bo Z, Zhu Z, Zheng H. Uni-Dock: GPU-accelerated "
+                    "docking enables ultralarge virtual screening. J Chem Theory Comput. "
+                    "2023;19(11):3336-3345. doi:10.1021/acs.jctc.2c01145"
+                ),
+                # meeko is the only piece that installs into this environment; the
+                # engine itself is an executable path, which is why it is not
+                # probed as an import here.
+                requires=("meeko",),
+                recommended=True,
+                # Upstream reports ~0.1 s per ligand on one card at
+                # 'search_mode balance'. Per GPU lane, not per core.
+                throughput_per_second=10,
+                defaults={
+                    "schema_version": 1,
+                    "executable": "",
+                    "scoring": "vina",
+                    "search_mode": "balance",
+                    "num_modes": 1,
+                    "conformer_index": 0,
+                    "keep_poses": False,
+                    "max_molecules": 200_000,
+                },
+                gate_defaults={
+                    "schema_version": 1,
+                    "engine_id": "unidock",
+                    "expected_score_kind": "VINA_KCAL_MOL",
+                    "expected_direction": "LOWER_STRONGER",
+                    "maximum": -7.0,
+                },
+                notes=(
+                    "Linux and an NVIDIA card only: it has no CPU path and takes no "
+                    "device flag, so the card it uses is whichever one MolCascade "
+                    "leaves visible to the shard. Set 'executable' to the absolute "
+                    "path of the 'unidock' binary; MolCascade does not build or "
+                    "install it.\n\n"
+                    "There are no weights to fetch. Vina's scoring functions are "
+                    "empirical physics, so nothing about this engine is downloadable "
+                    "and nothing about it is a model version.\n\n"
+                    "You supply a receptor PDB and MolCascade derives the PDBQT the "
+                    "engine reads, once, with meeko, before the first molecule. That "
+                    "is the fragile step -- protonation and unusual residues are where "
+                    "it fails -- and the run stops there rather than three tiers in. "
+                    "Pass '--receptor-pdbqt' with your own preparation when it cannot "
+                    "cope.\n\n"
+                    "A Vina score is a ranking, not an affinity. -7 kcal/mol is a "
+                    "conventional screening cut, not a measurement, and the published "
+                    "correlation with experiment is weak enough that this belongs at "
+                    "the bottom of a funnel rather than at the top."
+                ),
+                thresholds=(
+                    ThresholdField(
+                        name="executable",
+                        label="unidock path",
+                        kind="text",
+                        help=(
+                            "Absolute path to the binary. Not a bare command name: this "
+                            "is a tool you installed, and the run records which one."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="scoring",
+                        label="Scoring function",
+                        kind="choice",
+                        choices=(
+                            ("vina", "Vina (empirical, kcal/mol)"),
+                            ("vinardo", "Vinardo (reparameterised Vina)"),
+                            ("ad4", "AutoDock4 (force-field)"),
+                        ),
+                        help=(
+                            "Three different scales, not three settings of one. Change "
+                            "this and change the gate's expected scale to match, or the "
+                            "run stops rather than comparing kcal/mol against something "
+                            "else."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="search_mode",
+                        label="Search effort",
+                        kind="choice",
+                        choices=(
+                            ("fast", "Fast"),
+                            ("balance", "Balanced"),
+                            ("detail", "Detailed"),
+                        ),
+                        help=(
+                            "Uni-Dock's own presets for exhaustiveness and step count. "
+                            "'detail' is several times the cost of 'balance'."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="num_modes",
+                        label="Poses kept per ligand",
+                        kind="integer",
+                        minimum=1,
+                        maximum=20,
+                        step=1,
+                        help=(
+                            "One row of evidence per pose. The threshold below reads the "
+                            "best of them; the rest are there to be looked at."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="keep_poses",
+                        label="Store the docked pose",
+                        kind="boolean",
+                        help=(
+                            "Off by default: 45,000 poses is a few hundred megabytes of "
+                            "molblock that nothing downstream reads unless someone asked "
+                            "for structures."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="max_molecules",
+                        label="Most molecules to dock",
+                        kind="integer",
+                        minimum=1,
+                        maximum=10_000_000,
+                        step=1_000,
+                        help=(
+                            "The stage stops before the first ligand if the tier hands it "
+                            "more than this. It is the guard against pointing docking at "
+                            "a whole library by accident."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="expected_score_kind",
+                        label="Score scale the gate expects",
+                        kind="choice",
+                        target="gate",
+                        choices=(
+                            ("VINA_KCAL_MOL", "Vina (kcal/mol)"),
+                            ("VINARDO_KCAL_MOL", "Vinardo (kcal/mol)"),
+                            ("AD4_KCAL_MOL", "AutoDock4 (kcal/mol)"),
+                        ),
+                        help=(
+                            "Must match the scoring function above. The gate refuses to "
+                            "run on evidence from a different scale instead of quietly "
+                            "applying the wrong window to it."
+                        ),
+                    ),
+                    *_window(
+                        unit="kcal/mol",
+                        minimum_label="Strongest score allowed",
+                        maximum_label="Weakest score allowed",
+                        lower=-30.0,
+                        upper=10.0,
+                        step=0.1,
+                        help_text=(
+                            "Inclusive, and lower is stronger. The upper bound is the "
+                            "filter; a lower bound is worth setting only to catch scores "
+                            "too good to be real."
+                        ),
+                    ),
+                ),
+            ),
+            BackendOption(
+                id="karmadock",
+                label="KarmaDock",
+                engine="KarmaDock",
+                summary=(
+                    "Predicts a pose in one forward pass instead of searching for one, "
+                    "which is why it is about fifty times faster than a Vina-family "
+                    "engine."
+                ),
+                plugin_ref="docking.karmadock@0.1.0",
+                gate_plugin="docking.numeric_evidence_gate@0.1.0",
+                license_spdx="Apache-2.0",
+                citation=(
+                    "Zhang X, Zhang O, Shen C, et al. Efficient and accurate large "
+                    "library ligand docking with KarmaDock. Nat Comput Sci. "
+                    "2023;3:789-804. doi:10.1038/s43588-023-00511-5"
+                ),
+                # Nothing to import: it runs under its own interpreter, and
+                # probing this environment for it would report the healthy case
+                # as broken.
+                requires=(),
+                # Upstream reports ~0.02 s per ligand on one card.
+                throughput_per_second=50,
+                defaults={
+                    "schema_version": 1,
+                    "executable": "",
+                    "repo_path": "",
+                    "engine_batch_size": 64,
+                    "keep_poses": False,
+                    "max_molecules": 200_000,
+                },
+                gate_defaults={
+                    "schema_version": 1,
+                    "engine_id": "karmadock",
+                    "expected_score_kind": "KARMADOCK_MDN",
+                    "expected_direction": "HIGHER_STRONGER",
+                    "minimum": 50.0,
+                },
+                notes=(
+                    "Runs in an environment of its own, which you create once and "
+                    "MolCascade never touches. Measured, not assumed: KarmaDock pins "
+                    "rdkit 2022.09.1 against this project's rdkit 2024.9 or newer, and "
+                    "resolving it into this environment would change every descriptor "
+                    "and every identity in the cascade above it. So 'executable' is the "
+                    "python inside its environment, and 'repo_path' is the checkout it "
+                    "runs from.\n\n"
+                    "Its checkpoint is not something MolCascade can fetch for you: "
+                    "utils/virtual_screening.py loads the weights from a fixed path "
+                    "inside its own checkout with no flag to redirect it, so a copy "
+                    "downloaded anywhere else would never be read. Download them into "
+                    "the checkout as KarmaDock documents (Zenodo record 7789066) and "
+                    "set 'weights_path' to the file it loads -- that is what puts the "
+                    "model version into the recorded method rather than leaving two "
+                    "checkpoints indistinguishable.\n\n"
+                    "It takes no box. The site comes from the reference ligand's atoms, "
+                    "which is why '--reference-ligand' is the pocket definition this "
+                    "engine can actually use, and why a cascade holding it and Uni-Dock "
+                    "together needs the ligand rather than six numbers alone.\n\n"
+                    "The score is a unitless ranking from a mixture-density network, "
+                    "higher being stronger. It is not kcal/mol and does not convert to "
+                    "one; the default of 50 is a starting point to calibrate against "
+                    "your own known actives, not a published cut."
+                ),
+                thresholds=(
+                    ThresholdField(
+                        name="executable",
+                        label="KarmaDock python path",
+                        kind="text",
+                        help=(
+                            "Absolute path to the python inside KarmaDock's own "
+                            "environment. Deliberately not this one's."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="repo_path",
+                        label="KarmaDock checkout",
+                        kind="text",
+                        help=(
+                            "Absolute path to the checkout. Its utils/virtual_screening.py "
+                            "is the entry point and its trained_models/ is where the "
+                            "weights have to sit; the script has no flag for either."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="weights_path",
+                        label="Checkpoint file",
+                        kind="text",
+                        nullable=True,
+                        help=(
+                            "The checkpoint inside the checkout that KarmaDock will load. "
+                            "Recorded for identity only -- naming it is what distinguishes "
+                            "two model versions in the run's provenance."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="pocket_pdb_path",
+                        label="Pocket PDB override",
+                        kind="text",
+                        nullable=True,
+                        help=(
+                            "Optional. Set this when the geometric selection picks up the "
+                            "wrong chain or misses a residue that matters; leave it empty "
+                            "and KarmaDock derives its own from the reference ligand."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="engine_batch_size",
+                        label="Ligands per forward pass",
+                        kind="integer",
+                        minimum=1,
+                        maximum=4_096,
+                        step=16,
+                        help=(
+                            "GPU memory, not search effort. Lower it if the card runs out; "
+                            "raising it past what fits buys nothing."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="keep_poses",
+                        label="Store the repaired pose",
+                        kind="boolean",
+                        help=(
+                            "Off by default, as everywhere in this tier: nothing "
+                            "downstream reads a molblock unless structures were asked for."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="max_molecules",
+                        label="Most molecules to dock",
+                        kind="integer",
+                        minimum=1,
+                        maximum=10_000_000,
+                        step=1_000,
+                        help=(
+                            "The stage stops before the first ligand if the tier hands it "
+                            "more than this."
+                        ),
+                    ),
+                    *_window(
+                        minimum_label="Lowest score allowed",
+                        maximum_label="Highest score allowed",
+                        lower=0.0,
+                        upper=1_000.0,
+                        step=1.0,
+                        help_text=(
+                            "Inclusive, and higher is stronger. Unitless: calibrate it on "
+                            "molecules you already know the answer for before trusting it "
+                            "to reject anything."
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    ),
+    CriterionSpec(
+        id="docking_cnn_rescore",
+        label="CNN pose rescoring",
+        question="Does a convolutional network agree that this pose is a binder?",
+        stage="docking_rescore",
+        evidence="docking_score",
+        summary=(
+            "A second, independent opinion on the poses a cheaper engine already "
+            "kept. Seconds per ligand, so its position in the funnel is the whole "
+            "question of whether it is affordable."
+        ),
+        options=(
+            BackendOption(
+                id="gnina",
+                label="GNINA 1.3",
+                engine="GNINA",
+                summary=(
+                    "Vina-family search followed by a 3D convolutional network scoring "
+                    "the resulting poses."
+                ),
+                plugin_ref="docking.gnina@0.1.0",
+                gate_plugin="docking.numeric_evidence_gate@0.1.0",
+                license_spdx="GPL-2.0-or-later",
+                citation=(
+                    "McNutt AT, Li Y, Meli R, Aggarwal R, Koes DR. GNINA 1.3: the next "
+                    "increment in molecular docking with deep learning. J Cheminform. "
+                    "2025;17:28. doi:10.1186/s13321-025-00973-x"
+                ),
+                requires=(),
+                requires_license_optin=True,
+                # Deliberately not recommended and off in every shipped cascade:
+                # it is the one option here whose default position is "nowhere".
+                recommended=False,
+                # Upstream reports 2-10 s per ligand on one card with
+                # '--cnn_scoring rescore'. Fractional per second, and that is the
+                # point: at 0.3/s a million molecules is over a hundred GPU-days.
+                throughput_per_second=0.3,
+                defaults={
+                    "schema_version": 1,
+                    "executable": "",
+                    "cnn_scoring": "rescore",
+                    "exhaustiveness": 8,
+                    "rank_by": "cnn_affinity",
+                    "num_modes": 1,
+                    "conformer_index": 0,
+                    "keep_poses": False,
+                    "allow_cpu": False,
+                    # Two orders of magnitude below the other two engines, for the
+                    # same reason the throughput figure is: this is a shortlist
+                    # tool, and the cap is where that gets enforced rather than
+                    # merely recommended.
+                    "max_molecules": 20_000,
+                },
+                gate_defaults={
+                    "schema_version": 1,
+                    "engine_id": "gnina",
+                    "expected_score_kind": "CNN_AFFINITY",
+                    "expected_direction": "HIGHER_STRONGER",
+                    "minimum": 6.0,
+                },
+                notes=(
+                    "Blocked until you say otherwise. GNINA is GPL-2.0 -- only because "
+                    "it links Open Babel, but the terms are the terms -- so a run has "
+                    "to permit copyleft backends with '--allow-copyleft' before it will "
+                    "start, and the run records that the permission was given so a "
+                    "methods section can say so. MolCascade cannot make that decision "
+                    "for an organisation, so it defaults to the reversible answer.\n\n"
+                    "Set 'executable' to the absolute path of the 'gnina' binary. "
+                    "Linux only. Its CNN weights are compiled into the binary, so there "
+                    "is nothing to download and nothing to pin -- which also means the "
+                    "binary's version *is* the model version.\n\n"
+                    "Position is everything here. At two to ten seconds a ligand, "
+                    "45,000 molecules is one to five GPU-days and a million is out of "
+                    "the question; a few thousand survivors of a cheaper docking tier "
+                    "is under an hour. That is why this ships as its own tier below the "
+                    "parallel one rather than as a third engine inside it, and why the "
+                    "molecule cap is set two orders of magnitude lower than the "
+                    "others'.\n\n"
+                    "CNNaffinity is a predicted log-affinity, so 6 is roughly one "
+                    "micromolar. Unlike the search, the network is not bit-stable "
+                    "across GPU models: two cards can disagree in the last decimal, so "
+                    "treat a threshold as a threshold and not as a reproducible "
+                    "boundary."
+                ),
+                thresholds=(
+                    ThresholdField(
+                        name="executable",
+                        label="gnina path",
+                        kind="text",
+                        help=(
+                            "Absolute path to the binary. MolCascade does not build or "
+                            "install it."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="cnn_scoring",
+                        label="How much CNN",
+                        kind="choice",
+                        choices=(
+                            ("rescore", "Rescore poses (published setting)"),
+                            ("refinement", "Refine against the network"),
+                            ("metrorescore", "Metropolis rescore"),
+                            ("metrorefine", "Metropolis refine"),
+                            ("all", "All of them"),
+                            ("none", "None -- empirical scoring only"),
+                        ),
+                        help=(
+                            "'rescore' searches empirically and then scores the poses "
+                            "with the network, which is what the published accuracy "
+                            "figures are for. 'refinement' optimises against the network "
+                            "too and costs several times more. 'none' turns GNINA into a "
+                            "slower Uni-Dock."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="rank_by",
+                        label="Which number is the score",
+                        kind="choice",
+                        choices=(
+                            ("cnn_affinity", "CNNaffinity (predicted log-affinity)"),
+                            ("cnn_score", "CNNscore (pose quality, 0-1)"),
+                            ("affinity", "Vina affinity (kcal/mol)"),
+                        ),
+                        help=(
+                            "The other two are still computed and one is kept alongside. "
+                            "Choosing a CNN number with the network off is refused rather "
+                            "than silently producing an empty shortlist."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="exhaustiveness",
+                        label="Search effort",
+                        kind="integer",
+                        minimum=1,
+                        maximum=512,
+                        step=1,
+                        help=(
+                            "Monte-Carlo effort before any CNN work. Vina's own default "
+                            "is 8."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="num_modes",
+                        label="Poses kept per ligand",
+                        kind="integer",
+                        minimum=1,
+                        maximum=20,
+                        step=1,
+                        help="One row of evidence per pose; the gate reads the best.",
+                    ),
+                    ThresholdField(
+                        name="keep_poses",
+                        label="Store the docked pose",
+                        kind="boolean",
+                        help="Off by default; nothing downstream reads a molblock.",
+                    ),
+                    ThresholdField(
+                        name="allow_cpu",
+                        label="Allow the CPU path",
+                        kind="boolean",
+                        help=(
+                            "Deliberately awkward. GNINA's CPU path works, and a "
+                            "shortlist that takes an hour on a card takes weeks on it."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="max_molecules",
+                        label="Most molecules to rescore",
+                        kind="integer",
+                        minimum=1,
+                        maximum=10_000_000,
+                        step=1_000,
+                        help=(
+                            "The stage stops before the first ligand if the tier hands it "
+                            "more than this. Raise it only after timing one molecule and "
+                            "multiplying."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="expected_score_kind",
+                        label="Score scale the gate expects",
+                        kind="choice",
+                        target="gate",
+                        choices=(
+                            ("CNN_AFFINITY", "CNNaffinity (predicted log-affinity)"),
+                            ("CNN_SCORE", "CNNscore (pose quality, 0-1)"),
+                            ("VINA_KCAL_MOL", "Vina affinity (kcal/mol)"),
+                        ),
+                        help=(
+                            "Must match what is ranked above. -8.5 is a strong Vina score "
+                            "and an impossible CNN one; 0.9 is the reverse, and a window "
+                            "typed against the wrong scale would quietly accept or reject "
+                            "everything."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="expected_direction",
+                        label="Which way is stronger",
+                        kind="choice",
+                        target="gate",
+                        choices=(
+                            ("HIGHER_STRONGER", "Higher is stronger (both CNN scales)"),
+                            ("LOWER_STRONGER", "Lower is stronger (Vina affinity)"),
+                        ),
+                        help=(
+                            "Exposed only here, because GNINA is the one engine whose "
+                            "ranking can change direction: its two CNN scales go up and "
+                            "its Vina affinity goes down. Get it wrong and the gate stops "
+                            "the run rather than inverting the shortlist."
+                        ),
+                    ),
+                    *_window(
+                        minimum_label="Weakest score allowed",
+                        maximum_label="Strongest score allowed",
+                        lower=-30.0,
+                        upper=30.0,
+                        step=0.1,
+                        help_text=(
+                            "Inclusive. Higher is stronger for both CNN scales and lower "
+                            "is stronger for Vina affinity, so which end filters depends "
+                            "on the scale chosen above."
+                        ),
+                    ),
+                ),
             ),
         ),
     ),

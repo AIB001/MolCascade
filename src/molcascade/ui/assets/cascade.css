@@ -982,6 +982,36 @@ input[type="checkbox"] {
   background: color-mix(in srgb, var(--accent) 9%, var(--paper-raised));
 }
 
+/* Louder than a note because it is not commentary: the run will refuse to
+ * start until this is supplied.  It still sits inside the tier rather than in
+ * the validation strip, because it is not an error -- the cascade is correct
+ * and incomplete, and those want different type. */
+.tier-needs {
+  margin-top: 11px;
+  display: flex;
+  gap: 9px;
+  align-items: baseline;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--ink);
+  padding: 8px 11px;
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--accent) 15%, var(--paper-raised));
+  border: 1px dashed var(--accent-edge);
+}
+
+.tier-needs-tag {
+  flex: none;
+  font-size: 10px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  font-weight: 600;
+  /* Deep, not --accent-ink: this tag sits on tinted paper, and --accent-ink is
+   * the colour for type laid on a full-strength accent, which would put white
+   * on a pale panel for every dark group in the catalogue. */
+  color: var(--accent-deep);
+}
+
 .tier-note {
   margin-top: 11px;
   font-size: 12px;

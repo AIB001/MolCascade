@@ -55,8 +55,8 @@ def _option_block(option: BackendOption) -> list[str]:
         facts.append(f"- **Needs assets** — {', '.join(option.requires_assets)}")
     if option.throughput_per_second is not None:
         facts.append(
-            f"- **Measured throughput** — ~{option.throughput_per_second:,} molecules/second "
-            "on one core"
+            f"- **Throughput** — ~{option.throughput_per_second:,} molecules/second per "
+            "lane (one core, or one GPU for the isolated engines)"
         )
     lines.extend(facts)
     lines.append("")

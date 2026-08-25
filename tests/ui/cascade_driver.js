@@ -265,4 +265,39 @@ const restored = JSON.stringify(exported(), null, 2) + "\n";
 document.getElementById("action-download").click();
 steps.download = { count: downloads.length, matches: downloads[0] === restored };
 
+/* A docking block cannot be finished in this file -- the receptor belongs to
+ * the campaign, not to the screening policy -- so the tier has to say what the
+ * command line still owes it while the cascade is being written, rather than
+ * an hour later when the run refuses to start. */
+function needsOf(tierId) {
+  const card = tierCards().filter((node) => node.dataset.tier === tierId)[0];
+  if (!card) throw new Error("no tier card for " + tierId);
+  return card.all((node) => node.classList.contains("tier-needs")).map((n) => n.textContent);
+}
+
+const dockTierId = shape()[shape().length - 1].id;
+const needsBefore = needsOf(dockTierId);
+focusKey("add:" + dockTierId).click();
+const dockingEntry = document
+  .getElementById("picker-list")
+  .all((node) => node.classList.contains("picker-item"))
+  .filter((item) => item.textContent.indexOf("Docking score") === 0);
+if (dockingEntry.length !== 1) throw new Error("expected one docking entry");
+dockingEntry[0].click();
+const dockingCriteria = shape()[shape().length - 1].criteria;
+const dockingId = dockingCriteria[dockingCriteria.length - 1];
+const needsAfter = needsOf(dockTierId);
+// Disabling the block withdraws the demand with it: a tier that compiles into
+// no stage asks the command line for nothing.
+focusKey("ct:" + dockingId).click();
+steps.runTimeNeeds = {
+  offeredDisabled: dockingEntry[0].disabled,
+  before: needsBefore,
+  after: needsAfter,
+  whenTurnedOff: needsOf(dockTierId),
+  elsewhere: shape()
+    .filter((tier) => tier.id !== dockTierId)
+    .map((tier) => needsOf(tier.id)),
+};
+
 process.stdout.write(JSON.stringify(steps));

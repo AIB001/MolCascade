@@ -346,6 +346,26 @@ def test_a_target_reaching_a_finalize_step_follows_the_same_rule() -> None:
     assert "center_x" not in export
 
 
+def test_the_pipeline_records_whether_docking_ran_by_looking_at_its_own_stages() -> None:
+    """``docking_included`` is provenance, so it is counted rather than declared.
+
+    It used to be the literal ``False`` in three places, which was true for as
+    long as this project had no docking tier -- and would have gone on reading
+    ``False`` in the exported provenance of the first run that had one.  Both
+    directions are asserted here because only one of them can regress silently.
+    """
+
+    with_docking = _lower(_target())
+    assert with_docking.metadata["docking_included"] is True
+
+    without = lower_cascade(
+        _cascade(_tier("properties", {"id": "weight", "backend": "rdkit.properties@0.1.0"})),
+        registry=_registry(_box_engine(), _ligand_engine(), _property_filter()),
+        allow_missing_library=True,
+    ).pipeline
+    assert without.metadata["docking_included"] is False
+
+
 @pytest.mark.parametrize("stage_id", ["unidock", "karmadock"])
 def test_lowering_is_byte_stable_for_the_same_target(stage_id: str) -> None:
     """The stage config is hashed into the cache key, so its contents must settle.

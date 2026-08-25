@@ -23,6 +23,7 @@ from molcascade.backends import (
 from molcascade.config.models import PipelineConfig
 from molcascade.io.atomic import atomic_write_bytes
 from molcascade.plugins.builtin.admet import DEFAULT_MODELS_REFERENCE
+from molcascade.plugins.manifest import PluginKind
 from molcascade.plugins.registry import PluginRegistry, create_builtin_registry
 
 _LAYERS = (
@@ -183,12 +184,13 @@ _LAYERS = (
         "default_id": "shortlist",
         "color": "#667085",
         "description": (
-            "Export a verified local shortlist for downstream software; docking is out "
-            "of scope here."
+            "Export a verified local shortlist, carrying whatever docking scores the "
+            "run produced, for downstream software."
         ),
         "policy_hint": (
-            "MolCascade stops at an auditable shortlist and never starts docking, MD, "
-            "or MMPBSA."
+            "MolCascade ends at an auditable shortlist. A docking score that travels "
+            "with it is evidence, not a claim of binding; MD and free-energy "
+            "calculations are a later step, elsewhere."
         ),
     },
 )
@@ -628,6 +630,15 @@ def _default_pipeline(plugin_rows: list[dict[str, Any]]) -> PipelineConfig:
         rightmost = max(node_layout[stage_id]["x"] for stage_id in tier_node_ids)
         next_tier_x = int(rightmost) + 238 + 2 * 28 + 84
 
+    # Read off the graph rather than asserted.  The default screen has no
+    # docking tier today, so the literal and the computation agree -- but the
+    # moment someone adds one to the defaults above, a literal would keep
+    # reporting the old answer, and this key ends up in the provenance a
+    # methods section is written from.
+    docking_included = any(
+        plugins[stage["plugin"]]["kind"] == PluginKind.DOCK.value for stage in stages
+    )
+
     return PipelineConfig.model_validate(
         {
             "schema_version": 1,
@@ -638,7 +649,7 @@ def _default_pipeline(plugin_rows: list[dict[str, Any]]) -> PipelineConfig:
                 "created_by": f"MolCascade {__version__} offline builder",
                 "final_parent_target": 45_000,
                 "random_seed": 20_260_823,
-                "docking_included": False,
+                "docking_included": docking_included,
                 "builder_view": "node_canvas/v2",
                 "builder_layout": {
                     "schema_version": 2,

@@ -71,7 +71,11 @@ def test_shortlist_export_plugins_preserve_parents_and_emit_typed_records(
     SHORTLIST_EXPORT_V1.validate(records)
     assert parents.num_rows == records.num_rows == 2
     assert {row["record_format"] for row in records.to_pylist()} == {expected_format}
-    assert response.metadata["docking_included"] is False
+    # Not "is False" -- absent.  This stage is handed one input port and its own
+    # config, so it cannot see whether a docking tier ran above it; the answer it
+    # used to hardcode was right only for the pipelines that happened to ship.
+    # The compiled pipeline computes the flag from its own stages instead.
+    assert "docking_included" not in response.metadata
     if expected_format == "SDF_MOLBLOCK":
         assert all("M  END" in row["structure_record"] for row in records.to_pylist())
     else:

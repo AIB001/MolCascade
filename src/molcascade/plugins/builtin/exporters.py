@@ -90,6 +90,16 @@ def _execute_export(
     backend_version: str,
     record_format: str,
 ) -> StageResponse:
+    """Write the shortlist and describe what it is, without over-claiming.
+
+    Note what is deliberately absent from the returned metadata: whether the run
+    included docking.  This stage sees one input port and its own config; it has
+    no view of the tiers above it, so any answer it gave would be a guess that
+    happened to be right for the pipelines shipped today.  The pipeline records
+    it once, computed from the stages actually compiled -- see
+    ``cascade/lower.py`` -- and that is the copy a methods section should quote.
+    """
+
     from rdkit import Chem
 
     stage_input = require_single_input(request.inputs, contract_id=PARENT_V1.id)
@@ -208,7 +218,6 @@ def _execute_export(
             "suggested_filename": config.filename,
             "backend": backend,
             "backend_version": backend_version,
-            "docking_included": False,
         },
     )
 

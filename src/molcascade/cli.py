@@ -600,7 +600,14 @@ def build_parser() -> argparse.ArgumentParser:
     export.add_argument("run_id")
     export.add_argument("--workspace", type=Path, default=_DEFAULT_WORKSPACE)
     export.add_argument("--output", type=Path)
-    export.add_argument("--overwrite", action="store_true")
+    export.add_argument(
+        "--overwrite",
+        action="store_true",
+        help=(
+            "Replace an existing shortlist, and a docking sidecar this tool "
+            "wrote beside it. Never removes anything else."
+        ),
+    )
     export.add_argument("--json", action="store_true", dest="json_output")
 
     report = commands.add_parser("report", help="Generate a self-contained run report")
@@ -1930,7 +1937,7 @@ def _export_shortlist(
         output,
         overwrite=overwrite,
     )
-    payload = {
+    payload: dict[str, Any] = {
         "path": str(result.path),
         "record_format": result.record_format,
         "row_count": result.row_count,
@@ -1939,6 +1946,18 @@ def _export_shortlist(
         "source_artifact_id": result.source_artifact_id,
         "export_spec_id": result.export_spec_id,
     }
+    if result.docking is not None:
+        # Absent, not null, when the run had no docking tier: a key that is
+        # always there invites a script to treat an empty bundle and no bundle
+        # as the same thing, and they are not.
+        payload["docking"] = {
+            "path": str(result.docking.path),
+            "engines": list(result.docking.engines),
+            "engine_files": [str(item) for item in result.docking.engine_files],
+            "best_pose_path": str(result.docking.best_pose_path),
+            "pose_count": result.docking.pose_count,
+            "best_pose_count": result.docking.best_pose_count,
+        }
     if as_json:
         _json_dump(payload, sys.stdout)
     else:
@@ -1951,6 +1970,18 @@ def _export_shortlist(
             print(f"Named rows: {result.identified_count}/{result.row_count}")
         print(f"SHA-256: {result.sha256}")
         print(f"Path: {result.path}")
+        if result.docking is not None:
+            engines = ", ".join(result.docking.engines) or "none recorded"
+            print(f"Docking evidence: {result.docking.path}")
+            print(f"  Engines: {engines}")
+            # Both counts, because the gap between them is the pose depth each
+            # engine kept -- and a best-pose count below the shortlist size means
+            # some shortlisted molecules were never docked, which is worth
+            # noticing before the table is joined to anything.
+            print(
+                f"  Poses: {result.docking.pose_count}"
+                f" ({result.docking.best_pose_count} best-pose rows)"
+            )
     return 0
 
 

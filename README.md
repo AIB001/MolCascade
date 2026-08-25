@@ -4,8 +4,11 @@ MolCascade is a local-first Python package for building and running modular,
 hierarchical molecular-screening cascades. It starts from an existing molecular library,
 applies explicit and replaceable screening components, and produces an auditable shortlist.
 
-MolCascade does not generate molecules and does not run docking, MD, or MMPBSA. Those are
-deliberate handoff boundaries for downstream software such as PRISM.
+MolCascade does not generate molecules, and it does not run MD or free-energy
+calculations. Those are deliberate handoff boundaries for downstream software such as
+PRISM. Structure-based docking is available as an optional tier — GPU engines that score
+against a receptor you supply — and its scores travel with the shortlist as evidence, not
+as a claim of binding.
 
 > Status: early alpha (`0.1.0a0`). Contracts are versioned, but public compatibility is not
 > guaranteed before the first stable release.
@@ -59,8 +62,9 @@ what turns that choice into an install.
 | Structural validity (ChEMBL option) | `pip install "molcascade[standardize]"` | `chembl_structure_pipeline>=1.2` | EBI's curation checker on its published 0–9 penalty scale — a second toolkit's opinion, not RDKit's |
 | Similarity to reference leads (indexed option) | `pip install "molcascade[similarity]"` | `FPSim2>=0.7` | Popcount-bounded nearest-reference search; worth switching to above roughly 1,000 references |
 | Custom model prediction | `pip install "molcascade[custom-model]"` | `onnxruntime>=1.17` | Runs your own model from an ONNX bundle. ONNX is a data format, so nothing in the bundle executes as Python |
+| Docking score (Uni-Dock option) | `pip install "molcascade[docking]"` | `meeko>=0.7` | Turns a conformer — and the receptor, once — into the PDBQT Uni-Dock reads. The engines themselves are not pip packages; see [Docking engines](#docking-engines-live-in-their-own-environments) |
 
-`pip install "molcascade[all-backends]"` installs all six at once, which is the right choice
+`pip install "molcascade[all-backends]"` installs all seven at once, which is the right choice
 for a machine that has to run whatever a user assembles in the builder. The quotes matter:
 an unquoted bracket is a glob in most shells.
 
@@ -86,6 +90,46 @@ Nothing in the shipped cascade needs it: RDKit reads every format the library re
 and the descriptor criterion is served by RDKit and Mordred. If your project's licensing
 allows GPL dependencies, `pip install openbabel-wheel` and relax the policy; if it does not,
 you lose nothing by leaving it out.
+
+### Docking engines live in their own environments
+
+The docking tier runs three GPU engines, and none of them is a package this environment can
+hold. Uni-Dock and GNINA are compiled CUDA binaries; KarmaDock pins `rdkit==2022.09.1`
+against this project's `rdkit>=2024.9`, so it needs an interpreter of its own. That is what
+makes them *isolated* backends: MolCascade never imports them, it runs them as subprocesses
+and records the digest of everything it handed over.
+
+So they are installed the way their own projects document, and the cascade carries the
+absolute path to what it should run — the same shape AiZynthFinder already uses:
+
+| Engine | Licence | What goes in `executable` | Weights |
+| --- | --- | --- | --- |
+| [Uni-Dock](https://github.com/dptech-corp/Uni-Dock) | Apache-2.0 | the `unidock` binary | none — its scoring functions are physics |
+| [KarmaDock](https://github.com/schrojunzhang/KarmaDock) | Apache-2.0 | the `python` inside its environment, plus `repo_path` | Zenodo record 7789066, downloaded **into the checkout**: `virtual_screening.py` loads them from a fixed path with no flag to redirect it |
+| [GNINA 1.3](https://github.com/gnina/gnina) | GPL-2.0-or-later | the `gnina` binary | compiled into the binary |
+
+GNINA is copyleft only because it links Open Babel, and the default deployment policy
+refuses copyleft backends — so it is blocked until a run says otherwise:
+
+```bash
+molcascade screen --config cascade.json --library molecules.csv --allow-copyleft
+```
+
+The flag is recorded in the audit log and in the exported provenance, because a screening
+campaign has to be able to state in its methods section which licences it accepted.
+
+`molcascade doctor` reports all three the same way it reports everything else, and
+`--allow-copyleft` works there too — which is how you tell a licence refusal apart from an
+engine that is simply not installed yet:
+
+```
+$ molcascade doctor
+  blocked     gnina                — deployment policy blocks copyleft backends
+  unavailable unidock              — local command is not installed: unidock
+
+$ molcascade doctor --allow-copyleft
+  unavailable gnina                — local command is not installed: gnina
+```
 
 ### If you want a CUDA build of torch
 
@@ -127,6 +171,75 @@ A configuration is a reusable screening *policy*; the library is supplied per ru
 cascade can screen many generated batches without being edited. The run prints its funnel —
 what each tier removed, and whether the shortlist reached the size the cascade was
 configured for.
+
+### A cascade with docking needs a receptor at run time
+
+The cascade is a screening policy and is meant to be reused against the next target, so the
+receptor is not in it. Name it on the run, together with one statement of *where* on the
+protein to dock:
+
+```bash
+molcascade screen --config cascade.json --library molecules.csv \
+  --workspace .molcascade --run-id screen-002 \
+  --receptor stk17b.pdb --reference-ligand cocrystal.sdf
+```
+
+`--reference-ligand` (mol2/sdf/mol) takes the ligand's extent plus 4 Å of padding as the
+search box, and the derived numbers are written into the run's provenance so the campaign
+stays reproducible without the ligand file. `--pocket pocket.pdb` and
+`--box cx,cy,cz,sx,sy,sz` are the other two ways to say the same thing. Name the site once:
+two site files is a disagreement rather than a belt and braces, and a box given alongside a
+file has to contain what that file points at — Uni-Dock and GNINA read the box while
+KarmaDock reads the file, so a box the file's atoms sit outside of means the engines are
+docking into different places, and the run stops instead. `--receptor-pdbqt` is the escape
+hatch for a structure the automatic meeko preparation cannot cope with.
+
+A run whose cascade holds a docking tier and whose command line holds no receptor stops
+before the first molecule is read, naming the flags that would fix it. The receptor is read,
+hashed and validated — never edited: protonation, tautomers, cofactors, metals and missing
+loops decide the science, so MolCascade refuses to guess them.
+
+### The docking scores come out beside the shortlist
+
+`molcascade export` writes one portable file, and a `.smi` has nowhere to put a scores
+table. So a run that docked gets a sibling directory:
+
+```
+shortlist.smi              the shortlist itself, unchanged
+shortlist-docking/
+  dock.unidock.parquet     docking_score/v1, verbatim, for that stage
+  dock.karmadock.parquet
+  best-pose.parquet        one row per molecule per stage, at pose_rank 0
+```
+
+One file per docking *stage* rather than per engine, because a cascade may run the same
+engine twice — two boxes, two scoring functions — and the `engine_id` column inside each
+file still says which engine it was. Only shortlisted molecules are carried: a molecule
+docked in one tier and dropped by a later one has scores in the run's artifacts and the run
+report, but not here, so the bundle and the file beside it always agree on `parent_id`.
+
+`best-pose.parquet` is long, not pivoted — adding an engine adds rows, not columns — and it
+carries `direction` per row because a Vina score is stronger when lower and KarmaDock's MDN
+score is stronger when higher. Pose geometry stays in the per-stage file; join back on
+`(parent_id, engine_id, receptor_id)` at `pose_rank = 0`. A run with no docking tier writes
+no directory at all, and `shortlist_export/v1` is unchanged either way.
+
+### Using every core, and every card
+
+Screening is one molecule at a time by nature, so the work splits into contiguous shards
+that run in parallel and resume independently:
+
+```bash
+molcascade screen --config cascade.json --library molecules.csv \
+  --workspace .molcascade --run-id screen-002 --workers 8 --device auto
+```
+
+`--device auto` is the default: with usable NVIDIA cards it gives the GPU stages one lane
+per card, and without them it falls back to CPU **and records why**, so an eight-hour CPU
+run is never something you discover afterwards. `--device cuda` refuses to start rather than
+falling back. Shard count follows the library, not the machine, so the same cascade produces
+the same artifacts on a laptop and on a GPU node — and an interrupted stage resumes from the
+last completed shard rather than from zero.
 
 Inspect or resume the durable run and materialize its outputs:
 
@@ -305,8 +418,9 @@ mode changes the executable revision.
 MolCascade currently includes executable adapters for native Python/Arrow components,
 RDKit chemistry, the ChEMBL Structure Pipeline, Mordred descriptors, Lilly Medchem Rules
 and rd_filters alert sets, SCScore synthetic complexity, FPSim2 similarity search, optional
-Open Babel descriptors, an optional ADMET-AI v2 endpoint panel, and two bring-your-own-model
-paths. The builder and `molcascade doctor` distinguish three states:
+Open Babel descriptors, an optional ADMET-AI v2 endpoint panel, three GPU docking engines
+run out of process, and two bring-your-own-model paths. The builder and `molcascade doctor`
+distinguish three states:
 
 - **available executable adapter** — registered and runnable under current local policy;
 - **optional local adapter** — implemented but unavailable until its dependency or trusted
@@ -334,6 +448,12 @@ molecule's fragments are and SCScore learns complexity from reaction records, so
 disagree by construction and the default drops a molecule only when both call it hard.
 Neither is a route or a step count. PAINS matches are triage signals, not experimental proof. Endpoint direction, units, calibration, applicability, and project
 costs must be reviewed before a model score becomes a rejection rule.
+
+A docking score is the same kind of evidence, and no stronger. Two engines agreeing is
+worth more than either engine's own number, which is why the docking tier defaults to a
+consensus vote rather than to one tool — but a pose is a hypothesis about geometry and a
+score is a ranking, not a measured affinity. The scores travel with the shortlist so that
+whatever comes next, a binding model or an assay, starts from a ranked and auditable set.
 
 The ADMET-AI adapter is deliberately strict: it does not download models or install
 packages. Before enabling it, inspect and pin both the installed package code and complete
@@ -422,8 +542,9 @@ reference — so the bibliography cannot quietly fall behind the tools.
   cycles, path escapes, and untrusted executable adapters fail closed.
 - Assets a run will need are resolved before the first molecule is read, so a missing weight
   file costs nothing instead of surfacing halfway down the funnel.
-- No package manager, model downloader, docking engine, or remote service is invoked by the
-  HTML builder.
+- The HTML builder writes configuration and nothing else: it invokes no package manager,
+  no model downloader, no docking engine, and no remote service. Choosing a docking engine
+  there records the choice; it runs only when a run does.
 
 ## Development
 

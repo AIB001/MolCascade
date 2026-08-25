@@ -584,7 +584,7 @@
       }
       // The first tier is the only one that sees every molecule in the library,
       // so it is the only place where a slow check costs its full price. The
-      // measured rates span an order of magnitude, and the difference is
+      // recorded rates span four orders of magnitude, and the difference is
       // invisible until a run is already hours old -- which is too late to move
       // a block. Said in hours-per-million because that is the number someone
       // screening a generated library can actually act on.
@@ -595,7 +595,7 @@
           if (!rate || rate >= SLOW_PER_SECOND) continue;
           warn(
             "“" + criterionLabel(criterion) + "” runs at about " + rate +
-              " molecules/s, so in the first tier it costs roughly " +
+              " molecules/s per lane, so in the first tier it costs roughly " +
               hoursPerMillion(rate) + " per million molecules. Cheaper blocks " +
               "above it would leave it far less to read.",
             tier.id
@@ -1143,6 +1143,12 @@
     const body = el("div", { class: "tier-body" }, [
       tierSocket(tier, live),
       live && tier.mode !== "serial" && active.length > 1 ? joinBlock(tier, active) : null,
+      ...runTimeNeeds(tier, live).map((need) =>
+        el("div", { class: "tier-needs" }, [
+          el("span", { class: "tier-needs-tag", text: "At run time" }),
+          el("span", { text: need }),
+        ])
+      ),
       tier.note ? el("div", { class: "tier-note", text: tier.note }) : null,
       el("div", { class: "tier-footer" }, [
         el("button", {
@@ -1166,6 +1172,27 @@
     );
     card.style.setProperty("--accent", accentFor(tierAccentKey(tier)));
     return card;
+  }
+
+  /* Some blocks cannot be finished in this file.  A receptor belongs to a
+   * campaign rather than to a screening policy, so the docking groups declare
+   * what the command line still has to supply and the tier says so while the
+   * cascade is being written -- not an hour later, when the preflight refuses
+   * to start a run that has already been scheduled.
+   *
+   * Only live tiers, because only live tiers compile into stages: a disabled
+   * docking tier demands nothing, and saying otherwise would train people to
+   * read these lines as decoration. */
+  function runTimeNeeds(tier, live) {
+    if (!live) return [];
+    const seen = [];
+    for (const criterion of activeCriteria(tier)) {
+      const spec = specFor(criterion);
+      const stage = spec ? STAGES.get(spec.stage) : null;
+      const need = stage && stage.run_time_requirement;
+      if (need && seen.indexOf(need) === -1) seen.push(need);
+    }
+    return seen;
   }
 
   /* A tier has no stage group of its own, so it borrows the accent of whatever
@@ -1454,15 +1481,16 @@
       if (option && (option.notes || option.citation || option.throughput_per_second)) {
         const about = [];
         if (option.notes) about.push(el("p", { class: "tool-note", text: option.notes }));
-        // Stated as both a rate and a cost at scale. The rate is what was
-        // measured; the cost per million is the form in which it changes where
-        // someone puts the block.
+        // Stated as both a rate and a cost at scale. The rate is per lane --
+        // one core, or one card for the engines that need one -- and the cost
+        // per million is the form in which it changes where someone puts the
+        // block.
         if (option.throughput_per_second) {
           about.push(
             el("p", {
               class: "tool-rate",
               text:
-                "≈" + option.throughput_per_second + " molecules/s on one core — " +
+                "≈" + option.throughput_per_second + " molecules/s per lane — " +
                 hoursPerMillion(option.throughput_per_second) + " per million.",
             })
           );

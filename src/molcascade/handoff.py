@@ -4,21 +4,29 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
 import tempfile
-from collections.abc import Collection
+from collections.abc import Collection, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
+import pyarrow as pa
+
 from molcascade.artifacts import ArtifactDatasetRef
 from molcascade.contracts import (
+    DOCKING_SCORE_V1,
     PARENT_SOURCE_MAP_V1,
     RAW_MOLECULE_V1,
     RAW_MOLECULE_V2,
     SHORTLIST_EXPORT_V1,
 )
 from molcascade.errors import PipelineError
-from molcascade.io.atomic import DestinationExistsError, atomic_publish_file
-from molcascade.io.parquet import iter_parquet_batches
+from molcascade.io.atomic import (
+    DestinationExistsError,
+    atomic_commit_directory,
+    atomic_publish_file,
+)
+from molcascade.io.parquet import iter_parquet_batches, write_parquet_batches
 from molcascade.runtime import LocalRunner, RunState, RunStatus
 
 #: Contracts a source reader may emit.  Both carry ``source_candidate_id``.
@@ -27,6 +35,61 @@ _SOURCE_CONTRACTS = frozenset({RAW_MOLECULE_V1.id, RAW_MOLECULE_V2.id})
 #: Batch size for the two projected scans that build the identifier index.
 #: Larger than the export batch because only two narrow string columns are read.
 _INDEX_BATCH_SIZE = 65_536
+
+#: Batch size for the docking sidecar.  Far smaller than the index scans: these
+#: rows carry ``pose_molblock``, a large_string holding a full 3D structure, so a
+#: 64k batch would be hundreds of megabytes resident for no gain.
+_DOCKING_BATCH_SIZE = 4_096
+
+#: Suffix appended to the shortlist's stem to name its evidence directory.
+_DOCKING_SIDECAR_SUFFIX = "-docking"
+
+#: The one derived table in the sidecar; everything else is named for a stage.
+_BEST_POSE_FILE = "best-pose.parquet"
+
+#: The merged best-pose view.
+#:
+#: Deliberately *not* a contract, and deliberately not a pivot.  One row per
+#: (molecule, docking stage) in long form, so adding an engine adds rows rather
+#: than columns and nothing downstream has to be rewritten.  The pose geometry is
+#: left in the per-stage file -- join back on
+#: ``(parent_id, engine_id, receptor_id)`` at ``pose_rank = 0`` -- because
+#: duplicating molblocks would double the size of the bundle to say nothing new.
+_BEST_POSE_SCHEMA = pa.schema(
+    [
+        pa.field("parent_id", pa.string(), nullable=False),
+        # Which stage produced the row, not merely which engine: one cascade can
+        # run the same engine twice with different settings, and the stage id is
+        # the name that appears in the run report and in the cascade file.
+        pa.field("stage_id", pa.string(), nullable=False),
+        pa.field("engine_id", pa.string(), nullable=False),
+        pa.field("receptor_id", pa.string(), nullable=False),
+        pa.field("score", pa.float64(), nullable=False),
+        pa.field("score_kind", pa.string(), nullable=False),
+        # Carried per row rather than assumed: Vina-like scores are stronger when
+        # lower and KarmaDock's MDN score is stronger when higher, so a consumer
+        # that sorts without reading this column will rank one engine backwards.
+        pa.field("direction", pa.string(), nullable=False),
+        pa.field("secondary_score", pa.float64(), nullable=True),
+        pa.field("method_id", pa.string(), nullable=False),
+    ]
+)
+
+
+@dataclass(frozen=True, slots=True)
+class DockingSidecar:
+    """The docking evidence written beside a shortlist, if the run produced any."""
+
+    path: Path
+    #: One file per docking stage, holding its ``docking_score/v1`` rows verbatim.
+    engine_files: tuple[Path, ...]
+    best_pose_path: Path
+    #: Pose rows carried over -- every rank, not only the best.
+    pose_count: int
+    #: Rows in the merged table: one per molecule per docking stage.
+    best_pose_count: int
+    #: Distinct ``engine_id`` values observed, sorted.
+    engines: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,6 +103,8 @@ class MaterializedShortlist:
     #: Rows carrying an identifier from the user's library.  Zero when the
     #: library had no identifier column, which is also when no column is added.
     identified_count: int = 0
+    #: ``None`` when the cascade had no docking tier, which is most of them.
+    docking: DockingSidecar | None = None
 
 
 def _property_value(value: str) -> str:
@@ -175,6 +240,236 @@ def _identifier_index(
     return identifiers
 
 
+def _docking_ports(
+    runner: LocalRunner,
+    state: RunState,
+) -> tuple[tuple[str, ArtifactDatasetRef], ...]:
+    """Every docking-score dataset in the run, tagged with the stage that made it.
+
+    Like :func:`_ports_with_contract`, but it keeps the stage id, because that is
+    what the sidecar names its files after.  Two stages that lowered to the same
+    cache key share one artifact and are therefore listed once, under whichever
+    of them ran first -- they hold identical bytes, so a second copy would be a
+    second name for the same file rather than a second piece of evidence.
+    """
+
+    found: list[tuple[str, ArtifactDatasetRef]] = []
+    seen: set[str] = set()
+    for stage in state.stages:
+        if stage.output_ref is None or stage.output_ref.artifact_id in seen:
+            continue
+        seen.add(stage.output_ref.artifact_id)
+        manifest = runner.store.get_manifest(stage.output_ref.artifact_id)
+        for output in manifest.outputs:
+            if output.contract_id == DOCKING_SCORE_V1.id:
+                found.append((stage.stage_id, manifest.dataset_ref(output.port)))
+    return tuple(found)
+
+
+def _sidecar_file(staging: Path, name: str) -> Path:
+    """Resolve one file inside the staging directory, refusing to leave it.
+
+    A stage id is validated at config load and cannot hold a separator today, so
+    this is defence against a future loosening rather than against anything
+    reachable now -- but the id travels through a run-state file on disk, and a
+    handoff is the last place that should be willing to write outside the
+    directory it was asked to fill.
+    """
+
+    destination = (staging / name).resolve()
+    if destination.parent != staging.resolve():
+        raise PipelineError(
+            "docking sidecar file name escapes its directory",
+            code="HANDOFF_DOCKING_NAME_INVALID",
+            context={"name": name, "directory": str(staging)},
+        )
+    return destination
+
+
+def _aligned_docking_batch(batch: pa.RecordBatch) -> pa.RecordBatch:
+    """Re-project one batch into the contract's exact column order and types.
+
+    The source file has already passed ``validate_schema``, so a column missing
+    here is necessarily a nullable one -- an engine that never records a
+    secondary score, say -- and filling it with nulls is what the contract says
+    it means.  A required column cannot reach this point absent.
+    """
+
+    arrays = []
+    for field in DOCKING_SCORE_V1.schema:
+        index = batch.schema.get_field_index(field.name)
+        arrays.append(
+            batch.column(index)
+            if index >= 0
+            else pa.nulls(batch.num_rows, type=field.type)
+        )
+    return pa.RecordBatch.from_arrays(arrays, schema=DOCKING_SCORE_V1.schema)
+
+
+def _best_pose_batch(batch: pa.RecordBatch, stage_id: str) -> pa.RecordBatch:
+    """Project the rank-zero rows of one aligned batch into the merged schema."""
+
+    return pa.RecordBatch.from_arrays(
+        [
+            batch.column("parent_id"),
+            pa.array([stage_id] * batch.num_rows, type=pa.string()),
+            batch.column("engine_id"),
+            batch.column("receptor_id"),
+            batch.column("score"),
+            batch.column("score_kind"),
+            batch.column("direction"),
+            batch.column("secondary_score"),
+            batch.column("method_id"),
+        ],
+        schema=_BEST_POSE_SCHEMA,
+    )
+
+
+def _docking_batches(
+    files: Sequence[Path],
+    *,
+    stage_id: str,
+    wanted: pa.Array,
+    best_poses: list[pa.RecordBatch],
+    engines: set[str],
+) -> Iterator[pa.RecordBatch]:
+    """Stream one stage's docking rows, keeping only shortlisted molecules.
+
+    The schema is checked once per file rather than once per batch.  These bytes
+    were resolved with ``verify=True``, so their checksums already hold; what is
+    still worth asserting is the shape, because that is the assumption
+    :func:`_aligned_docking_batch` makes when it re-projects.  Re-running full
+    contract validation per batch would walk every molblock a second time for a
+    guarantee the artifact store has already given.
+
+    The rank-zero rows are collected on the way past, in ``best_poses``, so the
+    merged table costs no second pass over the pose geometry.
+    """
+
+    import pyarrow.compute as pc
+
+    for path in files:
+        checked = False
+        for batch in iter_parquet_batches(path, batch_size=_DOCKING_BATCH_SIZE):
+            if not checked:
+                DOCKING_SCORE_V1.validate_schema(batch.schema)
+                checked = True
+            kept = batch.filter(pc.is_in(batch.column("parent_id"), value_set=wanted))
+            if kept.num_rows == 0:
+                continue
+            aligned = _aligned_docking_batch(kept)
+            engines.update(pc.unique(aligned.column("engine_id")).to_pylist())
+            best = aligned.filter(pc.equal(aligned.column("pose_rank"), 0))
+            if best.num_rows:
+                best_poses.append(_best_pose_batch(best, stage_id))
+            yield aligned
+
+
+def _prepare_sidecar_destination(directory: Path, *, overwrite: bool) -> None:
+    """Make room for the sidecar, or refuse, before any work is done.
+
+    ``overwrite`` gives permission to replace a bundle MolCascade wrote.  It does
+    not give permission to delete a directory that merely happens to sit at the
+    derived path, so anything other than the parquet files this function itself
+    would have produced stops the export instead of being removed.
+
+    Called for every export, including one with nothing to put here: clearing the
+    old directory is how an undocked shortlist stops inheriting a docked run's
+    scores when it is written over the top of one.
+    """
+
+    if not directory.exists() and not directory.is_symlink():
+        return
+    if not overwrite:
+        raise PipelineError(
+            f"docking sidecar already exists: {directory}",
+            code="HANDOFF_DOCKING_SIDECAR_EXISTS",
+            hint="Choose another output path or explicitly enable overwrite.",
+            context={"path": str(directory)},
+        )
+    if directory.is_symlink() or not directory.is_dir():
+        raise PipelineError(
+            f"docking sidecar path is not a directory: {directory}",
+            code="HANDOFF_DOCKING_SIDECAR_FOREIGN",
+            hint="Remove or rename that path by hand; overwrite will not.",
+            context={"path": str(directory)},
+        )
+    entries = sorted(directory.iterdir())
+    for entry in entries:
+        if entry.is_symlink() or not entry.is_file() or entry.suffix != ".parquet":
+            raise PipelineError(
+                "docking sidecar directory holds files MolCascade did not write",
+                code="HANDOFF_DOCKING_SIDECAR_FOREIGN",
+                hint="Remove or rename that directory by hand; overwrite will not.",
+                context={"path": str(directory), "entry": entry.name},
+            )
+    for entry in entries:
+        entry.unlink()
+    directory.rmdir()
+
+
+def _fill_docking_sidecar(
+    runner: LocalRunner,
+    staging: Path,
+    ports: Sequence[tuple[str, ArtifactDatasetRef]],
+    shortlisted: Collection[str],
+    run_id: str,
+) -> tuple[tuple[str, ...], int, int, tuple[str, ...]]:
+    """Write the whole sidecar into ``staging`` and describe what went in.
+
+    One parquet per docking *stage*, not per engine as the plan first put it,
+    because a cascade may legitimately run one engine twice -- two boxes, two
+    scoring functions -- and one file per engine would then have to either merge
+    them or overwrite one with the other.  The ``engine_id`` column inside every
+    file still answers "which engine", and the merged table carries both names.
+
+    Returns the file names, the pose-row count, the merged-row count and the
+    engines seen.  Names rather than paths: the caller commits this directory by
+    rename, so no path built here survives the move.
+    """
+
+    wanted = pa.array(sorted(shortlisted), type=pa.string())
+    best_poses: list[pa.RecordBatch] = []
+    engines: set[str] = set()
+    written: list[str] = []
+    pose_count = 0
+    for stage_id, ref in ports:
+        if f"{stage_id}.parquet" == _BEST_POSE_FILE:
+            raise PipelineError(
+                f"a docking stage is named after the merged table: {stage_id}",
+                code="HANDOFF_DOCKING_NAME_RESERVED",
+                hint=f"Rename that stage; {_BEST_POSE_FILE} is written by the export.",
+                context={"stage_id": stage_id},
+            )
+        destination = _sidecar_file(staging, f"{stage_id}.parquet")
+        summary = write_parquet_batches(
+            _docking_batches(
+                _dataset_files(runner, ref),
+                stage_id=stage_id,
+                wanted=wanted,
+                best_poses=best_poses,
+                engines=engines,
+            ),
+            destination,
+            schema=DOCKING_SCORE_V1.schema,
+        )
+        written.append(destination.name)
+        pose_count += summary.row_count
+    merged = write_parquet_batches(
+        best_poses,
+        staging / _BEST_POSE_FILE,
+        schema=_BEST_POSE_SCHEMA,
+        metadata={
+            # Enough to tell, from the file alone, that this is a derived view of
+            # one run rather than a contract dataset somebody may build on.
+            "molcascade.derived_from": DOCKING_SCORE_V1.id,
+            "molcascade.run_id": run_id,
+            "molcascade.table": "docking best pose per molecule per stage",
+        },
+    )
+    return tuple(written), pose_count, merged.row_count, tuple(sorted(engines))
+
+
 def materialize_shortlist(
     runner: LocalRunner,
     run_id: str,
@@ -182,7 +477,20 @@ def materialize_shortlist(
     *,
     overwrite: bool = False,
 ) -> MaterializedShortlist:
-    """Stream the final export-record port into one portable SMILES or SDF file."""
+    """Stream the final export-record port into one portable SMILES or SDF file.
+
+    A run that docked also gets a ``<stem>-docking/`` directory beside that file:
+    one parquet per docking stage, plus ``best-pose.parquet`` joining every
+    shortlisted molecule to each stage's top-ranked score.  It sits beside the
+    shortlist rather than inside it because the formats a shortlist travels in
+    have nowhere to put a table -- an SDF tag per engine would be a schema
+    invented in string form -- and because a docking score is evidence a reader
+    may want to weigh, not a field every consumer of a ``.smi`` must now parse.
+    ``shortlist_export/v1`` is untouched.
+
+    Runs without a docking tier are unaffected: no directory is created, and the
+    returned ``docking`` is ``None``.
+    """
 
     state = runner.load_run(run_id)
     if state.status is not RunStatus.SUCCEEDED or state.output_ref is None:
@@ -246,6 +554,17 @@ def materialize_shortlist(
     include_identifier = bool(identifiers)
     identified_count = 0
     target.parent.mkdir(parents=True, exist_ok=True)
+    # Settled now rather than after the shortlist has been streamed: the sidecar
+    # is the expensive half of this function, and a run that cannot publish it
+    # should not spend that time first.
+    #
+    # Checked even when this run has no docking evidence, because the two
+    # destinations describe one export.  Overwriting a docked shortlist with an
+    # undocked one and leaving the old directory behind would leave scores that
+    # silently belong to a different run sitting beside the new file.
+    docking_ports = _docking_ports(runner, state)
+    sidecar_directory = target.with_name(target.stem + _DOCKING_SIDECAR_SUFFIX)
+    _prepare_sidecar_destination(sidecar_directory, overwrite=overwrite)
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{target.name}.",
         suffix=".tmp",
@@ -261,6 +580,8 @@ def materialize_shortlist(
         isinstance(plugin_config, dict)
         and plugin_config.get("include_header", True) is True
     )
+    sidecar_staging: Path | None = None
+    docking: DockingSidecar | None = None
     try:
         with os.fdopen(descriptor, "wb") as stream:
             if expected_format == "SMILES_TSV" and include_header:
@@ -344,6 +665,20 @@ def materialize_shortlist(
                 )
             stream.flush()
             os.fsync(stream.fileno())
+        if docking_ports:
+            # Built before either destination is touched, so a sidecar that
+            # cannot be written leaves the previous shortlist where it was
+            # instead of replacing it with half a bundle.
+            sidecar_staging = Path(
+                tempfile.mkdtemp(
+                    prefix=f".{sidecar_directory.name}.",
+                    suffix=".tmp",
+                    dir=target.parent,
+                )
+            )
+            names, poses, best, engines = _fill_docking_sidecar(
+                runner, sidecar_staging, docking_ports, shortlisted, run_id
+            )
         try:
             published = atomic_publish_file(temporary, target, overwrite=overwrite)
         except DestinationExistsError as error:
@@ -353,8 +688,21 @@ def materialize_shortlist(
                 hint="Choose another path or explicitly enable overwrite.",
                 context={"path": str(target)},
             ) from error
+        if sidecar_staging is not None:
+            committed = atomic_commit_directory(sidecar_staging, sidecar_directory)
+            sidecar_staging = None
+            docking = DockingSidecar(
+                path=committed,
+                engine_files=tuple(committed / name for name in names),
+                best_pose_path=committed / _BEST_POSE_FILE,
+                pose_count=poses,
+                best_pose_count=best,
+                engines=engines,
+            )
     except BaseException:
         temporary.unlink(missing_ok=True)
+        if sidecar_staging is not None:
+            shutil.rmtree(sidecar_staging, ignore_errors=True)
         raise
     return MaterializedShortlist(
         path=published,
@@ -364,7 +712,8 @@ def materialize_shortlist(
         source_artifact_id=state.output_ref.artifact_id,
         export_spec_id=export_spec_id,
         identified_count=identified_count,
+        docking=docking,
     )
 
 
-__all__ = ["MaterializedShortlist", "materialize_shortlist"]
+__all__ = ["DockingSidecar", "MaterializedShortlist", "materialize_shortlist"]
