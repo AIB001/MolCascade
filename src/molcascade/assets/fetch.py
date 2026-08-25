@@ -55,20 +55,22 @@ def _download(entry: AssetFile, destination: Path, progress: ProgressCallback | 
     written = 0
     ceiling = entry.size_bytes + _SIZE_SLACK_BYTES
     try:
-        with urllib.request.urlopen(request, timeout=_TIMEOUT_SECONDS) as response:
-            with open(destination, "wb") as handle:
-                while chunk := response.read(_CHUNK):
-                    written += len(chunk)
-                    if written > ceiling:
-                        raise AssetError(
-                            f"{entry.name} is larger than its declared "
-                            f"{entry.size_bytes} bytes; transfer abandoned",
-                            code="ASSET_DOWNLOAD_TOO_LARGE",
-                        )
-                    hasher.update(chunk)
-                    handle.write(chunk)
-                    if progress is not None:
-                        progress(entry.name, written, entry.size_bytes)
+        with (
+            urllib.request.urlopen(request, timeout=_TIMEOUT_SECONDS) as response,
+            open(destination, "wb") as handle,
+        ):
+            while chunk := response.read(_CHUNK):
+                written += len(chunk)
+                if written > ceiling:
+                    raise AssetError(
+                        f"{entry.name} is larger than its declared "
+                        f"{entry.size_bytes} bytes; transfer abandoned",
+                        code="ASSET_DOWNLOAD_TOO_LARGE",
+                    )
+                hasher.update(chunk)
+                handle.write(chunk)
+                if progress is not None:
+                    progress(entry.name, written, entry.size_bytes)
     except urllib.error.HTTPError as error:
         raise AssetError(
             f"{entry.name}: server returned HTTP {error.code}",

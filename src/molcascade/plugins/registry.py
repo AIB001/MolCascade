@@ -318,7 +318,9 @@ class PluginRegistry:
                 )
             try:
                 loaded: Any = entry_point.load()
-                if isinstance(loaded, type) or (not isinstance(loaded, StagePlugin) and callable(loaded)):
+                if isinstance(loaded, type) or (
+                    not isinstance(loaded, StagePlugin) and callable(loaded)
+                ):
                     loaded = loaded()
             except Exception as error:
                 raise PluginError(

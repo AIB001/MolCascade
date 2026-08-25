@@ -20,7 +20,9 @@ _DOCUMENT = Path(__file__).parents[2] / "docs" / "citations.md"
 
 
 def test_the_checked_in_document_matches_the_catalogue() -> None:
-    assert _DOCUMENT.is_file(), "docs/citations.md is missing; run: molcascade cite -o docs/citations.md"
+    assert _DOCUMENT.is_file(), (
+        "docs/citations.md is missing; run: molcascade cite -o docs/citations.md"
+    )
     on_disk = _DOCUMENT.read_text(encoding="utf-8")
     assert on_disk == render_citations(), (
         "docs/citations.md is out of date with src/molcascade/cascade/catalog.py. "

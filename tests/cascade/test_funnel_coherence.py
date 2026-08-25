@@ -86,7 +86,10 @@ def test_no_rule_is_put_to_a_vote_in_one_tier_and_enforced_in_another(
     assert not overruled, (
         "these rules are voted on in one tier and enforced as a verdict in "
         "another, so the vote does not decide: "
-        + ", ".join(f"{rule} (voted in {voted[rule]}, enforced in {enforced[rule]})" for rule in overruled)
+        + ", ".join(
+            f"{rule} (voted in {voted[rule]}, enforced in {enforced[rule]})"
+            for rule in overruled
+        )
     )
 
 

@@ -251,7 +251,9 @@ class RDKitPropertyPlugin:
                         "calculator_id": calculator_id,
                         "mw": _finite_or_none(Descriptors.MolWt(molecule), warnings, "mw"),
                         "clogp": _finite_or_none(Crippen.MolLogP(molecule), warnings, "clogp"),
-                        "tpsa": _finite_or_none(rdMolDescriptors.CalcTPSA(molecule), warnings, "tpsa"),
+                        "tpsa": _finite_or_none(
+                            rdMolDescriptors.CalcTPSA(molecule), warnings, "tpsa"
+                        ),
                         "hbd": int(rdMolDescriptors.CalcNumHBD(molecule)),
                         "hba": int(rdMolDescriptors.CalcNumHBA(molecule)),
                         "rotatable_bonds": int(Lipinski.NumRotatableBonds(molecule)),
@@ -279,8 +281,14 @@ class RDKitPropertyPlugin:
         )
         return StageResponse(
             outputs={
-                "primary": PendingOutput(PARENT_V1.id, (_PARENT_PATH.as_posix(),), {"row_count": count}),
-                "properties": PendingOutput(PROPERTY_V1.id, (_PROPERTY_PATH.as_posix(),), {"row_count": count, "calculator_id": calculator_id}),
+                "primary": PendingOutput(
+                    PARENT_V1.id, (_PARENT_PATH.as_posix(),), {"row_count": count}
+                ),
+                "properties": PendingOutput(
+                    PROPERTY_V1.id,
+                    (_PROPERTY_PATH.as_posix(),),
+                    {"row_count": count, "calculator_id": calculator_id},
+                ),
             },
             metadata={
                 "input_count": count,
@@ -400,8 +408,14 @@ class OpenBabelPropertyPlugin:
         )
         return StageResponse(
             outputs={
-                "primary": PendingOutput(PARENT_V1.id, (_PARENT_PATH.as_posix(),), {"row_count": count}),
-                "properties": PendingOutput(PROPERTY_V1.id, (_PROPERTY_PATH.as_posix(),), {"row_count": count, "calculator_id": calculator_id}),
+                "primary": PendingOutput(
+                    PARENT_V1.id, (_PARENT_PATH.as_posix(),), {"row_count": count}
+                ),
+                "properties": PendingOutput(
+                    PROPERTY_V1.id,
+                    (_PROPERTY_PATH.as_posix(),),
+                    {"row_count": count, "calculator_id": calculator_id},
+                ),
             },
             metadata={
                 "input_count": count,
@@ -523,8 +537,14 @@ class RDKitFingerprintPlugin:
         )
         return StageResponse(
             outputs={
-                "primary": PendingOutput(PARENT_V1.id, (_PARENT_PATH.as_posix(),), {"row_count": count}),
-                "fingerprints": PendingOutput(FINGERPRINT_V1.id, (_FINGERPRINT_PATH.as_posix(),), {"row_count": count, "fingerprint_spec_id": fingerprint_spec_id}),
+                "primary": PendingOutput(
+                    PARENT_V1.id, (_PARENT_PATH.as_posix(),), {"row_count": count}
+                ),
+                "fingerprints": PendingOutput(
+                    FINGERPRINT_V1.id,
+                    (_FINGERPRINT_PATH.as_posix(),),
+                    {"row_count": count, "fingerprint_spec_id": fingerprint_spec_id},
+                ),
             },
             metadata={
                 "input_count": count,

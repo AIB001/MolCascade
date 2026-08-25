@@ -64,7 +64,9 @@ _CITATION = Citation(
 )
 
 
-def _file(name: str = "weights.bin", *, payload: bytes = _PAYLOAD, **overrides: object) -> AssetFile:
+def _file(
+    name: str = "weights.bin", *, payload: bytes = _PAYLOAD, **overrides: object
+) -> AssetFile:
     fields: dict[str, object] = {
         "name": name,
         "sha256": hashlib.sha256(payload).hexdigest(),

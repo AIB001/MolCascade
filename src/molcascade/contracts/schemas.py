@@ -378,7 +378,9 @@ SCAFFOLD_ASSIGNMENT_V1 = DataContract(
     primary_key=("parent_id", "scaffold_definition_id"),
     invariants={
         "assignment_total": "every accepted parent receives one assignment for the definition",
-        "acyclic_explicit": "acyclic molecules use explicit sentinel IDs rather than an empty group",
+        "acyclic_explicit": (
+            "acyclic molecules use explicit sentinel IDs rather than an empty group"
+        ),
         "definition_namespaced": "chirality and toolkit/version participate in the definition ID",
     },
 )

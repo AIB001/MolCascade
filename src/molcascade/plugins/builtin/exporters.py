@@ -114,64 +114,68 @@ def _execute_export(
     export_destination = context.staging_root / _EXPORT_PATH
     count = 0
     try:
-        with pq.ParquetWriter(parent_destination, PARENT_V1.schema, compression="zstd") as parents:
-            with pq.ParquetWriter(
+        with (
+            pq.ParquetWriter(
+                parent_destination, PARENT_V1.schema, compression="zstd"
+            ) as parents,
+            pq.ParquetWriter(
                 export_destination,
                 SHORTLIST_EXPORT_V1.schema,
                 compression="zstd",
-            ) as records:
-                for batch in iter_contract_batches(
-                    stage_input,
-                    PARENT_V1,
-                    batch_size=config.batch_size,
-                ):
-                    exported: list[dict[str, Any]] = []
-                    for row in batch.select(["parent_id", "parent_smiles"]).to_pylist():
-                        parent_id = row["parent_id"]
-                        parent_smiles = row["parent_smiles"]
-                        warnings: list[str] = []
-                        if record_format == "SMILES_TSV":
-                            structure_record = f"{parent_smiles}\t{parent_id}"
-                        else:
-                            molecule = Chem.MolFromSmiles(parent_smiles)
-                            if molecule is None:
-                                raise PluginError(
-                                    "registered parent cannot be rendered for SDF export",
-                                    code="EXPORT_PARENT_INVALID",
-                                    context={"parent_id": parent_id},
-                                )
-                            molecule.SetProp("_Name", parent_id)
-                            assert isinstance(config, SDFExportConfig)
-                            try:
-                                structure_record = Chem.MolToMolBlock(
-                                    molecule,
-                                    forceV3000=config.force_v3000,
-                                ).rstrip("\r\n")
-                            except (ValueError, RuntimeError) as error:
-                                raise PluginError(
-                                    "RDKit could not render an SDF mol block",
-                                    code="EXPORT_RENDER_FAILED",
-                                    context={
-                                        "parent_id": parent_id,
-                                        "error_type": type(error).__name__,
-                                    },
-                                ) from error
-                        exported.append(
-                            {
-                                "parent_id": parent_id,
-                                "export_spec_id": export_spec_id,
-                                "record_format": record_format,
-                                "record_name": parent_id,
-                                "parent_smiles": parent_smiles,
-                                "structure_record": structure_record,
-                                "warning_codes_json": canonical_json(warnings) if warnings else None,
-                            }
-                        )
-                    parents.write_batch(batch)
-                    records.write_table(
-                        pa.Table.from_pylist(exported, schema=SHORTLIST_EXPORT_V1.schema)
+            ) as records,
+        ):
+            for batch in iter_contract_batches(
+                stage_input,
+                PARENT_V1,
+                batch_size=config.batch_size,
+            ):
+                exported: list[dict[str, Any]] = []
+                for row in batch.select(["parent_id", "parent_smiles"]).to_pylist():
+                    parent_id = row["parent_id"]
+                    parent_smiles = row["parent_smiles"]
+                    warnings: list[str] = []
+                    if record_format == "SMILES_TSV":
+                        structure_record = f"{parent_smiles}\t{parent_id}"
+                    else:
+                        molecule = Chem.MolFromSmiles(parent_smiles)
+                        if molecule is None:
+                            raise PluginError(
+                                "registered parent cannot be rendered for SDF export",
+                                code="EXPORT_PARENT_INVALID",
+                                context={"parent_id": parent_id},
+                            )
+                        molecule.SetProp("_Name", parent_id)
+                        assert isinstance(config, SDFExportConfig)
+                        try:
+                            structure_record = Chem.MolToMolBlock(
+                                molecule,
+                                forceV3000=config.force_v3000,
+                            ).rstrip("\r\n")
+                        except (ValueError, RuntimeError) as error:
+                            raise PluginError(
+                                "RDKit could not render an SDF mol block",
+                                code="EXPORT_RENDER_FAILED",
+                                context={
+                                    "parent_id": parent_id,
+                                    "error_type": type(error).__name__,
+                                },
+                            ) from error
+                    exported.append(
+                        {
+                            "parent_id": parent_id,
+                            "export_spec_id": export_spec_id,
+                            "record_format": record_format,
+                            "record_name": parent_id,
+                            "parent_smiles": parent_smiles,
+                            "structure_record": structure_record,
+                            "warning_codes_json": canonical_json(warnings) if warnings else None,
+                        }
                     )
-                    count += batch.num_rows
+                parents.write_batch(batch)
+                records.write_table(
+                    pa.Table.from_pylist(exported, schema=SHORTLIST_EXPORT_V1.schema)
+                )
+                count += batch.num_rows
         if count == 0:
             raise PluginError("shortlist export input is empty", code="EXPORT_EMPTY_INPUT")
     except BaseException:

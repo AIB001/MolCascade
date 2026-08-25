@@ -2,8 +2,9 @@
 
 Every test here comes from the shape of one real file: a curated binder
 workbook whose first sheet is a README, whose data sheet opens with a merged
-section banner, and whose SMILES column is spelled ``SMILES``.  MolCascade rejected it three separate
-ways before reaching a molecule, and each rejection named something other than
+section banner, and whose SMILES column is spelled ``SMILES``.  MolCascade
+rejected it three separate ways before reaching a molecule, and each rejection
+named something other than
 the thing that was wrong -- a "CSV header" for a spreadsheet, a missing column
 without saying what columns were present, a header row without saying which
 sheet it came from.

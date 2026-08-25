@@ -102,7 +102,9 @@ def probe_backend(
         return BackendStatus(
             spec=spec,
             availability=(
-                Availability.AVAILABLE if version or not spec.distribution else Availability.DEGRADED
+                Availability.AVAILABLE
+                if version or not spec.distribution
+                else Availability.DEGRADED
             ),
             version=version,
             reason=(
@@ -176,7 +178,9 @@ class BackendRegistry:
         values = self._specs.values()
         if capability is not None:
             values = (spec for spec in values if spec.capability is capability)
-        return tuple(sorted(values, key=lambda spec: (spec.capability.value, spec.tier.value, spec.id)))
+        return tuple(
+            sorted(values, key=lambda spec: (spec.capability.value, spec.tier.value, spec.id))
+        )
 
     def probe_all(
         self,

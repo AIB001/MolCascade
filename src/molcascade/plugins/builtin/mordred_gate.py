@@ -253,7 +253,9 @@ class MordredDescriptorGatePlugin:
                 near: list[str] = sorted(folded_index.get(folded, ()))
                 for match in difflib.get_close_matches(folded, folded_index, n=8, cutoff=0.6):
                     near.extend(
-                        candidate for candidate in sorted(folded_index[match]) if candidate not in near
+                        candidate
+                        for candidate in sorted(folded_index[match])
+                        if candidate not in near
                     )
                 if near:
                     suggestions[name] = near[:8]

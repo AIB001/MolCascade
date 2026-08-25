@@ -153,7 +153,10 @@ class DelimitedSmilesSourceConfig(_LocalMoleculeSourceConfig):
         references = (self.smiles_column, self.candidate_id_column, *self.metadata_columns)
         present = tuple(value for value in references if value is not None)
         expected_type = str if self.has_header else int
-        if any(isinstance(value, bool) or not isinstance(value, expected_type) for value in present):
+        if any(
+            isinstance(value, bool) or not isinstance(value, expected_type)
+            for value in present
+        ):
             mode = "names" if self.has_header else "zero-based integer indexes"
             raise ValueError(f"column references must use {mode}")
         if not self.has_header and self.expected_column_count is None:
@@ -331,65 +334,67 @@ def _write_events(
     max_buffered = 0
     observed_max_buffered_bytes = 0
     try:
-        with pq.ParquetWriter(raw_path, raw_contract.schema, compression="zstd") as raw_writer:
-            with pq.ParquetWriter(
+        with (
+            pq.ParquetWriter(raw_path, raw_contract.schema, compression="zstd") as raw_writer,
+            pq.ParquetWriter(
                 decision_path,
                 DECISION_V1.schema,
                 compression="zstd",
-            ) as decision_writer:
-                for event in events:
-                    event_bytes = _estimated_event_bytes(event)
-                    if event_bytes > max_buffered_bytes:
-                        raise PluginError(
-                            "one expanded source event exceeds max_buffered_bytes",
-                            code="SOURCE_BUFFER_BUDGET_EXCEEDED",
-                            hint=(
-                                "Increase max_buffered_bytes or lower max_record_bytes and "
-                                "the number of copied metadata columns."
-                            ),
-                            context={
-                                "estimated_event_bytes": event_bytes,
-                                "max_buffered_bytes": max_buffered_bytes,
-                            },
-                        )
-                    if pending and (
-                        pending >= batch_size
-                        or buffered_bytes + event_bytes > max_buffered_bytes
-                    ):
-                        _flush_rows(raw_writer, raw_rows, raw_contract.schema)
-                        _flush_rows(decision_writer, decision_rows, DECISION_V1.schema)
-                        pending = 0
-                        buffered_bytes = 0
-                    input_count += 1
-                    pending += 1
-                    buffered_bytes += event_bytes
-                    max_buffered = max(max_buffered, pending)
-                    observed_max_buffered_bytes = max(
-                        observed_max_buffered_bytes,
-                        buffered_bytes,
-                    )
-                    if event.raw_row is not None:
-                        accepted_count += 1
-                        raw_rows.append(event.raw_row)
-                    if event.decision_row is not None:
-                        decision_count += 1
-                        decision_rows.append(event.decision_row)
-                        if event.decision_row["outcome"] == "REJECT":
-                            rejected_count += 1
-                        else:
-                            warning_count += 1
-                    if pending >= batch_size or buffered_bytes >= max_buffered_bytes:
-                        _flush_rows(raw_writer, raw_rows, raw_contract.schema)
-                        _flush_rows(decision_writer, decision_rows, DECISION_V1.schema)
-                        pending = 0
-                        buffered_bytes = 0
-                if input_count == 0:
+            ) as decision_writer,
+        ):
+            for event in events:
+                event_bytes = _estimated_event_bytes(event)
+                if event_bytes > max_buffered_bytes:
                     raise PluginError(
-                        "source contains no data records",
-                        code="SOURCE_EMPTY",
+                        "one expanded source event exceeds max_buffered_bytes",
+                        code="SOURCE_BUFFER_BUDGET_EXCEEDED",
+                        hint=(
+                            "Increase max_buffered_bytes or lower max_record_bytes and "
+                            "the number of copied metadata columns."
+                        ),
+                        context={
+                            "estimated_event_bytes": event_bytes,
+                            "max_buffered_bytes": max_buffered_bytes,
+                        },
                     )
-                _flush_rows(raw_writer, raw_rows, raw_contract.schema)
-                _flush_rows(decision_writer, decision_rows, DECISION_V1.schema)
+                if pending and (
+                    pending >= batch_size
+                    or buffered_bytes + event_bytes > max_buffered_bytes
+                ):
+                    _flush_rows(raw_writer, raw_rows, raw_contract.schema)
+                    _flush_rows(decision_writer, decision_rows, DECISION_V1.schema)
+                    pending = 0
+                    buffered_bytes = 0
+                input_count += 1
+                pending += 1
+                buffered_bytes += event_bytes
+                max_buffered = max(max_buffered, pending)
+                observed_max_buffered_bytes = max(
+                    observed_max_buffered_bytes,
+                    buffered_bytes,
+                )
+                if event.raw_row is not None:
+                    accepted_count += 1
+                    raw_rows.append(event.raw_row)
+                if event.decision_row is not None:
+                    decision_count += 1
+                    decision_rows.append(event.decision_row)
+                    if event.decision_row["outcome"] == "REJECT":
+                        rejected_count += 1
+                    else:
+                        warning_count += 1
+                if pending >= batch_size or buffered_bytes >= max_buffered_bytes:
+                    _flush_rows(raw_writer, raw_rows, raw_contract.schema)
+                    _flush_rows(decision_writer, decision_rows, DECISION_V1.schema)
+                    pending = 0
+                    buffered_bytes = 0
+            if input_count == 0:
+                raise PluginError(
+                    "source contains no data records",
+                    code="SOURCE_EMPTY",
+                )
+            _flush_rows(raw_writer, raw_rows, raw_contract.schema)
+            _flush_rows(decision_writer, decision_rows, DECISION_V1.schema)
         validate_parquet_file(raw_path, expected_schema=raw_contract.schema)
         validate_parquet_file(decision_path, expected_schema=DECISION_V1.schema)
     except BaseException:
@@ -674,7 +679,10 @@ class DelimitedSmilesSourcePlugin:
             if config.has_header:
                 first_frame = next(frames, None)
                 if first_frame is None or first_frame.issues or first_frame.raw_bytes is None:
-                    raise PluginError("CSV header is missing or malformed", code="SOURCE_HEADER_INVALID")
+                    raise PluginError(
+                        "CSV header is missing or malformed",
+                        code="SOURCE_HEADER_INVALID",
+                    )
                 try:
                     header = _decode_csv_record(first_frame, config)
                 except (UnicodeDecodeError, csv.Error, ValueError) as error:
@@ -1084,11 +1092,15 @@ def _discover_parquet_files(path: str) -> tuple[Path, tuple[Path, ...]]:
         raise PluginError("Parquet source path must not be a symlink", code="SOURCE_PATH_INVALID")
     if root.is_file():
         if root.suffix.lower() != ".parquet":
-            raise PluginError("Parquet source file must end in .parquet", code="SOURCE_PATH_INVALID")
+            raise PluginError(
+                "Parquet source file must end in .parquet", code="SOURCE_PATH_INVALID"
+            )
         return root.parent, (root,)
     if not root.is_dir():
         raise PluginError("Parquet source path does not exist", code="SOURCE_PATH_INVALID")
-    files = tuple(sorted(root.rglob("*.parquet"), key=lambda item: item.relative_to(root).as_posix()))
+    files = tuple(
+        sorted(root.rglob("*.parquet"), key=lambda item: item.relative_to(root).as_posix())
+    )
     if not files:
         raise PluginError("Parquet source contains no .parquet files", code="SOURCE_EMPTY")
     if any(file.is_symlink() or not file.is_file() for file in files):
@@ -1362,7 +1374,10 @@ class XlsxSourceConfig(_LocalMoleculeSourceConfig):
         references = (self.smiles_column, self.candidate_id_column, *self.metadata_columns)
         present = tuple(value for value in references if value is not None)
         expected_type = str if self.has_header else int
-        if any(isinstance(value, bool) or not isinstance(value, expected_type) for value in present):
+        if any(
+            isinstance(value, bool) or not isinstance(value, expected_type)
+            for value in present
+        ):
             mode = "names" if self.has_header else "zero-based integer indexes"
             raise ValueError(f"column references must use {mode}")
         if not self.has_header and self.expected_column_count is None:

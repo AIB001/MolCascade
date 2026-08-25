@@ -163,7 +163,9 @@ def _run(
     config.update(overrides)
     staging = tmp_path / "out"
     response = CustomModelPredictorPlugin().execute(
-        StageRequest(stage_id="custom", inputs={"parents": _input(tmp_path, smiles)}, config=config),
+        StageRequest(
+            stage_id="custom", inputs={"parents": _input(tmp_path, smiles)}, config=config
+        ),
         StageContext(staging),
     )
     table = pq.read_table(staging / "datasets/custom_predictions/part-00000.parquet")
@@ -418,7 +420,9 @@ def test_graph_width_disagreement_is_caught_before_any_molecule_is_scored(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     bundle = _bundle(tmp_path)
-    session = _FakeSession(67, lambda *_: pytest.fail("must not reach inference"), declared_width=99)
+    session = _FakeSession(
+        67, lambda *_: pytest.fail("must not reach inference"), declared_width=99
+    )
     with pytest.raises(PluginError) as captured:
         _run(tmp_path, bundle, session, monkeypatch)
     assert captured.value.code == "CUSTOM_MODEL_FEATURE_WIDTH_MISMATCH"

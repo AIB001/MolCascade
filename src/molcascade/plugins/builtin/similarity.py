@@ -323,7 +323,11 @@ def _file_records(
                         continue
                     append(
                         ReferenceRecord(
-                            reference_id=row[1] if len(row) > 1 and row[1] else f"reference-{row_number}",
+                            reference_id=(
+                                row[1]
+                                if len(row) > 1 and row[1]
+                                else f"reference-{row_number}"
+                            ),
                             smiles=row[0],
                         )
                     )

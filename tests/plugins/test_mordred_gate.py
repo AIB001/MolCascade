@@ -55,7 +55,11 @@ def _input(tmp_path: Path, rows: list[dict[str, object]] | None = None) -> Stage
 
 def _run(tmp_path: Path, config: dict[str, object], rows=None):
     return MordredDescriptorGatePlugin().execute(
-        StageRequest(stage_id="mordred_gate", inputs={"parents": _input(tmp_path, rows)}, config=config),
+        StageRequest(
+            stage_id="mordred_gate",
+            inputs={"parents": _input(tmp_path, rows)},
+            config=config,
+        ),
         StageContext(tmp_path / "out"),
     )
 
@@ -199,7 +203,11 @@ def test_batch_size_does_not_change_the_verdicts(tmp_path: Path) -> None:
         ({"descriptor": "naRing"}, "the shorthand needs a bound too"),
         ({"minimum": 1}, "the shorthand needs a descriptor"),
         (
-            {"windows": [{"descriptor": "naRing", "minimum": 1}], "descriptor": "nRing", "maximum": 2},
+            {
+                "windows": [{"descriptor": "naRing", "minimum": 1}],
+                "descriptor": "nRing",
+                "maximum": 2,
+            },
             "both spellings at once is ambiguous",
         ),
         (

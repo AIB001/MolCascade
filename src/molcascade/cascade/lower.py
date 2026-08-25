@@ -245,7 +245,11 @@ def _lower_criterion(
             label=f"{criterion.label or producer.display_name} threshold",
         ),
     )
-    return criterion.gate_stage_id, gate_survivor_port, (criterion.gate_stage_id, gate_decision_port)
+    return (
+        criterion.gate_stage_id,
+        gate_survivor_port,
+        (criterion.gate_stage_id, gate_decision_port),
+    )
 
 
 def _lower_tier(

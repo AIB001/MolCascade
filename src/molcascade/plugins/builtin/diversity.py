@@ -263,42 +263,46 @@ class RDKitMurckoScaffoldPlugin:
         try:
             import pyarrow.parquet as pq
 
-            with pq.ParquetWriter(parent_destination, PARENT_V1.schema, compression="zstd") as parents:
-                with pq.ParquetWriter(
+            with (
+                pq.ParquetWriter(
+                    parent_destination, PARENT_V1.schema, compression="zstd"
+                ) as parents,
+                pq.ParquetWriter(
                     scaffold_destination,
                     SCAFFOLD_ASSIGNMENT_V1.schema,
                     compression="zstd",
-                ) as scaffolds:
-                    for batch in iter_contract_batches(
-                        stage_input,
-                        PARENT_V1,
-                        batch_size=config.batch_size,
-                    ):
-                        assignments: list[dict[str, Any]] = []
-                        for row in batch.select(["parent_id", "parent_smiles"]).to_pylist():
-                            molecule = _molecule(row["parent_smiles"], row["parent_id"])
-                            exact_id, exact, generic_id, generic, acyclic = _scaffold_values(
-                                molecule,
-                                include_chirality=config.include_chirality,
-                            )
-                            assignments.append(
-                                {
-                                    "parent_id": row["parent_id"],
-                                    "scaffold_definition_id": definition_id,
-                                    "exact_scaffold_id": exact_id,
-                                    "exact_scaffold_smiles": exact or None,
-                                    "generic_scaffold_id": generic_id,
-                                    "generic_scaffold_smiles": generic or None,
-                                    "ring_system_id": None if acyclic else exact_id,
-                                    "acyclic": acyclic,
-                                    "toolkit_version": rdBase.rdkitVersion,
-                                }
-                            )
-                        parents.write_batch(batch)
-                        scaffolds.write_table(
-                            pa.Table.from_pylist(assignments, schema=SCAFFOLD_ASSIGNMENT_V1.schema)
+                ) as scaffolds,
+            ):
+                for batch in iter_contract_batches(
+                    stage_input,
+                    PARENT_V1,
+                    batch_size=config.batch_size,
+                ):
+                    assignments: list[dict[str, Any]] = []
+                    for row in batch.select(["parent_id", "parent_smiles"]).to_pylist():
+                        molecule = _molecule(row["parent_smiles"], row["parent_id"])
+                        exact_id, exact, generic_id, generic, acyclic = _scaffold_values(
+                            molecule,
+                            include_chirality=config.include_chirality,
                         )
-                        count += batch.num_rows
+                        assignments.append(
+                            {
+                                "parent_id": row["parent_id"],
+                                "scaffold_definition_id": definition_id,
+                                "exact_scaffold_id": exact_id,
+                                "exact_scaffold_smiles": exact or None,
+                                "generic_scaffold_id": generic_id,
+                                "generic_scaffold_smiles": generic or None,
+                                "ring_system_id": None if acyclic else exact_id,
+                                "acyclic": acyclic,
+                                "toolkit_version": rdBase.rdkitVersion,
+                            }
+                        )
+                    parents.write_batch(batch)
+                    scaffolds.write_table(
+                        pa.Table.from_pylist(assignments, schema=SCAFFOLD_ASSIGNMENT_V1.schema)
+                    )
+                    count += batch.num_rows
             if count == 0:
                 raise PluginError("scaffold input contains no parents", code="SCAFFOLD_EMPTY_INPUT")
         except BaseException:
@@ -307,7 +311,9 @@ class RDKitMurckoScaffoldPlugin:
             raise
         return StageResponse(
             outputs={
-                "primary": PendingOutput(PARENT_V1.id, (_PARENT_PATH.as_posix(),), {"row_count": count}),
+                "primary": PendingOutput(
+                    PARENT_V1.id, (_PARENT_PATH.as_posix(),), {"row_count": count}
+                ),
                 "scaffolds": PendingOutput(
                     SCAFFOLD_ASSIGNMENT_V1.id,
                     (_SCAFFOLD_PATH.as_posix(),),
@@ -330,7 +336,10 @@ def _run_cluster(
     context: StageContext,
     config: Any,
     method_name: str,
-    assign: Callable[[Any, dict[str, Any], list[tuple[str, Any]], dict[str, int]], tuple[str, str, bool, float, int]],
+    assign: Callable[
+        [Any, dict[str, Any], list[tuple[str, Any]], dict[str, int]],
+        tuple[str, str, bool, float, int],
+    ],
 ) -> StageResponse:
     from rdkit import rdBase
 
@@ -368,7 +377,9 @@ def _run_cluster(
         )
         input_count = 0
         with connection:
-            for batch in iter_contract_batches(stage_input, PARENT_V1, batch_size=config.batch_size):
+            for batch in iter_contract_batches(
+                stage_input, PARENT_V1, batch_size=config.batch_size
+            ):
                 for row in batch.to_pylist():
                     parent_id = row.get("parent_id")
                     if not isinstance(parent_id, str) or not parent_id:
@@ -394,7 +405,14 @@ def _run_cluster(
                         )
                     connection.execute(
                         "INSERT INTO assignments VALUES (?, ?, ?, ?, ?, ?)",
-                        (parent_id, cluster_id, representative_id, int(is_representative), similarity, rank),
+                        (
+                            parent_id,
+                            cluster_id,
+                            representative_id,
+                            int(is_representative),
+                            similarity,
+                            rank,
+                        ),
                     )
                     input_count += 1
         if input_count == 0:
@@ -439,7 +457,9 @@ def _run_cluster(
         Path(f"{database_path}-journal").unlink(missing_ok=True)
     return StageResponse(
         outputs={
-            "primary": PendingOutput(PARENT_V1.id, (_PARENT_PATH.as_posix(),), {"row_count": input_count}),
+            "primary": PendingOutput(
+                PARENT_V1.id, (_PARENT_PATH.as_posix(),), {"row_count": input_count}
+            ),
             "clusters": PendingOutput(
                 CLUSTER_ASSIGNMENT_V1.id,
                 (_CLUSTER_PATH.as_posix(),),
@@ -608,7 +628,9 @@ def _selection_response(
         )
         input_count = 0
         with connection:
-            for batch in iter_contract_batches(stage_input, PARENT_V1, batch_size=config.batch_size):
+            for batch in iter_contract_batches(
+                stage_input, PARENT_V1, batch_size=config.batch_size
+            ):
                 for row in batch.to_pylist():
                     parent_id = row.get("parent_id")
                     if not isinstance(parent_id, str) or not parent_id:
@@ -622,7 +644,9 @@ def _selection_response(
                             """,
                             (
                                 parent_id, row.get("identity_policy_id"), row.get("parent_smiles"),
-                                row.get("registration_key"), row.get("stereo_key"), row.get("formula"),
+                                row.get("registration_key"),
+                                row.get("stereo_key"),
+                                row.get("formula"),
                                 row.get("duplicate_count"), input_count, tie, key,
                             ),
                         )
@@ -714,7 +738,9 @@ def _selection_response(
         Path(f"{database_path}-journal").unlink(missing_ok=True)
     return StageResponse(
         outputs={
-            "primary": PendingOutput(PARENT_V1.id, (_PARENT_PATH.as_posix(),), {"row_count": selected_count}),
+            "primary": PendingOutput(
+                PARENT_V1.id, (_PARENT_PATH.as_posix(),), {"row_count": selected_count}
+            ),
             "selection": PendingOutput(
                 SELECTION_DECISION_V1.id,
                 (_SELECTION_PATH.as_posix(),),
@@ -767,7 +793,10 @@ class NativeScaffoldRoundRobinSelectorPlugin:
         cardinality=Cardinality.FILTER,
         determinism=Determinism.SEEDED,
         display_name="Scaffold round-robin budget",
-        description="Breadth-first Murcko allocation with a per-scaffold cap and deterministic ties.",
+        description=(
+            "Breadth-first Murcko allocation with a per-scaffold cap and "
+            "deterministic ties."
+        ),
     )
     config_model = ScaffoldRoundRobinConfig
 

@@ -376,7 +376,10 @@ def build_parser() -> argparse.ArgumentParser:
         "-l",
         type=Path,
         required=True,
-        help="Molecule library to screen (.csv, .tsv, .smi, .xlsx, .sdf, .parquet, or a MOL2 directory)",
+        help=(
+            "Molecule library to screen (.csv, .tsv, .smi, .xlsx, .sdf, .parquet, "
+            "or a MOL2 directory)"
+        ),
     )
     screen.add_argument(
         "--format",
@@ -747,7 +750,10 @@ def _doctor(*, as_json: bool, run_version_commands: bool) -> int:
     print(f"Vendored assets in {default_asset_root()}:")
     for spec, status in zip(asset_specs, asset_states, strict=True):
         megabytes = spec.total_bytes / (1024 * 1024)
-        print(f"  {status.state.value:<11} {spec.id:<30} {megabytes:>8,.1f} MiB — {spec.display_name}")
+        print(
+            f"  {status.state.value:<11} {spec.id:<30} "
+            f"{megabytes:>8,.1f} MiB — {spec.display_name}"
+        )
     unready = [status.asset_id for status in asset_states if not status.ready]
     if unready:
         print("  Provision with: molcascade assets fetch " + " ".join(unready))

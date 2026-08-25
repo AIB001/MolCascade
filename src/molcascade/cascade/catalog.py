@@ -440,9 +440,15 @@ class _ADMETHead:
 #: are ADMET-AI's own held-out numbers, read from ``admet_ai/resources/data``.
 _ADMET_AI_HEADS: tuple[_ADMETHead, ...] = (
     # --- Absorption -------------------------------------------------------
-    _ADMETHead("HIA_Hou", "human_intestinal_absorption", "Human intestinal absorption · AUROC 0.99"),
+    _ADMETHead(
+        "HIA_Hou", "human_intestinal_absorption", "Human intestinal absorption · AUROC 0.99"
+    ),
     _ADMETHead("Pgp_Broccatelli", "pgp_inhibition", "P-glycoprotein inhibition · AUROC 0.95"),
-    _ADMETHead("Solubility_AqSolDB", "aqueous_solubility", "Aqueous solubility, log(mol/L) · R² 0.82"),
+    _ADMETHead(
+        "Solubility_AqSolDB",
+        "aqueous_solubility",
+        "Aqueous solubility, log(mol/L) · R² 0.82",
+    ),
     _ADMETHead(
         "Lipophilicity_AstraZeneca", "lipophilicity_logd", "Lipophilicity logD7.4 · R² 0.77"
     ),
@@ -452,7 +458,9 @@ _ADMET_AI_HEADS: tuple[_ADMETHead, ...] = (
         "Bioavailability_Ma", "oral_bioavailability", "Oral bioavailability · AUROC 0.72 (weak)"
     ),
     # --- Distribution -----------------------------------------------------
-    _ADMETHead("BBB_Martins", "blood_brain_barrier", "Blood-brain barrier penetration · AUROC 0.90"),
+    _ADMETHead(
+        "BBB_Martins", "blood_brain_barrier", "Blood-brain barrier penetration · AUROC 0.90"
+    ),
     _ADMETHead("PPBR_AZ", "plasma_protein_binding", "Plasma protein binding, % · R² 0.59 (weak)"),
     _ADMETHead(
         "VDss_Lombardo",

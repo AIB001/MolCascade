@@ -470,7 +470,9 @@ def test_the_model_id_changes_with_the_bytes_that_produced_the_numbers(
     other = _bundle(tmp_path / "other", checkpoints, kind="binary", task="binary_probability")
     assert inspect_chemprop_bundle(other)["model_id"] != baseline
 
-    reindexed = _bundle(tmp_path / "third", checkpoints, kind="regression_3", n_tasks=3, task_index=1)
+    reindexed = _bundle(
+        tmp_path / "third", checkpoints, kind="regression_3", n_tasks=3, task_index=1
+    )
     assert inspect_chemprop_bundle(reindexed)["model_id"] != baseline
 
 

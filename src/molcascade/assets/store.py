@@ -16,6 +16,7 @@ real path, having first proved the bytes are the declared ones.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -121,10 +122,11 @@ def write_stamp(directory: Path, entries: dict[str, dict[str, int | str]]) -> No
     """
 
     payload = json.dumps({"version": 1, "files": entries}, indent=2, sort_keys=True)
-    try:
+    # Suppressed rather than reported: the stamp is a cache, and a read-only or
+    # full asset directory should cost re-hashing, not fail the fetch that just
+    # succeeded.
+    with contextlib.suppress(OSError):
         (directory / _STAMP_NAME).write_text(payload + "\n", encoding="utf-8")
-    except OSError:
-        pass
 
 
 def _check_file(
