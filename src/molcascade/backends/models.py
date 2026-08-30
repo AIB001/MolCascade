@@ -104,6 +104,21 @@ class BackendSpec(StrictFrozenModel):
     #: preflight, would put one backend's vocabulary in a module that otherwise
     #: knows nothing about any particular backend.
     executable_config_key: str | None = Field(default=None, min_length=1, max_length=64)
+    #: Stage-config keys naming data files this backend reads, checked for
+    #: existence before the run starts.
+    #:
+    #: A config validator can only check a path's *shape*, because validation
+    #: has to work on a machine that is not the one the run will happen on.  So
+    #: a stage that names a lead set nobody put there passes ``molcascade
+    #: validate`` and dies at its first row -- after every stage above it has
+    #: been paid for.  Preflight is where the filesystem is allowed to have an
+    #: opinion, and it already receives each stage's config.
+    #:
+    #: A key that is absent or blank is *not* a failure here: several of these
+    #: fields have in-config alternatives (embedded reference records, for one),
+    #: and the plugin's own validator is what decides whether one was required.
+    #: This checks only the claim a config actually makes.
+    data_file_config_keys: tuple[str, ...] = ()
     plugin_ref: str | None = Field(default=None, min_length=1, max_length=512)
     platforms: tuple[str, ...] = ("windows", "linux", "darwin")
     offline: bool = True

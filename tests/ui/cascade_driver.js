@@ -28,10 +28,35 @@ global.Blob = function Blob(parts) {
 };
 global.URL = { createObjectURL: () => "blob:test", revokeObjectURL: () => {} };
 global.FileReader = function FileReader() {};
+/* Every POST the page attempts, and what the stub answered.  The reply is
+ * controlled from the environment so one driver can play both the run where the
+ * server takes the file and the run where it refuses -- the second being the
+ * one that has to end in a browser download rather than a lost cascade. */
+const posts = [];
+const fetchFailure = process.env.DRIVER_FETCH_FAILURE || "";
 global.window = {
   confirm: () => true,
   setTimeout: (fn) => 0,
+  fetch: (url, init) => {
+    posts.push({ url: url, method: init.method, headers: init.headers, body: init.body });
+    if (fetchFailure === "network") return Promise.reject(new Error("connection refused"));
+    if (fetchFailure === "refused") {
+      return Promise.resolve({
+        ok: false,
+        json: () => Promise.resolve({ ok: false, error: "wrong or missing builder token" }),
+      });
+    }
+    return Promise.resolve({
+      ok: true,
+      json: () => Promise.resolve({ ok: true, path: payloadEndpointPath() }),
+    });
+  },
 };
+
+function payloadEndpointPath() {
+  const endpoint = JSON.parse(payloadText).save_endpoint;
+  return endpoint ? endpoint.path : null;
+}
 
 document.getElementById("builder-payload").value = payloadText;
 
@@ -275,8 +300,61 @@ function needsOf(tierId) {
   return card.all((node) => node.classList.contains("tier-needs")).map((n) => n.textContent);
 }
 
+/* Docking ships enabled in the starter cascade now, and the conformer tier that
+ * feeds it ships with it.  Everything below is the story of an operator *adding*
+ * docking -- the tier declaring what the command line still owes it, the
+ * evidence producer appearing above it, both withdrawn again when the block is
+ * turned off -- and none of that can be observed on a cascade that already has
+ * docking in it.  So the shipped pair is removed first, through the same delete
+ * control an operator would use, and what was removed is recorded: a starter
+ * that stops shipping docking must fail here rather than quietly reduce this
+ * whole section to a re-run of the defaults.
+ *
+ * Consumers first, then the feeder.  Deleting a producer while a block above
+ * still reads it is refused -- that refusal is a guarantee of its own, checked
+ * further down -- so the reverse order would leave the session wedged in an
+ * error state. */
+const catalogueOptions = {};
+for (const spec of JSON.parse(payloadText).criteria) {
+  for (const option of spec.options) {
+    if (option.plugin_ref) catalogueOptions[option.plugin_ref] = option;
+  }
+}
+const shippedDocking = exported().tiers.filter((tier) =>
+  tier.criteria.some((criterion) => criterion.backend.indexOf("docking.") === 0)
+);
+const shippedNeeds = [];
+for (const tier of shippedDocking) {
+  for (const criterion of tier.criteria) {
+    const option = catalogueOptions[criterion.backend];
+    for (const contract of option ? option.needs_evidence : []) {
+      if (shippedNeeds.indexOf(contract) < 0) shippedNeeds.push(contract);
+    }
+  }
+}
+const shippedFeeders = exported().tiers.filter(
+  (tier) =>
+    !shippedDocking.some((docked) => docked.id === tier.id) &&
+    tier.criteria.some((criterion) => {
+      const option = catalogueOptions[criterion.backend];
+      if (!option) return false;
+      return option.produces_evidence.some((contract) => shippedNeeds.indexOf(contract) >= 0);
+    })
+);
+const removedShipped = shippedDocking.concat(shippedFeeders).map((tier) => tier.id);
+for (const tierId of removedShipped) {
+  focusKey("tx:" + tierId).click();
+}
+steps.shippedDocking = {
+  removed: removedShipped,
+  remaining: shape().map((tier) => tier.id),
+  status: status(),
+  downloadDisabled: document.getElementById("action-download").disabled,
+};
+
 const dockTierId = shape()[shape().length - 1].id;
 const needsBefore = needsOf(dockTierId);
+const shapeBeforeDocking = shape();
 focusKey("add:" + dockTierId).click();
 const dockingEntry = document
   .getElementById("picker-list")
@@ -287,6 +365,88 @@ dockingEntry[0].click();
 const dockingCriteria = shape()[shape().length - 1].criteria;
 const dockingId = dockingCriteria[dockingCriteria.length - 1];
 const needsAfter = needsOf(dockTierId);
+
+/* Some engines read evidence they do not compute: Uni-Dock and GNINA dock a 3D
+ * structure and generate none.  Nothing on the page tells an operator which of
+ * the offered engines is like that, so choosing one used to export a file that
+ * `lower_cascade` refused outright.  Adding the dependency is the fix, and this
+ * records where it landed -- it must be a *serial* tier directly above the block
+ * that reads it, because a pure evidence producer has no threshold and a
+ * parallel tier demands a decision from everything in it. */
+const shapeAfterDocking = shape();
+const insertedIds = shapeAfterDocking
+  .map((tier) => tier.id)
+  .filter((id) => !shapeBeforeDocking.some((was) => was.id === id));
+const exportedAfterDocking = exported();
+function exportedTier(tierId) {
+  return exportedAfterDocking.tiers.filter((tier) => tier.id === tierId)[0] || null;
+}
+steps.evidence = {
+  addStatus: status(),
+  downloadDisabled: document.getElementById("action-download").disabled,
+  tiersBefore: shapeBeforeDocking.map((tier) => tier.id),
+  tiersAfter: shapeAfterDocking.map((tier) => tier.id),
+  inserted: insertedIds,
+  insertedTiers: insertedIds.map(exportedTier),
+  dockTier: exportedTier(dockTierId),
+};
+
+/* Where the engine is installed is the one question this browser cannot answer,
+ * and it must not pretend to.  It used to: a blank engine path disabled Download
+ * and told the operator to fill it in or export a variable "on the machine that
+ * will run this cascade" -- advice that cannot be taken from the machine drawing
+ * the page, which is usually a laptop with no docking engine on it at all.  So
+ * the export goes ahead with the field blank, the page says who will answer it,
+ * and `preflight_engine_paths` refuses on the host that can actually look.  The
+ * Python side takes the file downloaded here and pushes it through exactly that
+ * sequence. */
+const dockingBlock = blocks().filter((node) => node.dataset.criterion === dockingId)[0];
+if (!dockingBlock) throw new Error("no block for " + dockingId);
+dockingBlock.click();
+const engineFields = inspectorFields();
+// Located by the variable it advertises rather than by its label, because which
+// engine the picker offers first is not what is under test here.  The variable
+// moved from the placeholder into the help text when the field stopped being
+// required, so this reads the whole field rather than one attribute of it.
+let engineLabel = null;
+let engineControl = null;
+let engineHelp = null;
+for (const [label, control] of engineFields) {
+  const text = control.parentNode.textContent || "";
+  if (text.indexOf("MOLCASCADE_") < 0 || text.indexOf("EXECUTABLE") < 0) continue;
+  engineLabel = label;
+  engineControl = control;
+  engineHelp = text;
+  break;
+}
+steps.installationPaths = {
+  blankStatus: status(),
+  blankDownloadDisabled: document.getElementById("action-download").disabled,
+  labels: Array.from(engineFields.keys()),
+  label: engineLabel,
+  placeholder: engineControl ? engineControl.getAttribute("placeholder") : null,
+  help: engineHelp,
+  variable: engineHelp ? (/MOLCASCADE_[A-Z0-9_]+/.exec(engineHelp) || [null])[0] : null,
+};
+if (!engineControl) {
+  throw new Error("no engine path control: " + steps.installationPaths.labels.join(" | "));
+}
+// The claim in one line: a cascade that names no installation still leaves the
+// browser.  What the Python side then does with it is the other half.
+document.getElementById("action-download").click();
+steps.installationPaths.blankDownload = downloads[downloads.length - 1];
+steps.installationPaths.downloadsSoFar = downloads.length;
+// Filling it in is still allowed -- an engine installed somewhere unusual is
+// exactly what the field is for -- and has to reach the exported settings.
+engineControl.value = "/opt/envs/karmadock/bin/python";
+engineControl.dispatch("change");
+steps.installationPaths.filledStatus = status();
+steps.installationPaths.filledDownloadDisabled =
+  document.getElementById("action-download").disabled;
+steps.installationPaths.filledSettings = exported()
+  .tiers.reduce((all, tier) => all.concat(tier.criteria), [])
+  .filter((criterion) => criterion.id === dockingId)[0].settings;
+
 // Disabling the block withdraws the demand with it: a tier that compiles into
 // no stage asks the command line for nothing.
 focusKey("ct:" + dockingId).click();
@@ -300,4 +460,58 @@ steps.runTimeNeeds = {
     .map((tier) => needsOf(tier.id)),
 };
 
-process.stdout.write(JSON.stringify(steps));
+/* The inserted producer is an ordinary block afterwards -- movable, editable,
+ * deletable -- so deleting it has to be caught rather than quietly allowed.  It
+ * is the same state a cascade loaded from disk can arrive in, which is the case
+ * the automatic insertion cannot cover. */
+focusKey("ct:" + dockingId).click();
+const producerTierId = steps.evidence.inserted[0];
+if (producerTierId) {
+  focusKey("tx:" + producerTierId).click();
+}
+steps.evidenceWithdrawn = {
+  removed: producerTierId || null,
+  status: status(),
+  downloadDisabled: document.getElementById("action-download").disabled,
+  tiers: shape().map((tier) => tier.id),
+};
+
+/* Where the exported file goes.
+ *
+ * With no endpoint in the payload -- the document written to disk -- the button
+ * makes a Blob and nothing is posted anywhere.  With one, the same button posts
+ * instead, and the interesting part is the failure: a server that refuses, or a
+ * command the operator has already stopped, must still leave the operator
+ * holding the file.  Both runs go through the shipped listener, so the token
+ * header, the body and the fallback are the real ones. */
+/* The steps above deliberately leave the canvas unexportable, and where a file
+ * goes is only a question about a cascade that is ready to run.  Restoring the
+ * starter through the shipped button is the shortest way back to one. */
+function recordExport() {
+  document.getElementById("action-reset").click();
+  steps.export = {
+    endpoint: JSON.parse(payloadText).save_endpoint,
+    downloadsBefore: downloads.length,
+    postsBefore: posts.length,
+  };
+  document.getElementById("action-download").click();
+  steps.export.posted = posts.slice(steps.export.postsBefore);
+  steps.export.downloadedAfterPost = downloads.length - steps.export.downloadsBefore;
+  steps.export.status = status();
+}
+
+/* Two ticks, for two different reasons.  The steps above click Download as
+ * well, and with an endpoint in the payload those clicks post too -- their
+ * promises settle after this script's synchronous phase, so the counters are
+ * only trustworthy once a turn of the event loop has drained them.  The second
+ * tick is then the export's own: its status line and any fallback download
+ * exist a microtask after the click returns, not before. */
+setImmediate(() => {
+  recordExport();
+  setImmediate(() => {
+    steps.export.settledStatus = status();
+    steps.export.settledDownloads = downloads.length - steps.export.downloadsBefore;
+    steps.export.settledFile = downloads[downloads.length - 1] || null;
+    process.stdout.write(JSON.stringify(steps));
+  });
+});

@@ -37,7 +37,7 @@ from molcascade.errors import PluginError
 from molcascade.pipeline.compiler import CompiledStage
 from molcascade.plugins import create_builtin_registry
 
-_GNINA = "docking.gnina@0.1.0"
+_GNINA = "docking.gnina@0.3.0"
 
 # GNINA declares Linux only, and a platform refusal is reported before the
 # licence is ever consulted -- correctly, since no flag makes a Linux binary run
@@ -139,7 +139,7 @@ def test_the_permission_is_recorded_by_name_not_as_a_boolean(tmp_path: Path) -> 
     stages = [
         _stage("t6_rescore", _GNINA, {"executable": executable}),
         _stage("t7_rescore_again", _GNINA, {"executable": executable}),
-        _stage("t5_dock", "docking.unidock@0.1.0", {"executable": executable}),
+        _stage("t5_dock", "docking.unidock@0.2.0", {"executable": executable}),
     ]
 
     permitted = copyleft_backends(stages)
@@ -152,7 +152,7 @@ def test_the_permission_is_recorded_by_name_not_as_a_boolean(tmp_path: Path) -> 
 
 
 def test_a_cascade_without_copyleft_tools_permits_nothing(tmp_path: Path) -> None:
-    stages = [_stage("t5_dock", "docking.unidock@0.1.0", {"executable": _executable(tmp_path)})]
+    stages = [_stage("t5_dock", "docking.unidock@0.2.0", {"executable": _executable(tmp_path)})]
 
     assert copyleft_backends(stages) == ()
 

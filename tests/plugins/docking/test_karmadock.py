@@ -46,15 +46,24 @@ _SMILES = (
     "CCCCCCCCCCCCCCCCCC(=O)O",
 )
 
-#: One carbon at the origin. Enough for RDKit to read a pose back; the pose's
-#: chemistry is KarmaDock's business, not this adapter's.
-_MOLBLOCK = """lig
-  molcascade-fake
+#: ``--out_corrected`` writes two poses per ligand, and the adapter must read the
+#: align-corrected one: the force-field-corrected file is the network's raw
+#: coordinates with ten MMFF steps applied, which leaves rings out of plane.  One
+#: carbon each is enough for RDKit, and the coordinate says which file it came
+#: from -- the pose's chemistry is KarmaDock's business, not this adapter's.
+_FF_POSE_XYZ = "9.0000"
+_ALIGN_POSE_XYZ = "1.5000"
 
-  1  0  0  0  0  0            999 V2000
-    0.0000    0.0000    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0
-M  END
-"""
+
+def _molblock(coordinate: str) -> str:
+    return (
+        "lig\n"
+        "  molcascade-fake\n"
+        "\n"
+        "  1  0  0  0  0  0            999 V2000\n"
+        f"    {coordinate}    0.0000    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0\n"
+        "M  END\n"
+    )
 
 
 # ------------------------------------------------------------- the fake screener
@@ -101,7 +110,7 @@ if behaviour.get("exit_code"):
 out_dir = Path(arguments["out_dir"][0])
 out_dir.mkdir(parents=True, exist_ok=True)
 skip = set(behaviour.get("skip", []))
-nan_ff = set(behaviour.get("nan_ff", []))
+nan_aligned = set(behaviour.get("nan_aligned", []))
 rows = []
 for line in Path(arguments["ligand_smi"][0]).read_text().split("\\n"):
     if not line.strip():
@@ -112,10 +121,11 @@ for line in Path(arguments["ligand_smi"][0]).read_text().split("\\n"):
     if ordinal in skip:
         continue
     score = float(len(smiles))
-    corrected = "nan" if ordinal in nan_ff else "%.3f" % (score + 0.5)
-    rows.append("%s,%.3f,%s,%.3f" % (name, score, corrected, score + 0.25))
+    aligned = "nan" if ordinal in nan_aligned else "%.3f" % (score + 0.25)
+    rows.append("%s,%.3f,%.3f,%s" % (name, score, score + 0.5, aligned))
     if "out_corrected" in arguments:
-        (out_dir / (name + "_pred_ff_corrected.sdf")).write_text(_MOLBLOCK)
+        (out_dir / (name + "_pred_ff_corrected.sdf")).write_text(_FF_POSE)
+        (out_dir / (name + "_pred_align_corrected.sdf")).write_text(_ALIGN_POSE)
 
 header = "pdb_id,karma_score,karma_score_ff,karma_score_aligned"
 (out_dir / "score.csv").write_text("\\n".join([header, *rows]) + "\\n")
@@ -136,7 +146,8 @@ def screener(tmp_path: Path) -> Any:
         script.parent.mkdir(parents=True, exist_ok=True)
         script.write_text(
             f"_BEHAVIOUR = {json.dumps(json.dumps(behaviour))}\n"
-            f"_MOLBLOCK = {json.dumps(_MOLBLOCK)}\n"
+            f"_FF_POSE = {json.dumps(_molblock(_FF_POSE_XYZ))}\n"
+            f"_ALIGN_POSE = {json.dumps(_molblock(_ALIGN_POSE_XYZ))}\n"
             f"{_FAKE_SCREENING}",
             encoding="utf-8",
         )
@@ -214,6 +225,12 @@ def _settings(repo: Path, target: _Target, **overrides: object) -> dict[str, obj
         "reference_ligand_path": str(target.reference),
         "batch_size": 64,
         "seed": 4_242,
+        # These tests drive the adapter against a one-line stub receptor and a
+        # fake engine, so pose repair and checking are switched off: they are
+        # exercised against a real protein in test_pose_quality.py.  Leaving the
+        # switch here also keeps it covered -- if the off-switch stopped working,
+        # this whole file would start needing a parsable receptor.
+        "pose_quality": {"enabled": False},
     }
     settings.update(overrides)
     return settings
@@ -279,8 +296,12 @@ def test_a_score_belongs_to_the_molecule_it_was_computed_for(
     # The engine's own view of what it was handed, checked against the answers.
     handed = _record(screener)["ligands"]
     assert [row["score"] for row in rows] == [float(len(item["smiles"])) for item in handed]
+    # The secondary is the rescore on the pose actually kept -- the aligned one,
+    # +0.25 in the fake -- not the force-field rescore at +0.5 that the same
+    # score.csv also carries.  A number describing a pose nobody exported would
+    # be the wrong number to report.
     assert [row["secondary_score"] for row in rows] == [
-        float(len(item["smiles"])) + 0.5 for item in handed
+        float(len(item["smiles"])) + 0.25 for item in handed
     ]
     assert len({item["smiles"] for item in handed}) == len(_SMILES)
 
@@ -357,24 +378,32 @@ def test_a_molecule_karmadock_returned_nothing_for_is_counted(
     assert metadata["unscored_count"] == 1
 
 
-def test_a_force_field_score_that_did_not_converge_is_absent_rather_than_nan(
+def test_a_rescore_that_did_not_converge_is_absent_rather_than_nan(
     tmp_path: Path, screener: Any
 ) -> None:
     """A NaN compares false against every threshold, so it filters silently."""
 
     target = _target(tmp_path)
-    rows, _parents, _metadata = _run(tmp_path, "nan", _settings(screener(nan_ff=[1]), target))
+    rows, _parents, _metadata = _run(tmp_path, "nan", _settings(screener(nan_aligned=[1]), target))
 
     assert [row["secondary_score"] is None for row in rows] == [False, True, False, False]
     # The primary score is untouched: only the correction failed.
     assert all(row["score"] is not None for row in rows)
 
 
-def test_poses_are_not_stored_unless_they_were_asked_for(
+def test_turning_pose_storage_off_leaves_the_column_empty(
     tmp_path: Path, screener: Any
 ) -> None:
+    """``keep_poses`` ships on, so the off state is the one worth pinning.
+
+    The off run also proves the engine stops *asking* for the corrected pose --
+    writing it out and then discarding it would cost the same and save nothing.
+    """
+
     target = _target(tmp_path)
-    quiet, _parents, _metadata = _run(tmp_path, "quiet", _settings(screener(), target))
+    quiet, _parents, _metadata = _run(
+        tmp_path, "quiet", _settings(screener(), target, keep_poses=False)
+    )
     kept, _parents, metadata = _run(
         tmp_path,
         "kept",
@@ -386,6 +415,32 @@ def test_poses_are_not_stored_unless_they_were_asked_for(
     assert metadata["pose_missing_count"] == 0
     assert "out_corrected" not in _record(screener)["calls"][0]
     assert "out_corrected" in _record(screener)["calls"][-1]
+
+
+def test_the_pose_kept_is_the_aligned_one_and_not_the_force_field_one(
+    tmp_path: Path, screener: Any
+) -> None:
+    """One call writes both, and only one of them is a usable structure.
+
+    ``_pred_ff_corrected.sdf`` is what the network predicted with ten MMFF
+    iterations applied, which does not undo it -- over a real shard its aromatic
+    rings sit up to 1.1 A out of plane.  ``_pred_align_corrected.sdf`` carries
+    the bond lengths, angles and rings of KarmaDock's own embedded conformer,
+    because the only things done to it are dihedral rotations and a rigid-body
+    fit.  Both files sit in the same directory under names one character apart,
+    so read the wrong one and nothing fails -- it just exports bad geometry.
+    """
+
+    target = _target(tmp_path)
+    rows, _parents, _metadata = _run(
+        tmp_path,
+        "aligned",
+        _settings(screener(), target, keep_poses=True, pose_score_threshold=0.0),
+    )
+
+    molblocks = [row["pose_molblock"] for row in rows]
+    assert all(_ALIGN_POSE_XYZ in block for block in molblocks)
+    assert not any(_FF_POSE_XYZ in block for block in molblocks)
 
 
 def test_splitting_the_work_does_not_move_a_score(tmp_path: Path, screener: Any) -> None:
@@ -546,7 +601,7 @@ def test_a_relative_checkout_is_rejected_by_configuration(tmp_path: Path) -> Non
 def test_the_engine_is_registered_without_a_conformer_binding() -> None:
     """It builds its own geometry, so binding the shared table would be a fiction."""
 
-    descriptor = create_builtin_registry().get("docking.karmadock@0.1.0").descriptor
+    descriptor = create_builtin_registry().get("docking.karmadock@0.3.0").descriptor
 
     assert descriptor.kind is PluginKind.DOCK
     assert descriptor.inputs == (PARENT_V1.id,)

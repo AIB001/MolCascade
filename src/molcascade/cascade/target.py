@@ -13,12 +13,34 @@ box is what reaches the stage config -- so a re-run needs the numbers, not the
 ligand file.  The receptor's PDBQT is derived with meeko once, cached by the
 receptor's digest, and can be replaced wholesale when meeko cannot cope.
 
-What is *not* derived is as deliberate as what is.  Protonation states,
-tautomers, cofactors, metals and missing loops decide the science.  The receptor
-is read, hashed and validated here; it is never edited.  ``meeko`` has a flag
-that deletes residues with missing atoms and this module does not pass it: a
-silently truncated protein is exactly the kind of change that never shows up in
-a score.
+The receptor itself is repaired first, before anything is derived from it, and
+that is a change of position worth stating plainly.  This module used to edit
+nothing, on the grounds that a silently truncated protein is exactly the kind of
+change that never shows up in a score.  The grounds were right and the policy
+did not achieve them: a deposition that stops a lysine at CB makes ``meeko``
+refuse to build a receptor at all, and the only documented way past that refusal
+is ``meeko``'s ``--allow_bad_res``, which does not relax the check -- it deletes
+the residue, backbone included.  On a 278-residue kinase that quietly removed
+twelve.  Refusing to edit the file did not prevent the truncation; it only moved
+it out of this module and out of the notes.
+
+So the receptor is now repaired by :mod:`molcascade.cascade.receptor` and the
+line is drawn somewhere it can actually be held: **every change is named in the
+notes, and nothing absent from the model is invented.**  Waters and
+co-crystallised matter are removed and side chains the crystallographer could
+not resolve are rebuilt -- the residue's identity is known and its rotamer is
+constrained by its neighbours -- while an unresolved loop is reported and left
+unresolved, because building nine residues from a template produces coordinates
+that look exactly as authoritative as measured ones and are not.  Metals stay.
+Protonation and tautomers are still not guessed here.  ``--allow_bad_res`` is
+still not passed, and now does not need to be.
+
+Repair happens here rather than inside the PDBQT derivation because the receptor
+has four consumers and not one: Uni-Dock reads the PDBQT, GNINA is handed the
+PDB directly, KarmaDock copies it, and PoseBusters computes its receptor field
+from it.  Fixing only the PDBQT would leave three of the four docking against a
+protein with holes in it -- one pocket, two descriptions, and a consensus
+between them that means nothing.
 """
 
 from __future__ import annotations
@@ -26,12 +48,20 @@ from __future__ import annotations
 import shutil
 import subprocess
 import sys
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
+from typing import Any
 
 from molcascade.backends.preflight import TARGET_SETTING_FLAGS
-from molcascade.cascade.models import BoxConfig, CascadeConfig, TargetConfig
+from molcascade.cascade.models import (
+    BoxConfig,
+    CascadeConfig,
+    ReceptorPreparation,
+    TargetConfig,
+)
+from molcascade.cascade.receptor import prepare_receptor_pdb
 from molcascade.errors import ConfigError
 from molcascade.plugins.registry import PluginRegistry
 
@@ -53,6 +83,11 @@ _MAX_STRUCTURE_BYTES = 256 * 1024 * 1024
 #: generous for meeko and short enough that a hang is reported rather than slept
 #: through.
 _PREPARE_TIMEOUT_SECONDS = 600.0
+
+#: How much of meeko's account of a failure travels in the error.  Enough for
+#: its summary and a readable length of the trace behind it, bounded so a
+#: pathological structure cannot put a megabyte of debug output in an audit log.
+_MEEKO_DETAIL_BUDGET = 4000
 
 _LIGAND_SUFFIXES = frozenset({".sdf", ".mol", ".mol2", ".pdb"})
 
@@ -129,6 +164,9 @@ def merge_target(
     pocket: Path | None = None,
     box: str | None = None,
     receptor_pdbqt: Path | None = None,
+    prepare_receptor: bool | None = None,
+    keep_waters: bool | None = None,
+    keep_heterogens: bool | None = None,
 ) -> TargetConfig | None:
     """Lay the run-time flags over whatever target the cascade already carried.
 
@@ -154,8 +192,17 @@ def merge_target(
             ),
             context={"flags": given},
         )
+    preparation = _merge_preparation(
+        base.preparation if base is not None else ReceptorPreparation(),
+        enabled=prepare_receptor,
+        keep_waters=keep_waters,
+        keep_heterogens=keep_heterogens,
+    )
     nothing_given = (
-        receptor is None and receptor_pdbqt is None and not given
+        receptor is None
+        and receptor_pdbqt is None
+        and not given
+        and preparation == ReceptorPreparation()
     )
     if base is None and nothing_given:
         return None
@@ -181,6 +228,7 @@ def merge_target(
             else (base.receptor_pdbqt_path if base is not None else None)
         ),
         "pocket_pdb_path": base.pocket_pdb_path if base is not None else None,
+        "preparation": preparation,
     }
     if receptor is not None and base is not None and receptor_path != base.receptor_path:
         # A different structure is a different target, and a digest pinned
@@ -209,6 +257,86 @@ def merge_target(
             context={"receptor_path": receptor_path},
         )
     return TargetConfig.model_validate(fields)
+
+
+#: Absolute, because every engine refuses a relative path, and unmistakable,
+#: because the point of these is to be reported rather than believed.  The
+#: counterpart of the library placeholders in :mod:`molcascade.cascade.library`,
+#: and for the same reason: a cascade is authored, validated and exported long
+#: before anyone chooses a protein, and the shape of the funnel is checkable
+#: either way.
+_PLACEHOLDER_PATHS: Mapping[str, str] = MappingProxyType(
+    {
+        "receptor_path": "/target-not-yet-chosen/receptor.pdb",
+        "receptor_pdbqt_path": "/target-not-yet-chosen/receptor.pdbqt",
+        "reference_ligand_path": "/target-not-yet-chosen/reference-ligand.sdf",
+        "pocket_pdb_path": "/target-not-yet-chosen/pocket.pdb",
+    }
+)
+
+#: A cube at the origin.  Any six numbers would do -- nothing reads them -- and
+#: these are the ones most obviously not measured from a protein.
+_PLACEHOLDER_BOX = BoxConfig(
+    center_x=0.0, center_y=0.0, center_z=0.0, size_x=20.0, size_y=20.0, size_z=20.0
+)
+
+
+def placeholder_target(
+    cascade: CascadeConfig,
+    *,
+    registry: PluginRegistry,
+) -> TargetConfig | None:
+    """A target that makes a receptor-less cascade compilable, or ``None``.
+
+    ``None`` when the cascade docks against nothing, so a cascade with no
+    docking tier is never handed a protein it will not open.
+
+    Fills exactly the fields the cascade's own engines declare as required, and
+    the box the model insists a site be named with.  Not the optional ones: a
+    placeholder ``pocket_pdb_path`` would move KarmaDock's method identity for a
+    file that does not exist, and the fewer fabricated values reach a stage the
+    closer the checked shape is to the one that will run.
+
+    Only ``validate`` asks for this, via ``allow_missing_target``.  A run
+    reaches :func:`~molcascade.backends.preflight.preflight_docking_target`
+    instead and is refused there, by name and with the flag that fixes it.
+    """
+
+    needed = docking_requirements(cascade, registry=registry)
+    if not needed:
+        return None
+    fields: dict[str, Any] = {
+        "name": "target-not-yet-chosen",
+        "box": _PLACEHOLDER_BOX,
+        "receptor_path": _PLACEHOLDER_PATHS["receptor_path"],
+    }
+    for name, value in _PLACEHOLDER_PATHS.items():
+        if name in needed:
+            fields[name] = value
+    return TargetConfig.model_validate(fields)
+
+
+def _merge_preparation(
+    base: ReceptorPreparation,
+    *,
+    enabled: bool | None,
+    keep_waters: bool | None,
+    keep_heterogens: bool | None,
+) -> ReceptorPreparation:
+    """Lay whichever preparation flags were passed over the cascade's own.
+
+    ``None`` for "not passed" rather than a default, so a cascade that turned
+    preparation off keeps it off through a run that says nothing about it.  The
+    flags are one-way -- each turns something on or off but cannot be spelled to
+    mean "whatever the cascade said" -- which is the ordinary shape for a CLI
+    override and the reason absence has to be a third value.
+    """
+
+    return ReceptorPreparation(
+        enabled=base.enabled if enabled is None else enabled,
+        keep_waters=base.keep_waters if keep_waters is None else keep_waters,
+        keep_heterogens=base.keep_heterogens if keep_heterogens is None else keep_heterogens,
+    )
 
 
 def docking_requirements(
@@ -285,7 +413,15 @@ def resolve_target(
         "pocket_path": target.pocket_path,
         "receptor_pdbqt_path": target.receptor_pdbqt_path,
         "pocket_pdb_path": target.pocket_pdb_path,
+        "preparation": target.preparation,
     }
+
+    # First, before the box is derived from anything and long before meeko is
+    # asked to read the structure.  Every later step and every engine reads
+    # whatever this leaves in ``receptor_path``, which is the point: repairing
+    # it downstream would repair it for one consumer out of four.
+    if "receptor_path" in requirements and target.preparation.enabled:
+        _prepare_receptor(target, fields=fields, notes=notes, workspace=workspace)
 
     site_file = target.reference_ligand_path or target.pocket_path
     if "center_x" in requirements and target.box is None:
@@ -306,11 +442,79 @@ def resolve_target(
         notes.append(f"box checked against {Path(site_file).name}: the site is inside it")
 
     if "receptor_pdbqt_path" in requirements and target.receptor_pdbqt_path is None:
-        prepared, note = prepare_receptor_pdbqt(Path(target.receptor_path), workspace=workspace)
+        # ``fields`` rather than ``target``: preparation above rewrote the former
+        # and cannot rewrite the latter, a frozen model.  Reading the original
+        # here would hand meeko the unrepaired structure while the three engines
+        # that read ``receptor_path`` got the repaired one -- one pocket, two
+        # descriptions, and the repair silently doing nothing for Uni-Dock.
+        source = Path(str(fields["receptor_path"]))
+        prepared, note = prepare_receptor_pdbqt(source, workspace=workspace)
         fields["receptor_pdbqt_path"] = str(prepared)
         notes.append(note)
 
     return ResolvedTarget(target=TargetConfig.model_validate(fields), notes=tuple(notes))
+
+
+def _prepare_receptor(
+    target: TargetConfig,
+    *,
+    fields: dict[str, object],
+    notes: list[str],
+    workspace: Path,
+) -> None:
+    """Repair the receptor and re-point the target at the repaired file.
+
+    The digest needs care, because it means two different things at the two ends
+    of this function.  A ``receptor_sha256`` the operator wrote is a pin on *the
+    file they named*, so it is checked against that file and a mismatch stops
+    the run before anything is repaired -- verifying it against the prepared
+    structure instead would fail every pin the moment preparation was switched
+    on, for the one reason that is not an error.  What the workers need is the
+    opposite: the digest of the bytes they will actually dock, or
+    ``verified_receptor`` would reject the prepared file as an impostor.  So the
+    field is re-stated afterwards, and both digests go into the notes, which is
+    what keeps the chain from the operator's file to the docked one legible.
+    """
+
+    from molcascade.plugins.builtin.docking.common import structure_digest
+
+    source = Path(target.receptor_path)
+    _, before = structure_digest(
+        str(source),
+        code="DOCKING_RECEPTOR_UNREADABLE",
+        hint="The receptor is read here so a run cannot find it unreadable three tiers deep.",
+        limit_bytes=_MAX_STRUCTURE_BYTES,
+    )
+    if target.receptor_sha256 is not None and target.receptor_sha256 != before:
+        raise ConfigError(
+            f"{source.name} is not the receptor this cascade pinned",
+            code="DOCKING_RECEPTOR_DIGEST_MISMATCH",
+            hint=(
+                "receptor_sha256 pins a docking run to bytes rather than to a path, "
+                "and these bytes are not those. Point the target at the structure "
+                "the pin was taken from, or clear the pin if the structure has "
+                "deliberately changed -- and re-run, because scores taken against "
+                "two receptors are not comparable."
+            ),
+            context={
+                "receptor_path": str(source),
+                "expected_sha256": target.receptor_sha256,
+                "actual_sha256": before,
+            },
+        )
+
+    prepared, report = prepare_receptor_pdb(source, options=target.preparation, workspace=workspace)
+    _, after = structure_digest(
+        str(prepared),
+        code="DOCKING_RECEPTOR_UNREADABLE",
+        hint="The prepared receptor is hashed so the workers verify the bytes they dock.",
+        limit_bytes=_MAX_STRUCTURE_BYTES,
+    )
+    fields["receptor_path"] = str(prepared)
+    fields["receptor_sha256"] = after
+    notes.append(f"receptor read from {source.name} (sha256 {before[:12]})")
+    notes.extend(report.notes())
+    notes.append(f"docking uses {prepared.name} (sha256 {after[:12]})")
 
 
 def _require_site_agreement(box: BoxConfig, site: Path) -> None:
@@ -569,7 +773,7 @@ def prepare_receptor_pdbqt(receptor: Path, *, workspace: Path) -> tuple[Path, st
     )
     if completed.returncode != 0 or not destination.exists():
         destination.unlink(missing_ok=True)
-        detail = (completed.stderr or completed.stdout).decode("utf-8", "replace").strip()
+        detail = _meeko_failure_detail(completed)
         raise ConfigError(
             f"meeko could not prepare {receptor.name} as a PDBQT receptor",
             code="DOCKING_RECEPTOR_PREPARATION_FAILED",
@@ -583,10 +787,35 @@ def prepare_receptor_pdbqt(receptor: Path, *, workspace: Path) -> tuple[Path, st
             context={
                 "receptor_path": str(receptor),
                 "returncode": completed.returncode,
-                "meeko_output": detail[-4000:],
+                "meeko_output": detail,
             },
         )
     return destination, f"receptor PDBQT derived with meeko from sha256:{digest}"
+
+
+def _meeko_failure_detail(completed: subprocess.CompletedProcess[bytes]) -> str:
+    """Both of meeko's streams, with the half an operator can act on first.
+
+    meeko splits a receptor failure across the two.  stderr gets the
+    residue-by-residue template-matching trace, thousands of lines of it on a
+    real protein; stdout gets the few hundred characters that name which
+    residues failed, which carry an alternate location, and the flags that get
+    past each.  Keeping one stream therefore drops half the failure, and this
+    kept the wrong half: ``stderr or stdout`` never reaches stdout, because a
+    meeko that failed always wrote a trace.  Keeping the *tail* of the pair
+    drops the same half again, since the summary is what a program prints last.
+
+    So stdout leads and is budgeted first, and stderr takes what is left of it
+    from its end -- the end of a trace being the part nearest the failure.
+    """
+
+    summary = completed.stdout.decode("utf-8", "replace").strip()[:_MEEKO_DETAIL_BUDGET]
+    remaining = _MEEKO_DETAIL_BUDGET - len(summary)
+    trace = completed.stderr.decode("utf-8", "replace").strip()
+    trace = trace[-remaining:] if remaining > 0 else ""
+    if summary and trace:
+        return f"{summary}\n\n--- meeko trace (tail) ---\n{trace}"
+    return summary or trace
 
 
 def _meeko_command() -> list[str]:

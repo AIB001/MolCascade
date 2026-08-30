@@ -27,6 +27,14 @@ them would turn a preflight into a reason a working run refuses to start.
 
 Nothing here installs anything either.  MolCascade does not run pip; it reports
 what is missing and the exact command a human can decide to run.
+
+:func:`preflight_engine_paths` is the same idea for the software that is *not*
+a package.  Where an out-of-process engine is installed is a fact about a
+machine, so a portable cascade leaves it out and three things answer in turn --
+the config, ``MOLCASCADE_<ENGINE>_<FIELD>``, and the layout
+``envs/bootstrap.sh`` creates.  That resolution happens in config validation,
+where it can supply a value but must not fail; deciding whether the answer is
+really there belongs here, on the host, once, before any molecule is read.
 """
 
 from __future__ import annotations
@@ -51,6 +59,7 @@ from molcascade.backends.models import (
 )
 from molcascade.backends.registry import probe_backend
 from molcascade.errors import ConfigError, PluginError
+from molcascade.plugins.builtin._machine_paths import environment_key
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from molcascade.config.models import StageConfig
@@ -135,6 +144,28 @@ def copyleft_backends(
     return tuple(found)
 
 
+def _supplying_variable(spec: BackendSpec, key: str, configured: str) -> str | None:
+    """Name the environment variable this path came from, if it came from one.
+
+    An engine path may be answered once per machine by
+    ``MOLCASCADE_<ENGINE>_<FIELD>`` instead of being written into every cascade,
+    which means the path in a failure below can be one the operator will not find
+    anywhere in the file they are reading.  Saying where it came from is the
+    difference between a fixable message and a confusing one.
+
+    Claimed only when the variable's value *is* the configured value, so there is
+    nothing to get wrong: a backend whose id does not match the config model's
+    engine id simply has no variable to find, and this says nothing rather than
+    something untrue.
+    """
+
+    variable = environment_key(spec.id, key)
+    supplied = os.environ.get(variable, "").strip()
+    if not supplied:
+        return None
+    return variable if str(Path(supplied).expanduser()) == configured.strip() else None
+
+
 def _isolated_status(
     spec: BackendSpec,
     config: Mapping[str, object],
@@ -167,11 +198,17 @@ def _isolated_status(
         )
     path = Path(configured).expanduser()
     evidence["executable"] = str(path)
+    variable = _supplying_variable(spec, key, str(path))
+    origin = f" (from {variable})" if variable else ""
+    if variable:
+        evidence["environment_variable"] = variable
     if not path.is_absolute():
         return BackendStatus(
             spec=spec,
             availability=Availability.UNAVAILABLE,
-            reason=f"'{key}' must be an absolute path, not a command name to resolve on PATH",
+            reason=(
+                f"'{key}' must be an absolute path, not a command name to resolve on PATH{origin}"
+            ),
             evidence=evidence,
         )
     try:
@@ -180,22 +217,49 @@ def _isolated_status(
         return BackendStatus(
             spec=spec,
             availability=Availability.UNAVAILABLE,
-            reason=f"nothing exists at the configured '{key}': {path}",
+            reason=f"nothing exists at the configured '{key}': {path}{origin}",
             evidence=evidence,
         )
     if not stat.S_ISREG(info.st_mode) or not os.access(path, os.X_OK):
         return BackendStatus(
             spec=spec,
             availability=Availability.UNAVAILABLE,
-            reason=f"the configured '{key}' is not an executable file: {path}",
+            reason=f"the configured '{key}' is not an executable file: {path}{origin}",
             evidence=evidence,
         )
     return BackendStatus(
         spec=spec,
         availability=Availability.AVAILABLE,
-        reason="isolated executable found at the configured path",
+        reason=f"isolated executable found at the configured path{origin}",
         evidence=evidence,
     )
+
+
+def _missing_data_file(
+    spec: BackendSpec,
+    config: Mapping[str, object],
+) -> BackendStatus | None:
+    """Fail a stage now if it names a data file that is not there.
+
+    See :attr:`BackendSpec.data_file_config_keys` for why this cannot live in
+    the config validator.  Blank and absent are both left alone: whether a
+    missing value is legal is the plugin's judgement, not this module's.
+    """
+
+    for key in spec.data_file_config_keys:
+        configured = config.get(key)
+        if not isinstance(configured, str) or not configured.strip():
+            continue
+        path = Path(configured.strip()).expanduser()
+        if path.is_file():
+            continue
+        return BackendStatus(
+            spec=spec,
+            availability=Availability.UNAVAILABLE,
+            reason=f"nothing readable at the configured '{key}': {path}",
+            evidence={"config_key": key, "path": str(path)},
+        )
+    return None
 
 
 def _install_command(missing: Sequence[BackendSpec]) -> str | None:
@@ -248,6 +312,11 @@ def preflight_backends(
     missing: list[BackendSpec] = []
     blocked: list[BackendSpec] = []
     configs = {stage.stage_id: stage.config for stage in stages}
+    # Backends whose only problem is a data file the stage named and nobody put
+    # there.  Kept apart from the rest because the remedies do not overlap: no
+    # pip install produces someone's lead set, and telling them to run one sends
+    # them to fix an installation that is already correct.
+    data_file_gaps: set[str] = set()
     for stage_id, spec in required_backends(stages):
         status = probe_backend(spec, selected_policy)
         if (
@@ -258,6 +327,16 @@ def preflight_backends(
             # A licence or platform refusal stands whatever the stage says; only
             # the "is it installed" half of the verdict moves off PATH.
             status = _isolated_status(spec, configs.get(stage_id, {}))
+        if spec.data_file_config_keys and status.availability in (
+            Availability.AVAILABLE,
+            Availability.DEGRADED,
+        ):
+            # Only when the backend itself is otherwise fine, so that a genuinely
+            # uninstalled package keeps its own diagnosis and its pip command.
+            gap = _missing_data_file(spec, configs.get(stage_id, {}))
+            if gap is not None:
+                status = gap
+                data_file_gaps.add(spec.id)
         if status.availability in (Availability.AVAILABLE, Availability.DEGRADED):
             if spec.id not in ready:
                 ready.append(spec.id)
@@ -279,12 +358,22 @@ def preflight_backends(
         # install their way out of it sends them to fix something that is not
         # broken.  These are separated out of both instructions below.
         refused = {spec.id for spec in blocked}
-        installable = [spec for spec in missing if spec.id not in refused]
+        installable = [
+            spec for spec in missing if spec.id not in refused and spec.id not in data_file_gaps
+        ]
         command = _install_command(installable)
         if command:
             hint = f"{command}; {hint}"
         if not installable:
             hint = "Removing the block from the cascade is the other way out."
+        if data_file_gaps:
+            note = (
+                "Point the stage at a file that exists, or remove the block: "
+                "that is a path in the cascade, not a missing installation."
+            )
+            # Keep the pip command when something really is uninstalled too;
+            # replace the install advice outright when nothing is.
+            hint = f"{note} {hint}" if installable else note
         if blocked:
             names = ", ".join(
                 f"{spec.display_name} ({spec.license_spdx})" for spec in blocked
@@ -341,6 +430,156 @@ _SITE_FORMS = (
     "becomes the box), --pocket POCKET.pdb (the residues lining it), or "
     "--box cx,cy,cz,sx,sy,sz (the six numbers directly)"
 )
+
+#: What to type when a cascade carries no target.  Shared by the run-time
+#: refusal below and by ``validate``, which reports the same gap without failing
+#: -- one sentence, so the two can never come to describe different flags.
+TARGET_RUN_TIME_HINT = (
+    f"Pass '--receptor RECEPTOR.pdb' together with one binding-site definition: {_SITE_FORMS}."
+)
+
+
+def _installed_paths(plugin: object) -> tuple[Any, ...]:
+    """What one plugin needs installed on this machine, or nothing.
+
+    A config model that declares ``installed_paths`` is a model whose adapter
+    calls out to software living somewhere else.  Asking the model rather than
+    consulting a table here means an out-of-tree plugin participates for free,
+    and means the places worth looking are declared next to the field they fill
+    instead of in a registry that can fall behind it.
+    """
+
+    model = getattr(plugin, "config_model", None)
+    declared = getattr(model, "installed_paths", None)
+    if not callable(declared):
+        return ()
+    try:
+        paths = declared()
+    except Exception:  # pragma: no cover - a plugin's own bug, not a run's
+        return ()
+    return tuple(paths) if isinstance(paths, Sequence) else ()
+
+
+def _path_gap(spec: Any, configured: object) -> str | None:
+    """Say what is wrong with one installation path, or ``None`` if nothing is.
+
+    Blank is the interesting case and it is reported first, because it is the
+    one an operator arrives at by doing everything right: the builder cannot
+    know where an engine lives on a machine it is not running on, so it leaves
+    the box empty, and this is where that empty box is answered for.
+    """
+
+    searched = ", ".join(str(candidate) for candidate in spec.candidates)
+    if not isinstance(configured, str) or not configured.strip():
+        looked = f" Looked in: {searched}." if searched else ""
+        return (
+            f"{spec.label} was not found on this machine, and the cascade does not "
+            f"name it ('{spec.field}' is blank).{looked}"
+        )
+    path = Path(configured.strip()).expanduser()
+    if not path.exists():
+        return f"nothing exists at the configured '{spec.field}': {path}"
+    if spec.kind == "directory":
+        if not path.is_dir():
+            return f"the configured '{spec.field}' is not a directory: {path}"
+        absent = [item for item in spec.contents if not (path / item).exists()]
+        if absent:
+            return f"{path} is not a complete {spec.label}: it is missing {', '.join(absent)}"
+        return None
+    if not path.is_file():
+        return f"the configured '{spec.field}' is not a regular file: {path}"
+    if spec.kind == "executable" and not os.access(path, os.X_OK):
+        return f"the configured '{spec.field}' is not executable by this user: {path}"
+    return None
+
+
+def preflight_engine_paths(
+    stages: Sequence[CompiledStage],
+    *,
+    registry: PluginRegistry,
+) -> tuple[str, ...]:
+    """Settle where every out-of-process engine is installed, before the run starts.
+
+    A cascade is authored in a browser and run somewhere else, so the machine
+    paths in it are the one thing the authoring machine cannot fill in.  Leaving
+    them blank is therefore correct, and this is where blank stops being an open
+    question: by the time a stage is compiled, the path has been supplied by the
+    config, by ``MOLCASCADE_<ENGINE>_<FIELD>`` or by looking where
+    ``envs/bootstrap.sh`` puts things -- and if none of those answered, the run
+    refuses here rather than at the docking tier some hours in.
+
+    Every gap is reported at once, with what was searched and the command that
+    provisions it.  One at a time would turn setting a machine up into an
+    install-restart-install loop, which is the same delay the check removes.
+
+    Returns the ids of the stages whose installation it confirmed.
+    """
+
+    checked: list[str] = []
+    problems: list[str] = []
+    remedies: list[str] = []
+    gaps: list[JsonValue] = []
+    for stage in stages:
+        try:
+            plugin = registry.entry(stage.plugin_key).plugin
+        except Exception:
+            # An unregistered plugin is the compiler's problem to report, and
+            # guessing at its requirements here would turn a preflight into a
+            # reason a working run refuses to start.
+            continue
+        specs = _installed_paths(plugin)
+        if not specs:
+            continue
+        # Reached the same way as in ``_installed_paths``: the protocol a plugin
+        # satisfies does not promise a config model, so asking for one directly
+        # would be a type error waiting on an out-of-tree plugin to prove it.
+        model = getattr(plugin, "config_model", None)
+        engine_id = str(getattr(model, "engine_id", "") or "")
+        stage_ok = True
+        for spec in specs:
+            gap = _path_gap(spec, stage.config.get(spec.field))
+            if gap is None:
+                continue
+            stage_ok = False
+            problems.append(f"  {stage.stage_id}: {gap}")
+            variable = spec.variable(engine_id) if engine_id else ""
+            if variable:
+                problems.append(
+                    f"      answer it once for this machine: export {variable}=/path/to/it"
+                )
+            if spec.remedy and spec.remedy not in remedies:
+                remedies.append(spec.remedy)
+            if spec.note:
+                problems.append(f"      {spec.note}")
+            gaps.append(
+                {
+                    "stage": stage.stage_id,
+                    "field": str(spec.field),
+                    "variable": variable,
+                    "remedy": str(spec.remedy),
+                }
+            )
+        if stage_ok:
+            checked.append(stage.stage_id)
+
+    if problems:
+        detail = "\n".join(problems)
+        hint = (
+            "These are installation paths, not screening settings, so they do not "
+            "belong in the cascade: export the variables above once on this machine "
+            "and the same cascade.json runs here unchanged."
+        )
+        if remedies:
+            installer = "; ".join(remedies)
+            hint = f"Not installed yet? Run: {installer}. {hint}"
+        raise ConfigError(
+            f"{len(gaps)} installation path(s) this run needs are not resolved on "
+            f"this machine:\n{detail}",
+            code="ENGINE_PATH_UNRESOLVED",
+            hint=hint,
+            context={"gaps": gaps},
+        )
+    return tuple(checked)
 
 
 def _docking_config_model(plugin: object) -> type[Any] | None:
@@ -416,10 +655,7 @@ def preflight_docking_target(
             raise ConfigError(
                 f"stage {stage.id!r} docks against a protein and this run was not given one",
                 code="DOCKING_TARGET_RECEPTOR_REQUIRED",
-                hint=(
-                    "Pass '--receptor RECEPTOR.pdb' together with one binding-site "
-                    f"definition: {_SITE_FORMS}."
-                ),
+                hint=TARGET_RUN_TIME_HINT,
                 context={"stage": stage.id, "plugin": stage.plugin},
             )
         if missing:
@@ -479,9 +715,11 @@ def preflight_docking_target(
 
 
 __all__ = [
+    "TARGET_RUN_TIME_HINT",
     "TARGET_SETTING_FLAGS",
     "copyleft_backends",
     "preflight_backends",
     "preflight_docking_target",
+    "preflight_engine_paths",
     "required_backends",
 ]

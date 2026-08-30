@@ -40,7 +40,46 @@ class ThresholdField:
     step: float | None = None
     choices: tuple[tuple[str, str], ...] = ()
     nullable: bool = False
+    #: The cascade cannot run without a value here, even though the plugin's own
+    #: field accepts ``None``.
+    #:
+    #: ``nullable=False`` already means "required", and covers every engine path
+    #: in this catalogue.  This flag is for the other case: a field the plugin
+    #: makes optional because it has an in-config alternative the *builder* does
+    #: not offer.  ``reference_path`` is the one -- the plugin will also take
+    #: reference records embedded in the settings, but nothing in this UI writes
+    #: them, so leaving the box empty produces a criterion that cannot run.
+    required: bool = False
+    #: A machine-level environment variable that can supply this value instead.
+    #:
+    #: Where an engine is installed is a fact about a host, not about a campaign.
+    #: Naming the variable here lets the builder say so in the field's help, and
+    #: lets it leave the box empty -- without baking one host's paths into a
+    #: config meant to travel.
+    environment_variable: str | None = None
     help: str = ""
+
+    @property
+    def installed_path(self) -> bool:
+        """Whether this field says where software lives, not how to screen.
+
+        An installation path is a property of the host that will run the cascade,
+        and the builder is almost never open on that host.  So an empty box is
+        the portable answer rather than an omission, and the browser must not
+        block a download over one: :func:`preflight_engine_paths` settles the
+        path at run start -- from the config, from this variable, or from the
+        layout ``envs/bootstrap.sh`` creates -- and refuses there, naming the
+        command that installs it, if none of the three answered.
+
+        Declared by the presence of a variable rather than measured from the
+        environment.  The builder used to ask whether *this* shell exported the
+        path, which made the generated HTML a statement about the laptop it was
+        drawn on: a cascade assembled where nothing was installed could not be
+        downloaded at all, even when every engine was present on the machine
+        that would run it.
+        """
+
+        return self.environment_variable is not None
 
     def as_json(self) -> dict[str, Any]:
         return {
@@ -54,6 +93,9 @@ class ThresholdField:
             "step": self.step,
             "choices": [{"value": value, "label": label} for value, label in self.choices],
             "nullable": self.nullable,
+            "required": self.required,
+            "environment_variable": self.environment_variable,
+            "installed_path": self.installed_path,
             "help": self.help,
         }
 
@@ -1042,6 +1084,210 @@ CRITERIA: tuple[CriterionSpec, ...] = (
         ),
     ),
     CriterionSpec(
+        id="ring_topology",
+        label="Ring topology and rigidity",
+        question="Is the ring system a shape a drug could have?",
+        stage="physchem",
+        evidence="decision",
+        summary=(
+            "Editable caps on ring count, fused-system size, ring size, rotors, "
+            "ring-atom fraction, sp3 fraction and bridgeheads."
+        ),
+        options=(
+            BackendOption(
+                id="rdkit_ring_topology",
+                label="RDKit ring topology",
+                engine="RDKit",
+                summary=(
+                    "Counts the rings fused into the largest system -- the number "
+                    "medchem and Mordred do not report."
+                ),
+                plugin_ref="chemistry.rdkit_ring_topology_gate@0.1.0",
+                license_spdx="BSD-3-Clause",
+                citation=(
+                    "Lagorce D, Bouslama L, Becot J, Miteva MA, Villoutreix BO. "
+                    "FAF-Drugs4: free ADME-tox filtering computations for chemical "
+                    "biology and early stages drug discovery. Bioinformatics. "
+                    "2017;33(22):3658-3660. doi:10.1093/bioinformatics/btx491 (rings "
+                    "and ring-system size); Benigni R, Bossa C, Jeliazkova N, Netzeva "
+                    "T, Worth A. The Benigni/Bossa rulebase for mutagenicity and "
+                    "carcinogenicity. JRC Report EUR 23241 EN. 2008. "
+                    "doi:10.2788/60246 (fused polycyclic aromatics, SA_18); Shearer J, "
+                    "Castro JL, Lawson ADG, MacCoss M, Taylor RD. Rings in clinical "
+                    "trials and drugs: present and future. J Med Chem. "
+                    "2022;65(13):8699-8712. doi:10.1021/acs.jmedchem.2c00473 "
+                    "(ring systems in drugs)"
+                ),
+                notes=(
+                    "Aimed at three-dimensional generative libraries, where fused "
+                    "polycyclic sheets with no rotatable bond pass Lipinski, QED, "
+                    "PAINS and ADMET and then dock better than the flexible "
+                    "molecules around them -- a rigid surface makes many contacts "
+                    "and pays no entropy for it. Over one 2,000-molecule run here, "
+                    "molecules with four or more fused rings were 71.5% of the "
+                    "input and 83.3% of the final shortlist. The three defaults "
+                    "leave 30 of 33 approved drugs standing, costing only morphine, "
+                    "camptothecin and artemisinin. The rotor floor, ring-atom "
+                    "fraction, sp3 floor, bridgehead cap and all-systems fused "
+                    "total ship empty on purpose: "
+                    "each has a defensible use on a generated library and none has "
+                    "a threshold the literature will support against approved "
+                    "drugs, so a project that wants one sets it deliberately."
+                ),
+                # Ring perception plus seven RDKit descriptors, all graph-only:
+                # no conformer, no fingerprint. Comfortably faster than the
+                # property panel's 270 mol/s, which pays for Crippen and TPSA.
+                throughput_per_second=600,
+                recommended=True,
+                defaults={
+                    "schema_version": 1,
+                    # FAF-Drugs4's own drug-like values, chosen by its authors so
+                    # that up to 90% of 916 approved oral drugs pass. Taken
+                    # unchanged so the default strictness here is a published
+                    # calibration rather than a preference.
+                    "max_rings": 6,
+                    "max_ring_system_size": 18,
+                    # No filter to inherit from: nothing else counts rings within
+                    # a fused system. Toxtree flags three or more fused aromatic
+                    # rings; four is one step looser, which is what passes the
+                    # steroids.
+                    "max_fused_rings": 4,
+                },
+                thresholds=(
+                    ThresholdField(
+                        name="max_rings",
+                        label="Rings maximum",
+                        kind="integer",
+                        minimum=0,
+                        maximum=1_000,
+                        step=1,
+                        nullable=True,
+                        help=(
+                            "Total rings (SSSR). FAF-Drugs4 drug-like uses 6. "
+                            "Leave empty for no cap."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="max_fused_rings",
+                        label="Fused rings maximum",
+                        kind="integer",
+                        minimum=1,
+                        maximum=1_000,
+                        step=1,
+                        nullable=True,
+                        help=(
+                            "Rings fused into the largest single system, ignoring "
+                            "aromaticity. Pentacene is 5 and pyrene is 4; both are "
+                            "1 to medchem and Mordred. Spiro junctions do not "
+                            "count as fusion."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="max_fused_ring_total",
+                        label="Fused rings maximum, all systems",
+                        kind="integer",
+                        minimum=0,
+                        maximum=1_000,
+                        step=1,
+                        nullable=True,
+                        help=(
+                            "Rings summed over every fused system, so three "
+                            "separate naphthalenes total 6 while the largest is "
+                            "only 2. Empty by default; pair it with a tight "
+                            "fused-rings cap, e.g. 2 and 4 for 'at most two "
+                            "bicyclics'."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="max_ring_system_size",
+                        label="Fused system atoms maximum",
+                        kind="integer",
+                        unit="atoms",
+                        minimum=3,
+                        maximum=1_000,
+                        step=1,
+                        nullable=True,
+                        help=(
+                            "Heavy atoms in the largest fused system. A useful "
+                            "second opinion, but peri-fusion slips past it: pyrene "
+                            "packs 4 rings into 16 atoms."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="max_ring_size",
+                        label="Largest ring maximum",
+                        kind="integer",
+                        unit="atoms",
+                        minimum=3,
+                        maximum=1_000,
+                        step=1,
+                        nullable=True,
+                        help=(
+                            "Atoms in the largest single ring, for excluding "
+                            "macrocycles. 12 is the conventional threshold; "
+                            "erythromycin has a 14-membered ring. Empty by default."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="min_rotatable_bonds",
+                        label="Rotatable bonds minimum",
+                        kind="integer",
+                        minimum=0,
+                        maximum=1_000,
+                        step=1,
+                        nullable=True,
+                        help=(
+                            "A floor, not Veber's ceiling. Empty by default: a "
+                            "floor of 3 would reject caffeine, estradiol, morphine "
+                            "and olanzapine, which have none."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="max_ring_atom_fraction",
+                        label="Ring atom fraction maximum",
+                        minimum=0.0,
+                        maximum=1.0,
+                        step=0.05,
+                        nullable=True,
+                        help=(
+                            "Ring atoms over heavy atoms; 1.00 means no "
+                            "substituent chain at all. Empty by default: "
+                            "olanzapine is 0.91."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="min_fraction_csp3",
+                        label="Fraction sp3 carbon minimum",
+                        minimum=0.0,
+                        maximum=1.0,
+                        step=0.05,
+                        nullable=True,
+                        help=(
+                            "Escape-from-flatland saturation. Empty by default: "
+                            "Lovering's 0.36-0.47 are cohort means, and a floor of "
+                            "0.25 rejects imatinib at 0.24."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="max_bridgehead_atoms",
+                        label="Bridgehead atoms maximum",
+                        kind="integer",
+                        minimum=0,
+                        maximum=1_000,
+                        step=1,
+                        nullable=True,
+                        help=(
+                            "Atoms shared by three rings -- the signature of a "
+                            "cage. Empty by default: no citable threshold, and "
+                            "bridged bicyclics are ordinary chemistry."
+                        ),
+                    ),
+                    _BATCH,
+                ),
+            ),
+        ),
+    ),
+    CriterionSpec(
         id="drug_likeness",
         label="Rule of Five and QED",
         question="How many Lipinski violations does it have, and what is its QED?",
@@ -2018,6 +2264,7 @@ CRITERIA: tuple[CriterionSpec, ...] = (
                         name="executable",
                         label="aizynthcli path",
                         kind="text",
+                        environment_variable="MOLCASCADE_AIZYNTHFINDER_EXECUTABLE",
                         help=(
                             "Absolute path to aizynthcli inside the environment you "
                             "made for it. Not a bare command name: that environment is "
@@ -2028,6 +2275,7 @@ CRITERIA: tuple[CriterionSpec, ...] = (
                         name="config_path",
                         label="AiZynthFinder config file",
                         kind="text",
+                        environment_variable="MOLCASCADE_AIZYNTHFINDER_CONFIG_PATH",
                         help=(
                             "Absolute path to the YAML naming your expansion policy "
                             "and stock. Its bytes are hashed into the method identity, "
@@ -2250,7 +2498,7 @@ CRITERIA: tuple[CriterionSpec, ...] = (
                     "functions and the same box, thousands of ligands resident on the "
                     "card at once."
                 ),
-                plugin_ref="docking.unidock@0.1.0",
+                plugin_ref="docking.unidock@0.2.0",
                 gate_plugin="docking.numeric_evidence_gate@0.1.0",
                 license_spdx="Apache-2.0",
                 citation=(
@@ -2273,7 +2521,7 @@ CRITERIA: tuple[CriterionSpec, ...] = (
                     "search_mode": "balance",
                     "num_modes": 1,
                     "conformer_index": 0,
-                    "keep_poses": False,
+                    "keep_poses": True,
                     "max_molecules": 200_000,
                 },
                 gate_defaults={
@@ -2281,7 +2529,7 @@ CRITERIA: tuple[CriterionSpec, ...] = (
                     "engine_id": "unidock",
                     "expected_score_kind": "VINA_KCAL_MOL",
                     "expected_direction": "LOWER_STRONGER",
-                    "maximum": -7.0,
+                    "maximum": -9.5,
                 },
                 notes=(
                     "Linux and an NVIDIA card only: it has no CPU path and takes no "
@@ -2298,16 +2546,21 @@ CRITERIA: tuple[CriterionSpec, ...] = (
                     "it fails -- and the run stops there rather than three tiers in. "
                     "Pass '--receptor-pdbqt' with your own preparation when it cannot "
                     "cope.\n\n"
-                    "A Vina score is a ranking, not an affinity. -7 kcal/mol is a "
-                    "conventional screening cut, not a measurement, and the published "
-                    "correlation with experiment is weak enough that this belongs at "
-                    "the bottom of a funnel rather than at the top."
+                    "A Vina score is a ranking, not an affinity. The default of -9.5 "
+                    "kcal/mol is not the conventional -7: this tier sits below seven "
+                    "cheaper ones, so it is handed molecules that already look like "
+                    "drugs, and -7 then keeps most of what it is given -- measured at "
+                    "88% on a real library, which is a tier that costs GPU hours and "
+                    "decides almost nothing. Neither number is a measurement, and the "
+                    "published correlation with experiment is weak enough that this "
+                    "belongs at the bottom of a funnel rather than at the top."
                 ),
                 thresholds=(
                     ThresholdField(
                         name="executable",
                         label="unidock path",
                         kind="text",
+                        environment_variable="MOLCASCADE_UNIDOCK_EXECUTABLE",
                         help=(
                             "Absolute path to the binary. Not a bare command name: this "
                             "is a tool you installed, and the run records which one."
@@ -2360,9 +2613,10 @@ CRITERIA: tuple[CriterionSpec, ...] = (
                         label="Store the docked pose",
                         kind="boolean",
                         help=(
-                            "Off by default: 45,000 poses is a few hundred megabytes of "
-                            "molblock that nothing downstream reads unless someone asked "
-                            "for structures."
+                            "On by default, because 'molcascade trace' writes the kept "
+                            "poses as SDF and cannot recover them later. Turn it off for "
+                            "a scores-only screen: 45,000 poses is a few hundred "
+                            "megabytes of molblock."
                         ),
                     ),
                     ThresholdField(
@@ -2418,7 +2672,7 @@ CRITERIA: tuple[CriterionSpec, ...] = (
                     "which is why it is about fifty times faster than a Vina-family "
                     "engine."
                 ),
-                plugin_ref="docking.karmadock@0.1.0",
+                plugin_ref="docking.karmadock@0.3.0",
                 gate_plugin="docking.numeric_evidence_gate@0.1.0",
                 license_spdx="Apache-2.0",
                 citation=(
@@ -2437,7 +2691,7 @@ CRITERIA: tuple[CriterionSpec, ...] = (
                     "executable": "",
                     "repo_path": "",
                     "engine_batch_size": 64,
-                    "keep_poses": False,
+                    "keep_poses": True,
                     "max_molecules": 200_000,
                 },
                 gate_defaults={
@@ -2445,7 +2699,7 @@ CRITERIA: tuple[CriterionSpec, ...] = (
                     "engine_id": "karmadock",
                     "expected_score_kind": "KARMADOCK_MDN",
                     "expected_direction": "HIGHER_STRONGER",
-                    "minimum": 50.0,
+                    "minimum": 45.0,
                 },
                 notes=(
                     "Runs in an environment of its own, which you create once and "
@@ -2469,14 +2723,18 @@ CRITERIA: tuple[CriterionSpec, ...] = (
                     "together needs the ligand rather than six numbers alone.\n\n"
                     "The score is a unitless ranking from a mixture-density network, "
                     "higher being stronger. It is not kcal/mol and does not convert to "
-                    "one; the default of 50 is a starting point to calibrate against "
-                    "your own known actives, not a published cut."
+                    "one; the default of 45 is a starting point to calibrate against "
+                    "your own known actives, not a published cut. It is paired with "
+                    "Uni-Dock's -9.5 so that the two engines reject comparable shares "
+                    "of a tier: at 50 this one did nearly all of the filtering, which "
+                    "makes a two-engine tier an expensive way to ask one engine."
                 ),
                 thresholds=(
                     ThresholdField(
                         name="executable",
                         label="KarmaDock python path",
                         kind="text",
+                        environment_variable="MOLCASCADE_KARMADOCK_EXECUTABLE",
                         help=(
                             "Absolute path to the python inside KarmaDock's own "
                             "environment. Deliberately not this one's."
@@ -2486,6 +2744,7 @@ CRITERIA: tuple[CriterionSpec, ...] = (
                         name="repo_path",
                         label="KarmaDock checkout",
                         kind="text",
+                        environment_variable="MOLCASCADE_KARMADOCK_REPO_PATH",
                         help=(
                             "Absolute path to the checkout. Its utils/virtual_screening.py "
                             "is the entry point and its trained_models/ is where the "
@@ -2531,8 +2790,9 @@ CRITERIA: tuple[CriterionSpec, ...] = (
                         label="Store the repaired pose",
                         kind="boolean",
                         help=(
-                            "Off by default, as everywhere in this tier: nothing "
-                            "downstream reads a molblock unless structures were asked for."
+                            "On by default, as everywhere in this tier: 'molcascade "
+                            "trace' exports these as SDF, and a repaired pose that was "
+                            "discarded cannot be rebuilt from the score."
                         ),
                     ),
                     ThresholdField(
@@ -2583,7 +2843,7 @@ CRITERIA: tuple[CriterionSpec, ...] = (
                     "Vina-family search followed by a 3D convolutional network scoring "
                     "the resulting poses."
                 ),
-                plugin_ref="docking.gnina@0.1.0",
+                plugin_ref="docking.gnina@0.3.0",
                 gate_plugin="docking.numeric_evidence_gate@0.1.0",
                 license_spdx="GPL-2.0-or-later",
                 citation=(
@@ -2608,7 +2868,7 @@ CRITERIA: tuple[CriterionSpec, ...] = (
                     "rank_by": "cnn_affinity",
                     "num_modes": 1,
                     "conformer_index": 0,
-                    "keep_poses": False,
+                    "keep_poses": True,
                     "allow_cpu": False,
                     # Two orders of magnitude below the other two engines, for the
                     # same reason the throughput figure is: this is a shortlist
@@ -2652,6 +2912,7 @@ CRITERIA: tuple[CriterionSpec, ...] = (
                         name="executable",
                         label="gnina path",
                         kind="text",
+                        environment_variable="MOLCASCADE_GNINA_EXECUTABLE",
                         help=(
                             "Absolute path to the binary. MolCascade does not build or "
                             "install it."
@@ -2717,7 +2978,10 @@ CRITERIA: tuple[CriterionSpec, ...] = (
                         name="keep_poses",
                         label="Store the docked pose",
                         kind="boolean",
-                        help="Off by default; nothing downstream reads a molblock.",
+                        help=(
+                            "On by default; 'molcascade trace' exports the kept poses "
+                            "as SDF. Turn it off for a scores-only screen."
+                        ),
                     ),
                     ThresholdField(
                         name="allow_cpu",
@@ -2832,6 +3096,7 @@ CRITERIA: tuple[CriterionSpec, ...] = (
                         label="Reference lead file",
                         kind="text",
                         nullable=True,
+                        required=True,
                         help="Local CSV/TSV/SMI file holding the project's known actives.",
                     ),
                     ThresholdField(
@@ -2904,6 +3169,7 @@ CRITERIA: tuple[CriterionSpec, ...] = (
                         label="Reference lead file",
                         kind="text",
                         nullable=True,
+                        required=True,
                         help="Local CSV/TSV/SMI file holding the reference set.",
                     ),
                     ThresholdField(

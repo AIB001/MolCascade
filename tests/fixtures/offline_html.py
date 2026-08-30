@@ -14,6 +14,16 @@ thing as a harmless one there: an ``href``, a ``src``, a CSS ``url()`` or a
 ``fetch`` is a network request, and the rule "no URLs here" is worth more than
 any rule that tries to judge which ones are safe.
 
+The cascade builder's script does contain one ``fetch``, and it is inside that
+rule rather than an exception to it.  Its argument is the *relative* path the
+served render posts its export back to, so it resolves against the origin the
+document was loaded from and names no host; opened from a file there is no
+origin to resolve against, and the call is unreachable anyway, because the code
+guarded by ``payload.save_endpoint`` runs only when the served render put an
+endpoint there.  ``test_builder_serve.py`` asserts both halves of that -- the
+written document's endpoint is null and its ``connect-src`` is ``'none'`` --
+because "unreachable" is a claim about the payload, which this scan skips.
+
 *The embedded payload* is a JSON blob inside a ``<textarea>``, and it carries
 the citation for every backend the builder offers -- references that are close
 to useless without their DOI.  A URL there is a string that gets rendered as

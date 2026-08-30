@@ -2,13 +2,12 @@
 
 KarmaDock is the odd one in this tier and it is worth being precise about why.
 Uni-Dock and GNINA *search* for a pose inside a box the operator drew; KarmaDock
-*predicts* one with a graph network and then repairs it with a force field.  So
-it takes SMILES rather than conformers, generates its own geometry internally,
-and has no box at all -- which is why this adapter binds only ``parent/v1`` and
-why handing it the tier's shared conformer table would be recording that it used
-geometry it never read.
+*predicts* one with a graph network.  So it takes SMILES rather than conformers,
+generates its own geometry internally, and has no box at all -- which is why this
+adapter binds only ``parent/v1`` and why handing it the tier's shared conformer
+table would be recording that it used geometry it never read.
 
-Two consequences of its command line shape run through everything below.
+Three consequences of its command line shape run through everything below.
 
 It loads a Torch checkpoint and initialises CUDA once per invocation and then
 scores at roughly fifty molecules a second, so a shard is one call: splitting a
@@ -21,6 +20,10 @@ would litter their directory, and -- worse -- two shards on two GPUs would race
 to write the same derived file and one of them could read it half-written.  So
 each shard stages its own copy of the receptor in scratch and lets KarmaDock
 derive the pocket there.
+
+Finally, ``--out_corrected`` writes *two* poses per ligand rather than one and
+they are not interchangeable.  ``_POSE_SUFFIX`` below says which one this
+adapter reads and why the other one is not usable as a structure.
 """
 
 from __future__ import annotations
@@ -31,7 +34,7 @@ import shutil
 import tempfile
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -46,8 +49,12 @@ from molcascade.parallel import ShardOutcome, ShardTask, iter_shard_batches
 from molcascade.plugins.api import PendingOutput, StageContext, StageRequest, StageResponse
 from molcascade.plugins.builtin.docking.common import (
     DockingEngineConfig,
+    MachinePath,
     absolute_path,
+    backend_root,
+    conda_environment,
     enforce_population_cap,
+    engine_path,
     finite_number,
     population_size,
     require_gpu_lane,
@@ -57,6 +64,10 @@ from molcascade.plugins.builtin.docking.common import (
     structure_digest,
     validated_config,
     verified_receptor,
+)
+from molcascade.plugins.builtin.docking.pose_quality import (
+    apply_pose_quality,
+    pose_quality_metadata,
 )
 from molcascade.plugins.manifest import (
     Cardinality,
@@ -69,7 +80,14 @@ _PARENT_PATH = Path("datasets/parents/part-00000.parquet")
 _SCORE_PATH = Path("datasets/docking_scores/part-00000.parquet")
 _ENGINE = "KarmaDock"
 _ENGINE_ID = "karmadock"
-_IMPLEMENTATION_VERSION = 1
+# Bumped whenever a change here alters the numbers or the poses recorded, so the
+# `method_id` on every score row distinguishes them.  That is provenance only: it
+# is *not* in `stage_cache_key`, which hashes the descriptor and the config, so
+# bumping this alone leaves a warm cache serving the old results.  The descriptor
+# version has to move with it.  v2: read the align-corrected pose and its
+# matching score instead of the force-field-corrected pair.  v3: repair the pose
+# against the receptor and check it before the score row is written.
+_IMPLEMENTATION_VERSION = 3
 _SCORE_KIND = "KARMADOCK_MDN"
 
 # One call per shard, so the shard is as large as the default allows: the model
@@ -84,8 +102,19 @@ _SCRIPT = Path("utils") / "virtual_screening.py"
 #: a pose filename.  Six digits covers a shard several times over.
 _NAME_TEMPLATE = "lig-{index:06d}"
 
-#: What ``--out_corrected`` writes per ligand, force-field repaired.
-_POSE_SUFFIX = "_pred_ff_corrected.sdf"
+#: Which of the two poses ``--out_corrected`` writes per ligand is read back.
+#: ``_pred_ff_corrected.sdf`` is the network's raw coordinates given ten MMFF
+#: iterations, and ten is nowhere near enough: measured over a real shard its
+#: aromatic rings sit up to 1.1 A out of plane and its MMFF strain reaches six
+#: figures, because nothing constrains a graph network to bond lengths or to
+#: planarity.  ``_pred_align_corrected.sdf`` instead starts from KarmaDock's own
+#: ETKDG plus MMFF94s conformer and moves *that* onto the prediction using
+#: rotatable-bond dihedrals and a rigid-body fit -- neither of which can alter a
+#: bond length, an angle or a ring -- so it is a chemically sound structure by
+#: construction.  It pays for that in placement, being a clean conformer fitted
+#: to a distorted prediction, which is why the score reported alongside it is
+#: the one KarmaDock measured on this pose rather than on the raw prediction.
+_POSE_SUFFIX = "_pred_align_corrected.sdf"
 
 _EXECUTABLE_HINT = (
     "Set 'executable' to the absolute path of the python inside KarmaDock's own "
@@ -104,10 +133,54 @@ class KarmaDockConfig(DockingEngineConfig):
     cascade cannot hand this engine a search volume it silently drops.
     """
 
+    engine_id: ClassVar[str] = _ENGINE_ID
+
+    @classmethod
+    def installed_paths(cls) -> tuple[MachinePath, ...]:
+        """Two paths, because KarmaDock is a checkout as well as an environment.
+
+        Both are properties of the installation and neither changes between
+        campaigns, so both can be answered by the host.  The checkout is checked
+        by its contents rather than its name: an empty ``KarmaDock/`` is a
+        directory, and the failure it produces if the run starts anyway is
+        Torch's, several minutes in.  ``trained_models/karmadock_screening.pkl``
+        is committed to their repository, so the clone *is* the weight download
+        -- there is no separate fetch, and the preflight says so.
+        """
+
+        return (
+            MachinePath(
+                field="executable",
+                label="the python inside KarmaDock's own environment",
+                candidates=conda_environment(_ENGINE_ID, "bin/python"),
+                remedy="bash envs/bootstrap.sh karmadock",
+                note=(
+                    "It pins rdkit==2022.09.1 against this project's rdkit>=2024.9, "
+                    "so this is never this environment's interpreter."
+                ),
+            ),
+            MachinePath(
+                field="repo_path",
+                label="the KarmaDock checkout",
+                kind="directory",
+                candidates=(backend_root() / "KarmaDock",),
+                contents=(
+                    "utils/virtual_screening.py",
+                    "trained_models/karmadock_screening.pkl",
+                ),
+                remedy="bash envs/bootstrap.sh karmadock",
+                note=(
+                    "The checkpoint is committed to the repository, so cloning it is "
+                    "the whole download; there is no 'molcascade assets fetch' for it."
+                ),
+            ),
+        )
+
     #: The KarmaDock checkout. Its ``utils/virtual_screening.py`` is the entry
     #: point and its ``trained_models/`` is where the weights have to sit --
     #: the script has no flag for either, so both are found by location.
-    repo_path: str = Field(min_length=1, max_length=4096)
+    #: ``MOLCASCADE_KARMADOCK_REPO_PATH`` can supply it instead.
+    repo_path: str = Field(default="", max_length=4096)
 
     #: A ligand bound in the site, in mol2. KarmaDock reads only its
     #: coordinates: their centroid is the pocket centre and their extent is
@@ -131,10 +204,11 @@ class KarmaDockConfig(DockingEngineConfig):
     #: KarmaDock predicts one pose per ligand, so there is nothing to rank.
     num_modes: int = Field(default=1, ge=1, le=1)
 
-    #: Keep the repaired pose in the score row. Off by default for the same
-    #: reason as everywhere else in this tier: nothing downstream reads a
-    #: molblock unless someone asked for structures.
-    keep_poses: bool = False
+    #: Keep the corrected pose in the score row.  On by default for the same
+    #: reason as everywhere else in this tier: ``molcascade trace`` exports the
+    #: kept poses as SDF, and a run that discarded them has no way to say so
+    #: except by producing an empty file.
+    keep_poses: bool = True
 
     #: Only poses scoring at least this well are written at all. Ignored unless
     #: ``keep_poses`` is set, and zero means every ligand KarmaDock scored.
@@ -152,7 +226,7 @@ class KarmaDockConfig(DockingEngineConfig):
     @field_validator("repo_path")
     @classmethod
     def _repo_is_absolute(cls, value: str) -> str:
-        return absolute_path(value, field="repo_path")
+        return engine_path(value, field="repo_path", engine_id=cls.engine_id)
 
     @field_validator("reference_ligand_path")
     @classmethod
@@ -194,6 +268,7 @@ def _method_id(
             "pocket_id": pocket_id,
             "weights_id": weights_id,
             "seed": config.seed,
+            "pose_quality": config.pose_quality.identity(),
         }
     )
 
@@ -282,7 +357,13 @@ def _staged_receptor(config: KarmaDockConfig, scratch: Path) -> Path:
 
 
 def _read_scores(path: Path) -> dict[str, tuple[float, float | None]]:
-    """Read ``score.csv`` back as ``name -> (score, force-field rescore)``.
+    """Read ``score.csv`` back as ``name -> (score, rescore of the kept pose)``.
+
+    KarmaDock writes three columns: the score on its raw prediction, and that
+    score recomputed on each of the two corrected poses.  The primary is the
+    prediction, which is what the gate compares; the secondary is deliberately
+    the one measured on ``_POSE_SUFFIX``, so the number recorded and the
+    structure exported describe the same geometry.
 
     A ligand KarmaDock could not build a graph for is absent from this file
     rather than present with a null, so a missing key is the normal way a
@@ -298,12 +379,12 @@ def _read_scores(path: Path) -> dict[str, tuple[float, float | None]]:
             primary = finite_number(row.get("karma_score"))
             if not name or primary is None:
                 continue
-            scores[name] = (primary, finite_number(row.get("karma_score_ff")))
+            scores[name] = (primary, finite_number(row.get("karma_score_aligned")))
     return scores
 
 
 def _pose_molblock(directory: Path, name: str) -> str | None:
-    """Read one repaired pose back, or record that it could not be."""
+    """Read one corrected pose back, or record that it could not be."""
 
     from rdkit import Chem
 
@@ -377,7 +458,10 @@ def _dock_shard(
             "--score_threshold",
             repr(float(config.pose_score_threshold)),
         ]
-        if config.keep_poses:
+        # The checker needs the same file the operator would keep, so either
+        # request produces it.  Nulling the column afterwards is cheap; docking
+        # a shard again because the geometry was never written is not.
+        if config.keep_poses or config.pose_quality.enabled:
             command.append("--out_corrected")
 
         run_engine(
@@ -396,8 +480,9 @@ def _dock_shard(
             if found is None:
                 continue
             score, secondary = found
-            molblock = _pose_molblock(output_dir, name) if config.keep_poses else None
-            if config.keep_poses and molblock is None:
+            wants_pose = config.keep_poses or config.pose_quality.enabled
+            molblock = _pose_molblock(output_dir, name) if wants_pose else None
+            if wants_pose and molblock is None:
                 poses_missing += 1
             rows.append(
                 {
@@ -477,6 +562,17 @@ def _run_shard(task: ShardTask) -> ShardOutcome:
             method_id=method_id,
         )
 
+    # Repair and judge before the rows are written, so what lands in the score
+    # table is what passed.  A discarded pose leaves the molecule with no score,
+    # which the tier's evidence gate already treats as missing -- the funnel
+    # shows the drop and `pose_check_failed__*` names the check responsible.
+    rows, pose_report = apply_pose_quality(
+        rows,
+        config=config.pose_quality,
+        receptor_path=config.receptor_path,
+        keep_poses=config.keep_poses,
+    )
+
     with pq.ParquetWriter(
         task.output_paths["scores"], DOCKING_SCORE_V1.schema, compression="zstd"
     ) as score_writer:
@@ -493,6 +589,7 @@ def _run_shard(task: ShardTask) -> ShardOutcome:
             "pose_missing_count": poses_missing,
             "receptor_id": receptor_id,
             "method_id": method_id,
+            **pose_report.metadata(),
         },
     )
 
@@ -531,7 +628,14 @@ class KarmaDockPlugin:
 
     descriptor = PluginDescriptor(
         id="docking.karmadock",
-        version="0.1.0",
+        # 0.2.0 reads the align-corrected pose rather than the force-field one.
+        # `stage_cache_key` hashes this descriptor and the stage config, and the
+        # change was to neither, so without the bump every workspace with a warm
+        # cache would go on serving the distorted geometry forever.  It also
+        # renames the registry key, which is the point: a config pinning
+        # `@0.1.0` should fail to resolve rather than quietly get different
+        # structures from the ones it was written against.
+        version="0.3.0",
         kind=PluginKind.DOCK,
         inputs=(PARENT_V1.id,),
         outputs=(PARENT_V1.id, DOCKING_SCORE_V1.id),
@@ -623,6 +727,7 @@ class KarmaDockPlugin:
                 "unscored_count": result.total("unscored_count"),
                 "unusable_smiles_count": result.total("unusable_smiles_count"),
                 "pose_missing_count": result.total("pose_missing_count"),
+                **pose_quality_metadata(result.total, config=config.pose_quality),
                 **result.response_metadata(),
             },
         )

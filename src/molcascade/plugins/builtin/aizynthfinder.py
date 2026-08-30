@@ -60,11 +60,11 @@ import stat
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-from pydantic import Field, ValidationError, field_validator
+from pydantic import Field, ValidationError, field_validator, model_validator
 
 from molcascade.chemistry.datasets import iter_contract_batches, require_single_input
 from molcascade.config.canonical import canonical_json, canonical_sha256
@@ -72,6 +72,14 @@ from molcascade.config.models import StrictFrozenModel
 from molcascade.contracts import PARENT_V1, SYNTHESIS_SCORE_V1
 from molcascade.errors import PluginError
 from molcascade.plugins.api import PendingOutput, StageContext, StageRequest, StageResponse
+from molcascade.plugins.builtin._machine_paths import (
+    MachinePath,
+    absolute_path,
+    backend_root,
+    conda_environment,
+    engine_path,
+    fill_machine_paths,
+)
 from molcascade.plugins.manifest import (
     Cardinality,
     Determinism,
@@ -117,13 +125,6 @@ _UNSOLVED_WARNINGS: tuple[str, ...] = ("ROUTE_NOT_FOUND",)
 _UNPINNED_WARNING = "ROUTE_BACKEND_VERSION_UNPINNED"
 
 
-def _absolute_path(value: str, *, field: str) -> str:
-    candidate = Path(value.strip()).expanduser()
-    if not value.strip() or not candidate.is_absolute():
-        raise ValueError(f"{field} must be an absolute path")
-    return str(candidate)
-
-
 def _valid_names(value: tuple[str, ...], *, field: str) -> tuple[str, ...]:
     for name in value:
         if not name or name != name.strip() or name.startswith("-") or " " in name:
@@ -135,17 +136,65 @@ class AiZynthFinderConfig(StrictFrozenModel):
     schema_version: int = Field(default=1, ge=1, le=1)
     batch_size: int = Field(default=16_384, ge=1, le=250_000)
 
+    #: Which engine's environment overrides apply, giving the two paths below
+    #: ``MOLCASCADE_AIZYNTHFINDER_EXECUTABLE`` and
+    #: ``MOLCASCADE_AIZYNTHFINDER_CONFIG_PATH``.  See
+    #: :mod:`molcascade.plugins.builtin._machine_paths`.
+    engine_id: ClassVar[str] = "aizynthfinder"
+
+    @classmethod
+    def installed_paths(cls) -> tuple[MachinePath, ...]:
+        """An interpreter's neighbour and a 750 MB download, found where they land.
+
+        The public data is the interesting one: it is a genuine weight-and-stock
+        download rather than an installation, and it is not a MolCascade asset --
+        AiZynthFinder resolves the policy and stock files itself, relative to
+        this YAML, so a copy fetched into the asset store would never be read.
+        Which makes the remedy below the download instruction, not a path hint.
+        """
+
+        data = os.environ.get("MOLCASCADE_AIZYNTH_DATA", "").strip()
+        data_root = Path(data).expanduser() if data else Path.home() / "aizynth-data"
+        return (
+            MachinePath(
+                field="executable",
+                label="the aizynthcli inside AiZynthFinder's own environment",
+                candidates=conda_environment("aizynth", "bin/aizynthcli"),
+                remedy="bash envs/bootstrap.sh aizynth",
+            ),
+            MachinePath(
+                field="config_path",
+                label="the AiZynthFinder configuration naming its policy and stock",
+                kind="file",
+                candidates=(
+                    data_root / "config.yml",
+                    backend_root() / "aizynth-data" / "config.yml",
+                ),
+                remedy="bash envs/bootstrap.sh aizynth",
+                note=(
+                    "That step downloads about 750 MB of expansion policy and stock; "
+                    "the configuration is written beside it and points at it by "
+                    "relative path, so the two move together."
+                ),
+            ),
+        )
+
     #: Absolute path to ``aizynthcli`` inside the isolated environment, for
     #: example ``/home/you/miniforge3/envs/aizynth/bin/aizynthcli``.  Not a bare
     #: name: the environment this adapter calls into must not be on this
     #: process's ``PATH``, because the dependency conflict is the whole reason
     #: it exists somewhere else.
-    executable: str = Field(min_length=1, max_length=4096)
+    #:
+    #: Defaulted to empty rather than left required so that the environment or
+    #: the host layout can answer it; blank with nothing found is still refused,
+    #: by ``preflight_engine_paths``, at the start of the run.
+    executable: str = Field(default="", max_length=4096)
 
     #: Absolute path to the AiZynthFinder YAML that names the expansion policy
     #: and the stock.  MolCascade never reads its contents, only its bytes, and
-    #: hashes them into the method identity.
-    config_path: str = Field(min_length=1, max_length=4096)
+    #: hashes them into the method identity.  A machine path like the one above:
+    #: the policy and stock files it points at were installed with the engine.
+    config_path: str = Field(default="", max_length=4096)
 
     #: Names defined in that YAML, passed through to ``aizynthcli`` when the
     #: file defines more than one and the stage wants a specific selection.
@@ -181,20 +230,25 @@ class AiZynthFinderConfig(StrictFrozenModel):
     #: tmpfs, because the output carries every route it found.
     scratch_dir: str | None = Field(default=None, max_length=4096)
 
+    @model_validator(mode="before")
+    @classmethod
+    def _fill_machine_paths(cls, data: Any) -> Any:
+        return fill_machine_paths(data, engine_id=cls.engine_id, paths=cls.installed_paths())
+
     @field_validator("executable")
     @classmethod
     def _executable_is_absolute(cls, value: str) -> str:
-        return _absolute_path(value, field="executable")
+        return engine_path(value, field="executable", engine_id=cls.engine_id)
 
     @field_validator("config_path")
     @classmethod
     def _config_is_absolute(cls, value: str) -> str:
-        return _absolute_path(value, field="config_path")
+        return engine_path(value, field="config_path", engine_id=cls.engine_id)
 
     @field_validator("scratch_dir")
     @classmethod
     def _scratch_is_absolute(cls, value: str | None) -> str | None:
-        return None if value is None else _absolute_path(value, field="scratch_dir")
+        return None if value is None else absolute_path(value, field="scratch_dir")
 
     @field_validator("policy", "filter", "stocks", mode="before")
     @classmethod

@@ -346,6 +346,44 @@ class BoxConfig(StrictFrozenModel):
         }
 
 
+class ReceptorPreparation(StrictFrozenModel):
+    """What to do to the operator's PDB before any engine reads it.
+
+    A crystal structure is a model of resolved density, not of a protein.  Long
+    side chains routinely have none, so the deposition stops at CB -- and every
+    consumer of that file then behaves differently without saying so.  meeko
+    refuses to build a receptor at all; GNINA and KarmaDock dock happily against
+    a protein with holes in its surface; PoseBusters measures clashes against
+    the same holes.  The one documented way past meeko's refusal was its
+    ``--allow_bad_res``, which does not relax the check but deletes the residue,
+    backbone included: on STK17B that silently removed twelve of 278.
+
+    So the receptor is repaired rather than truncated, and the defaults here are
+    the recipe that makes the four consumers agree.  What each switch turns off
+    is a scientific claim, which is why there are only three of them and why
+    none of them is about adding atoms that were never measured.
+    """
+
+    #: Off is the escape hatch, not a second opinion: the structure goes to
+    #: every engine exactly as supplied.  Worth using when the PDB has already
+    #: been prepared by hand -- and worth knowing that meeko will then refuse
+    #: any structure with an incomplete residue in it.
+    enabled: bool = True
+
+    #: Crystallographic waters are removed by default because a water modelled
+    #: in the site is an atom the docking box has to route around, and no engine
+    #: here treats it as displaceable.  Keep them when a specific bridging water
+    #: is part of the hypothesis -- at which point it should be argued for
+    #: rather than inherited from the deposition.
+    keep_waters: bool = False
+
+    #: Co-crystallised ligands, sugars, buffers and cryoprotectants are removed
+    #: for the same reason.  Metals are never removed by this switch: a
+    #: catalytic zinc deleted as a "heterogen" changes every score in the tier
+    #: and shows up in none of them.
+    keep_heterogens: bool = False
+
+
 class TargetConfig(StrictFrozenModel):
     """The protein a cascade's docking tier is pointed at.
 
@@ -371,14 +409,20 @@ class TargetConfig(StrictFrozenModel):
 
     ``receptor_sha256`` is what binds a docking score to bytes rather than to a
     path.  Present, it is verified and a mismatch stops the run; absent, this
-    run establishes it.
+    run establishes it.  It is checked against the file the *operator* named and
+    then re-stated for the prepared structure, so the pin means what the
+    operator meant by it and the worker still verifies the bytes it docks.
     """
 
     name: str = Field(min_length=1, max_length=256)
 
-    #: The structure the *user* supplied, in PDB.  MolCascade reads, hashes and
-    #: validates it; it never edits it.  Protonation, tautomers, cofactors,
-    #: metals and missing loops decide the science and are not guessed here.
+    #: The structure the *user* supplied, in PDB.  It is read and hashed here,
+    #: and repaired -- not rewritten -- before any engine sees it: solvent and
+    #: co-crystallised matter are removed and side chains the crystallographer
+    #: could not resolve are rebuilt, each change named in the target notes.
+    #: What is *not* guessed stays not guessed: unresolved loops are reported
+    #: and left absent, protonation and tautomers are the engines' business,
+    #: and metals are kept.  See :class:`ReceptorPreparation`.
     receptor_path: str = Field(min_length=1, max_length=4096)
 
     receptor_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
@@ -400,6 +444,12 @@ class TargetConfig(StrictFrozenModel):
     #: KarmaDock reads an already-selected pocket.  Set this when the geometric
     #: selection picks up the wrong chain or misses a residue that matters.
     pocket_pdb_path: str | None = Field(default=None, min_length=1, max_length=4096)
+
+    #: How the receptor is cleaned and repaired before anything derives from it.
+    #: Not per-engine, for the same reason the target is not per-engine: three
+    #: preparations of one protein make the tier's consensus a comparison
+    #: between numbers that are not about the same thing.
+    preparation: ReceptorPreparation = ReceptorPreparation()
 
     @field_validator(
         "receptor_path",
@@ -535,6 +585,7 @@ __all__ = [
     "GateConfig",
     "LibraryConfig",
     "LibraryFormat",
+    "ReceptorPreparation",
     "StepConfig",
     "TargetConfig",
     "ThresholdDirection",

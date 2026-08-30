@@ -31,11 +31,13 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from pydantic import ValidationError
 
 from molcascade.artifacts import ArtifactRef
 from molcascade.contracts import PARENT_V1, SYNTHESIS_SCORE_V1
 from molcascade.errors import PluginError
 from molcascade.plugins.api import StageContext, StageInput, StageRequest
+from molcascade.plugins.builtin._machine_paths import environment_key
 from molcascade.plugins.builtin.aizynthfinder import (
     AiZynthFinderConfig,
     AiZynthFinderRoutePlugin,
@@ -537,3 +539,140 @@ def test_the_output_is_read_from_the_scratch_directory_that_was_configured(
     # And it is cleaned up: the trees file is the largest thing this stage
     # touches and leaving it behind would fill the disk it was moved to.
     assert list(scratch.iterdir()) == []
+
+
+# ------------------------------------------------- where the engine is installed
+
+
+def _clear_machine_paths(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Start from a machine that has configured nothing.
+
+    The developer running this suite may well have these exported -- that is the
+    point of the feature -- and a test that passed only on a machine without
+    them would be testing the machine.
+    """
+
+    for spec in AiZynthFinderConfig.installed_paths():
+        monkeypatch.delenv(spec.variable(AiZynthFinderConfig.engine_id), raising=False)
+
+
+def test_the_variable_names_match_the_other_isolated_engines() -> None:
+    assert AiZynthFinderConfig.engine_id == "aizynthfinder"
+    assert tuple(spec.field for spec in AiZynthFinderConfig.installed_paths()) == (
+        "executable",
+        "config_path",
+    )
+    assert environment_key("aizynthfinder", "config_path") == "MOLCASCADE_AIZYNTHFINDER_CONFIG_PATH"
+
+
+def test_neither_path_configured_leaves_both_blank_for_the_run_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Neither of these can be answered by the machine that writes the cascade.
+
+    So both validate blank, and ``preflight_engine_paths`` asks for them on the
+    host that is about to run the search -- where the ~750 MB of policy and stock
+    either is on disk or is not, and where naming the download command is useful
+    rather than premature.
+    """
+
+    _clear_machine_paths(monkeypatch)
+    config = AiZynthFinderConfig()
+    assert config.executable == ""
+    assert config.config_path == ""
+
+
+def test_the_environment_supplies_the_installation_the_cascade_omits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both of these are facts about a machine, not about a campaign.
+
+    The environment was built once and the config file naming its policy and
+    stock came with it, so neither belongs in a ``cascade.json`` that is meant to
+    be committed and handed to someone else.  The builder exports the fields it
+    shows whether or not they were filled, so ``""`` has to mean "not
+    configured" just as a missing key does.
+    """
+
+    _clear_machine_paths(monkeypatch)
+    monkeypatch.setenv("MOLCASCADE_AIZYNTHFINDER_EXECUTABLE", "/opt/envs/aizynth/bin/aizynthcli")
+    monkeypatch.setenv("MOLCASCADE_AIZYNTHFINDER_CONFIG_PATH", "/opt/data/aizynth/config.yml")
+    config = AiZynthFinderConfig(executable="  ", config_path="")
+    assert config.executable == "/opt/envs/aizynth/bin/aizynthcli"
+    assert config.config_path == "/opt/data/aizynth/config.yml"
+
+
+def test_a_configured_installation_beats_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cascade that names its own paths is not redirected by the host.
+
+    Which matters more here than for a docking engine: the config file selects
+    the expansion policy and the stock, and its bytes are hashed into the method
+    identity, so silently substituting the machine's would silently change the
+    search.
+    """
+
+    _clear_machine_paths(monkeypatch)
+    monkeypatch.setenv("MOLCASCADE_AIZYNTHFINDER_EXECUTABLE", "/opt/envs/aizynth/bin/aizynthcli")
+    monkeypatch.setenv("MOLCASCADE_AIZYNTHFINDER_CONFIG_PATH", "/opt/data/aizynth/config.yml")
+    config = AiZynthFinderConfig(
+        executable="/home/alice/envs/aizynth/bin/aizynthcli",
+        config_path="/home/alice/aizynth/uspto.yml",
+    )
+    assert config.executable == "/home/alice/envs/aizynth/bin/aizynthcli"
+    assert config.config_path == "/home/alice/aizynth/uspto.yml"
+
+
+def test_a_blank_variable_is_not_a_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``export MOLCASCADE_AIZYNTHFINDER_EXECUTABLE=`` means unset, not "".
+
+    An empty export is what a half-finished shell profile leaves behind.
+    Treating it as an answer would push ``""`` past the preflight's "is it
+    blank?" test and into its "nothing exists at the configured path" branch,
+    which describes a different mistake from the one that was made.
+    """
+
+    _clear_machine_paths(monkeypatch)
+    monkeypatch.setenv("MOLCASCADE_AIZYNTHFINDER_EXECUTABLE", "   ")
+    monkeypatch.setenv("MOLCASCADE_AIZYNTHFINDER_CONFIG_PATH", "/opt/data/aizynth/config.yml")
+    config = AiZynthFinderConfig()
+    assert config.executable == ""
+    assert config.config_path == "/opt/data/aizynth/config.yml"
+
+
+def test_a_relative_variable_is_refused_like_a_relative_field(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit variable is a statement rather than a guess, but it can be wrong.
+
+    ``aizynthcli`` on a ``PATH`` this environment is deliberately absent from is
+    exactly the resolution this adapter refuses, and it stays refused however the
+    bare name arrives.
+    """
+
+    _clear_machine_paths(monkeypatch)
+    monkeypatch.setenv("MOLCASCADE_AIZYNTHFINDER_EXECUTABLE", "aizynthcli")
+    monkeypatch.setenv("MOLCASCADE_AIZYNTHFINDER_CONFIG_PATH", "/opt/data/aizynth/config.yml")
+    with pytest.raises(ValidationError) as caught:
+        AiZynthFinderConfig()
+    assert "executable must be an absolute path" in str(caught.value)
+
+
+def test_the_filled_path_is_the_one_the_search_is_actually_run_from(
+    tmp_path: Path, cli: Any, az_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The variable has to reach the subprocess, not just pass validation.
+
+    A fallback that resolved into the model and was then ignored by the runner
+    would look configured in the run report and fail at the call.
+    """
+
+    _clear_machine_paths(monkeypatch)
+    executable = cli()
+    monkeypatch.setenv("MOLCASCADE_AIZYNTHFINDER_EXECUTABLE", str(executable))
+    monkeypatch.setenv("MOLCASCADE_AIZYNTHFINDER_CONFIG_PATH", str(az_config))
+    _, _, scores = _run(tmp_path, {"schema_version": 1})
+    assert len(scores) == len(_SMILES)
+    arguments = json.loads(cli.argv_path.read_text())
+    assert arguments["config"] == [str(az_config)]

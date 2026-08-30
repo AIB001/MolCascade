@@ -41,6 +41,7 @@ from molcascade.plugins.builtin.mordred_gate import MordredDescriptorGatePlugin
 from molcascade.plugins.builtin.policy import NativeDecisionJoinPlugin
 from molcascade.plugins.builtin.property_gate import RDKitPropertyRangeGatePlugin
 from molcascade.plugins.builtin.rd_filters_alerts import RdFiltersAlertsPlugin
+from molcascade.plugins.builtin.ring_topology_gate import RDKitRingTopologyGatePlugin
 from molcascade.plugins.builtin.scscore import ScScorePlugin
 from molcascade.plugins.builtin.similarity import RDKitReferenceSimilarityPlugin
 from molcascade.plugins.builtin.similarity_fpsim2 import Fpsim2ReferenceSimilarityPlugin
@@ -65,6 +66,7 @@ BUILTIN_STAGE_PLUGINS: tuple[StagePlugin, ...] = (
     RDKitHardGatePlugin(),
     ChemblStructureCheckPlugin(),
     RDKitPropertyRangeGatePlugin(),
+    RDKitRingTopologyGatePlugin(),
     MordredDescriptorGatePlugin(),
     RDKitDrugLikenessPlugin(),
     MedchemRulesPlugin(),

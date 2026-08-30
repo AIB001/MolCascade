@@ -277,6 +277,12 @@ def _settings(executable: Path, target: _Target, **overrides: object) -> dict[st
         "size_z": 20.0,
         "batch_size": 64,
         "seed": 4_242,
+        # These tests drive the adapter against a stub receptor and a fake
+        # engine, so pose repair and checking are switched off: they are
+        # exercised against a real protein in test_pose_quality.py.  Leaving the
+        # switch here also keeps it covered -- if the off-switch stopped working,
+        # this whole file would start needing a parsable receptor.
+        "pose_quality": {"enabled": False},
     }
     settings.update(overrides)
     return settings
@@ -477,7 +483,7 @@ def test_poses_come_back_ranked_best_first_on_either_scale(
     empirical, _parents, _metadata = _run(
         tmp_path,
         "poses-affinity",
-        _settings(engine(), target, num_modes=3, rank_by="affinity"),
+        _settings(engine(), target, num_modes=3, rank_by="affinity", keep_poses=False),
         smiles=(_SMILES[0], _SMILES[1]),
     )
 
@@ -489,7 +495,8 @@ def test_poses_come_back_ranked_best_first_on_either_scale(
         assert [row["pose_rank"] for row in cnn if row["parent_id"] == parent_id] == [0, 1, 2]
         assert higher == sorted(higher, reverse=True)
         assert lower == sorted(lower)
-    # keep_poses is the only reason a molblock should be present at all.
+    # keep_poses is what decides whether a molblock is present at all, and the
+    # second run turns it off to say so on a scale where the ranking flips too.
     assert all("M  END" in str(row["pose_molblock"]) for row in cnn)
     assert [row["pose_molblock"] for row in empirical] == [None] * 6
 
@@ -609,6 +616,29 @@ def test_a_ligand_the_engine_returned_nothing_for_is_counted(
     assert metadata["unscored_count"] == 1
 
 
+def test_the_stored_pose_does_not_carry_the_name_this_module_invented(
+    tmp_path: Path, engine: Any
+) -> None:
+    """``lig-000003`` counts within a batch, so storing it would leak the shard.
+
+    The name exists because GNINA echoes it back and it is the only handle the
+    scores are joined through.  It is meaningless outside the call that minted
+    it: the same molecule is ``lig-000003`` in a serial run and ``lig-000000``
+    in a two-shard one, which would make a molecule's recorded bytes depend on
+    how many cards were free.  In an exported SDF the same few titles would then
+    repeat once per shard.  ``parent_id`` is the identity and the SD tags carry
+    it, so the title line is blanked -- which is what the other two engines in
+    the tier already write.
+    """
+
+    target = _target(tmp_path)
+    rows, _parents, _metadata = _run(tmp_path, "titles", _settings(engine(), target))
+
+    titles = [str(row["pose_molblock"]).splitlines()[0] for row in rows]
+
+    assert titles == [""] * len(_SMILES)
+
+
 def test_splitting_the_work_does_not_move_a_score(tmp_path: Path, engine: Any) -> None:
     target = _target(tmp_path)
     serial, _parents, serial_metadata = _run(
@@ -714,7 +744,7 @@ def test_a_relative_executable_is_rejected_by_configuration(tmp_path: Path) -> N
 
 
 def test_the_engine_is_registered_as_a_docking_stage() -> None:
-    descriptor = create_builtin_registry().get("docking.gnina@0.1.0").descriptor
+    descriptor = create_builtin_registry().get("docking.gnina@0.3.0").descriptor
 
     assert descriptor.kind is PluginKind.DOCK
     assert descriptor.inputs == (PARENT_V1.id, LIGAND_CONFORMER_V1.id)

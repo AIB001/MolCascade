@@ -24,7 +24,7 @@ import importlib.util
 import math
 import tempfile
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -39,7 +39,10 @@ from molcascade.parallel import ShardOutcome, ShardTask, iter_shard_batches
 from molcascade.plugins.api import PendingOutput, StageContext, StageRequest, StageResponse
 from molcascade.plugins.builtin.docking.common import (
     BoxedDockingEngineConfig,
+    MachinePath,
     absolute_path,
+    backend_root,
+    conda_environment,
     enforce_population_cap,
     population_size,
     ranked,
@@ -50,6 +53,10 @@ from molcascade.plugins.builtin.docking.common import (
     structure_digest,
     validated_config,
     verified_receptor,
+)
+from molcascade.plugins.builtin.docking.pose_quality import (
+    PoseQualitySession,
+    pose_quality_metadata,
 )
 from molcascade.plugins.manifest import (
     Cardinality,
@@ -62,7 +69,11 @@ _PARENT_PATH = Path("datasets/parents/part-00000.parquet")
 _SCORE_PATH = Path("datasets/docking_scores/part-00000.parquet")
 _ENGINE = "Uni-Dock"
 _ENGINE_ID = "unidock"
-_IMPLEMENTATION_VERSION = 1
+# Bumped whenever a change here alters the numbers or the poses recorded, so the
+# `method_id` on every score row distinguishes them.  Provenance only: the
+# descriptor version has to move with it to invalidate a warm cache.  v2: repair
+# the pose against the receptor and check it before the score row is written.
+_IMPLEMENTATION_VERSION = 2
 
 # Uni-Dock runs at roughly a tenth of a second per ligand, so 20 000 rows is a
 # little over half an hour of work -- a sane amount to lose to an interruption
@@ -92,6 +103,24 @@ _MEEKO_HINT = (
 class UniDockConfig(BoxedDockingEngineConfig):
     """Uni-Dock's own settings on top of the shared target block."""
 
+    engine_id: ClassVar[str] = _ENGINE_ID
+
+    @classmethod
+    def installed_paths(cls) -> tuple[MachinePath, ...]:
+        """Uni-Dock is a conda package, so its own environment is where it is."""
+
+        return (
+            MachinePath(
+                field="executable",
+                label="the Uni-Dock binary",
+                candidates=(
+                    *conda_environment(_ENGINE_ID, "bin/unidock"),
+                    backend_root() / "bin" / "unidock",
+                ),
+                remedy="bash envs/bootstrap.sh unidock",
+            ),
+        )
+
     #: The receptor as Uni-Dock reads it. Derived from ``receptor_path`` with
     #: meeko once at preflight and cached by digest, or supplied directly with
     #: '--receptor-pdbqt' when the automatic preparation cannot cope. Required,
@@ -111,10 +140,13 @@ class UniDockConfig(BoxedDockingEngineConfig):
     #: itself, so the starting geometry matters far less here than it does for a
     #: pose predictor -- one conformer is the honest default.
     conformer_index: int = Field(default=0, ge=0, le=63)
-    #: Keep the docked pose in the score row. Off by default: 45 000 poses is a
-    #: few hundred megabytes of molblock that nothing downstream reads unless
-    #: someone asked for structures.
-    keep_poses: bool = False
+    #: Keep the docked pose in the score row.  On by default: ``molcascade
+    #: trace`` writes the shortlist's poses as SDF and has nothing to write
+    #: without them, and a docking run whose structures were silently discarded
+    #: is the surprise, not the reverse.  The cost is the reason it stays a
+    #: setting -- 45 000 poses is a few hundred megabytes of molblock -- so turn
+    #: it off for a screen whose scores are all anyone will read.
+    keep_poses: bool = True
     #: A hang guard, not a search budget. Uni-Dock spends about 0.1 s per ligand.
     timeout_per_molecule_seconds: float = Field(default=5.0, gt=0.0, le=86_400.0)
 
@@ -137,6 +169,7 @@ def _method_id(config: UniDockConfig, *, receptor_id: str, prepared_id: str) -> 
         {
             "engine": _ENGINE_ID,
             "implementation_version": _IMPLEMENTATION_VERSION,
+            "pose_quality": config.pose_quality.identity(),
             "receptor_id": receptor_id,
             "receptor_pdbqt_id": prepared_id,
             "scoring": config.scoring,
@@ -365,9 +398,11 @@ def _dock_batch(
             if not scores:
                 unscored += 1
                 continue
-            molblocks = (
-                _pose_molblocks(text, len(scores)) if config.keep_poses else [None] * len(scores)
-            )
+            # The checker needs the same geometry the operator would keep, so
+            # either request parses it; the column is nulled afterwards if only
+            # the checker wanted it.
+            wants_pose = config.keep_poses or config.pose_quality.enabled
+            molblocks = _pose_molblocks(text, len(scores)) if wants_pose else [None] * len(scores)
             for rank, block in enumerate(
                 ranked(scores, limit=config.num_modes, descending=False)
             ):
@@ -398,6 +433,9 @@ def _run_shard(task: ShardTask) -> ShardOutcome:
     _receptor, receptor_id = verified_receptor(config)
     prepared, prepared_id = _prepared_receptor(config)
     method_id = _method_id(config, receptor_id=receptor_id, prepared_id=prepared_id)
+    # One session for the shard: the receptor is read once however many batches
+    # follow, and the counters accumulate across them.
+    pose_session = PoseQualitySession(config.pose_quality, receptor_path=config.receptor_path)
 
     input_count = 0
     score_count = 0
@@ -444,6 +482,9 @@ def _run_shard(task: ShardTask) -> ShardOutcome:
                 method_id=method_id,
             )
             unscored += batch_unscored
+            # Repaired and judged before the rows are written, so what lands in
+            # the score table is what passed.
+            rows = pose_session.apply(rows, keep_poses=config.keep_poses)
             score_count += len(rows)
             if rows:
                 score_writer.write_table(pa.Table.from_pylist(rows, schema=DOCKING_SCORE_V1.schema))
@@ -458,6 +499,7 @@ def _run_shard(task: ShardTask) -> ShardOutcome:
             "receptor_id": receptor_id,
             "receptor_pdbqt_id": prepared_id,
             "method_id": method_id,
+            **pose_session.report.metadata(),
         },
     )
 
@@ -467,7 +509,7 @@ class UniDockPlugin:
 
     descriptor = PluginDescriptor(
         id="docking.unidock",
-        version="0.1.0",
+        version="0.2.0",
         kind=PluginKind.DOCK,
         inputs=(PARENT_V1.id, LIGAND_CONFORMER_V1.id),
         outputs=(PARENT_V1.id, DOCKING_SCORE_V1.id),
@@ -555,6 +597,7 @@ class UniDockPlugin:
                 "missing_geometry_count": result.total("missing_geometry_count"),
                 "ligand_prep_failed_count": result.total("ligand_prep_failed_count"),
                 "unscored_count": result.total("unscored_count"),
+                **pose_quality_metadata(result.total, config=config.pose_quality),
                 **config.box,
                 **result.response_metadata(),
             },

@@ -20,8 +20,10 @@ from typing import Any
 import pytest
 from pydantic import BaseModel
 
+from molcascade.backends.preflight import preflight_docking_target
 from molcascade.cascade.lower import lower_cascade
 from molcascade.cascade.models import BoxConfig, CascadeConfig, TargetConfig
+from molcascade.errors import ConfigError, PluginError
 from molcascade.plugins import (
     Cardinality,
     Determinism,
@@ -377,3 +379,101 @@ def test_lowering_is_byte_stable_for_the_same_target(stage_id: str) -> None:
     first = _config(_lower(_target()), stage_id)
     second = _config(_lower(_target()), stage_id)
     assert list(first.items()) == list(second.items())
+
+
+# ------------------------------------------- a cascade authored before the protein
+
+
+def _lower_without_a_target(*, allow_missing_target: bool) -> Any:
+    return lower_cascade(
+        _docking_cascade(None),
+        registry=_registry(_box_engine(), _ligand_engine(), _property_filter()),
+        allow_missing_library=True,
+        allow_missing_target=allow_missing_target,
+    )
+
+
+def test_lowering_invents_nothing_unless_it_is_asked_to() -> None:
+    """The default is the run's default, and a run must not dock into a stand-in.
+
+    This is the whole guard: the placeholder exists for ``validate``, and the
+    only thing standing between it and a real run is that nobody asks for it
+    there.  So the unasked case is pinned as carefully as the asked one.
+    """
+
+    lowered = _lower_without_a_target(allow_missing_target=False)
+
+    assert lowered.target_is_placeholder is False
+    assert "receptor_path" not in _config(lowered.pipeline, "unidock")
+    assert "reference_ligand_path" not in _config(lowered.pipeline, "karmadock")
+
+
+def test_a_placeholder_fills_what_the_engines_require_and_nothing_else() -> None:
+    """Every fabricated value is one more way the checked shape differs from the run's.
+
+    Both engines here declare an optional target field -- Uni-Dock's prepared
+    PDBQT, KarmaDock's pocket override -- and neither is invented, because a
+    stand-in for a file the operator did not ask for would move the stage's
+    method identity for no reason at all.
+    """
+
+    lowered = _lower_without_a_target(allow_missing_target=True)
+    assert lowered.target_is_placeholder is True
+
+    unidock = _config(lowered.pipeline, "unidock")
+    karmadock = _config(lowered.pipeline, "karmadock")
+
+    assert unidock["receptor_path"] == "/target-not-yet-chosen/receptor.pdb"
+    assert karmadock["receptor_path"] == unidock["receptor_path"]
+    assert karmadock["reference_ligand_path"] == "/target-not-yet-chosen/reference-ligand.sdf"
+    # The site the model insists on, which is also what the box engine reads.
+    assert unidock["size_x"] == 20.0
+    assert "receptor_pdbqt_path" not in unidock
+    assert "pocket_pdb_path" not in karmadock
+
+
+def test_a_cascade_that_docks_into_nothing_is_handed_nothing() -> None:
+    """Asking for the courtesy is not the same as needing it.
+
+    Most cascades have no docking tier.  Marking one of those as carrying a
+    placeholder target would put a line about receptors in front of an operator
+    whose screen never opens a protein.
+    """
+
+    lowered = lower_cascade(
+        _cascade(_tier("properties", {"id": "weight", "backend": "rdkit.properties@0.1.0"})),
+        registry=_registry(_box_engine(), _ligand_engine(), _property_filter()),
+        allow_missing_library=True,
+        allow_missing_target=True,
+    )
+
+    assert lowered.target_is_placeholder is False
+    assert "receptor_path" not in _config(lowered.pipeline, "weight")
+
+
+def test_the_run_time_refusal_is_what_the_placeholder_gets_past() -> None:
+    """Both halves, because only together do they say what the stand-in changed.
+
+    Without it the run-time preflight refuses by stage and by flag -- the message
+    an operator should get, which must keep working.  With it, that refusal is
+    satisfied and the check goes on to the receptor's bytes, which is a fact
+    about the machine and the reason ``validate`` does not run this preflight at
+    all.  A cascade is checkable on a laptop that holds no protein.
+    """
+
+    registry = _registry(_box_engine(), _ligand_engine(), _property_filter())
+
+    with pytest.raises(ConfigError) as refused:
+        preflight_docking_target(
+            _lower_without_a_target(allow_missing_target=False).pipeline.stages,
+            registry=registry,
+        )
+    assert refused.value.code == "DOCKING_TARGET_RECEPTOR_REQUIRED"
+    assert "--receptor" in (refused.value.hint or "")
+
+    with pytest.raises(PluginError) as unreadable:
+        preflight_docking_target(
+            _lower_without_a_target(allow_missing_target=True).pipeline.stages,
+            registry=registry,
+        )
+    assert unreadable.value.code == "DOCKING_RECEPTOR_UNREADABLE"

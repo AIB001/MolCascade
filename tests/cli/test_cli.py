@@ -8,13 +8,17 @@ from pathlib import Path
 
 import pytest
 from fixtures.offline_html import assert_offline
+from fixtures.starter_cascade import starter_without_docking
 
 from molcascade.artifacts import canonical_json_bytes
-from molcascade.cli import _molecule_override, main
+from molcascade.cascade.catalog import CRITERIA_BY_ID
+from molcascade.cascade.defaults import build_criterion
+from molcascade.cli import _molecule_override, _render_error, main
 from molcascade.config import PipelineConfig
 from molcascade.errors import PipelineError
 from molcascade.plugins import create_builtin_registry
 from molcascade.runtime import AuditEvent, RunState
+from molcascade.ui.cascade_builder import build_cascade_builder_payload
 
 
 def _pipeline_document(path: str = "configured-input.csv") -> dict[str, object]:
@@ -265,6 +269,388 @@ stages:
     assert result["name"] == "strict-yaml"
     assert len(result["revision_id"]) == 64
     assert result["stages"][0]["plugin"] == "source.delimited_smiles@0.1.0"
+
+
+def _write_cascade_needing_a_lead_file(tmp_path: Path) -> tuple[Path, Path]:
+    """The starter cascade plus one tier that names a lead file nobody wrote.
+
+    Built from the shipped default so the rest of the file is exactly what the
+    builder would have exported; only the last tier is the case under test.
+    """
+
+    registry = create_builtin_registry()
+    spec = CRITERIA_BY_ID["reference_similarity"]
+    option = next(item for item in spec.options if item.id == "rdkit_reference_similarity")
+    absent = tmp_path / "leads.csv"
+    criterion = build_criterion(
+        spec,
+        option,
+        criterion_id="lead_similarity",
+        settings={"reference_path": str(absent)},
+        registry=registry,
+    )
+    # Without the shipped docking, because this asks what ``validate`` says
+    # about a path in the cascade.  Left in, the same report also carries two
+    # docking engines that a machine with nothing installed cannot run, and the
+    # sentence under test is no longer the one the operator would read first.
+    config = starter_without_docking(build_cascade_builder_payload()["default_cascade"])
+    config["tiers"] = [
+        *config["tiers"],
+        {
+            "id": "lead_tier",
+            "title": "Lead similarity",
+            "mode": "serial",
+            "minimum_passes": None,
+            "note": None,
+            "enabled": True,
+            "criteria": [json.loads(criterion.model_dump_json(exclude_none=False))],
+        },
+    ]
+    path = tmp_path / "cascade.json"
+    path.write_text(json.dumps(config), encoding="utf-8")
+    return path, absent
+
+
+def test_validate_names_the_missing_file_and_not_only_the_remedy(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Two sentences, because they answer two different questions.
+
+    ``validate`` used to print the hint alone.  A lead file the operator had not
+    written therefore read as ``pip install rdkit`` -- a remedy for a problem
+    they did not have, with no mention of the stage, the setting or the path.
+    """
+
+    config, absent = _write_cascade_needing_a_lead_file(tmp_path)
+
+    assert main(["validate", str(config)]) == 0
+
+    printed = capsys.readouterr().out
+    assert "Valid cascade" in printed
+    assert "lead_similarity" in printed
+    assert f"nothing readable at the configured 'reference_path': {absent}" in printed
+    assert "hint: Point the stage at a file that exists" in printed
+    assert "pip install" not in printed
+
+
+def test_validate_json_carries_the_same_two_sentences(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config, absent = _write_cascade_needing_a_lead_file(tmp_path)
+
+    assert main(["validate", str(config), "--json"]) == 0
+
+    result = json.loads(capsys.readouterr().out)
+    assert result["valid"] is True
+    assert str(absent) in result["backends_detail"]
+    assert "lead_similarity" in result["backends_detail"]
+    assert "not a missing installation" in result["backends_note"]
+
+
+def _tool_failure(**context: object) -> PipelineError:
+    return PipelineError(
+        "meeko could not prepare protein.pdb as a PDBQT receptor",
+        code="DOCKING_RECEPTOR_PREPARATION_FAILED",
+        hint="Prepare the receptor yourself and pass '--receptor-pdbqt PREPARED.pdbqt'.",
+        context=context,  # type: ignore[arg-type]
+    )
+
+
+def test_a_captured_tool_transcript_reaches_the_terminal_and_not_only_json(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``--json`` was the only way to read why the tool underneath us stopped.
+
+    An operator who hits this on a terminal has to already suspect the flag
+    exists, and then reproduce the failure a second time to use it.  So the one
+    part of ``context`` that is a tool's own account of itself is printed here
+    too.
+    """
+
+    error = _tool_failure(
+        receptor_path="/targets/stk17b/protein.pdb",
+        returncode=1,
+        meeko_output="Error: Creation of data structure failed.\nUse --allow_bad_res.",
+    )
+
+    _render_error(error, as_json=False)
+
+    printed = capsys.readouterr().err
+    assert "molcascade: error [DOCKING_RECEPTOR_PREPARATION_FAILED]" in printed
+    assert "hint: Prepare the receptor yourself" in printed
+    assert "meeko_output:" in printed
+    assert "  Error: Creation of data structure failed." in printed
+    assert "  Use --allow_bad_res." in printed
+
+
+def test_the_rest_of_the_context_stays_behind_json(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Paths, counts and return codes are for a machine.
+
+    Printing every entry would bury the transcript in the noise it was added to
+    escape, so the suffix is the whole of the convention.
+    """
+
+    error = _tool_failure(
+        receptor_path="/targets/stk17b/protein.pdb",
+        returncode=1,
+        meeko_output="Error: Creation of data structure failed.",
+    )
+
+    _render_error(error, as_json=False)
+
+    printed = capsys.readouterr().err
+    assert "receptor_path" not in printed
+    assert "returncode" not in printed
+
+
+def test_an_error_carrying_no_transcript_prints_exactly_what_it_used_to(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    error = _tool_failure(receptor_path="/targets/stk17b/protein.pdb", returncode=1)
+
+    _render_error(error, as_json=False)
+
+    assert capsys.readouterr().err.splitlines() == [
+        "molcascade: error [DOCKING_RECEPTOR_PREPARATION_FAILED]: "
+        "meeko could not prepare protein.pdb as a PDBQT receptor",
+        "hint: Prepare the receptor yourself and pass '--receptor-pdbqt PREPARED.pdbqt'.",
+    ]
+
+
+def test_json_still_carries_the_whole_context(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The machine-readable form loses nothing to the human one."""
+
+    error = _tool_failure(
+        receptor_path="/targets/stk17b/protein.pdb",
+        returncode=1,
+        meeko_output="Error: Creation of data structure failed.",
+    )
+
+    _render_error(error, as_json=True)
+
+    result = json.loads(capsys.readouterr().err)
+    assert result["ok"] is False
+    assert result["error"]["context"] == {
+        "receptor_path": "/targets/stk17b/protein.pdb",
+        "returncode": 1,
+        "meeko_output": "Error: Creation of data structure failed.",
+    }
+
+
+def test_validate_says_nothing_about_backends_when_the_lead_file_is_there(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The other half of the claim: the check passes once the file exists.
+
+    Otherwise this could be a stage that is refused for some unrelated reason,
+    and the message would be right by accident.
+    """
+
+    config, absent = _write_cascade_needing_a_lead_file(tmp_path)
+    absent.write_text("id,smiles\nlead,CCO\n", encoding="utf-8")
+
+    assert main(["validate", str(config), "--json"]) == 0
+
+    result = json.loads(capsys.readouterr().out)
+    assert result["backends_detail"] is None
+    assert result["backends_note"] is None
+    assert "rdkit.reference-similarity" in result["backends_ready"]
+
+
+def _install_karmadock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make this machine answer KarmaDock's two installation paths.
+
+    Laid out rather than merely pointed at, because the preflight checks the
+    checkout by its contents: an empty ``KarmaDock/`` is a directory and would be
+    reported as an incomplete installation, which is a true statement about a
+    machine but not what the tests using this are about.
+    """
+
+    interpreter = tmp_path / "python"
+    interpreter.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    interpreter.chmod(0o755)
+    checkout = tmp_path / "KarmaDock"
+    for relative in ("utils/virtual_screening.py", "trained_models/karmadock_screening.pkl"):
+        item = checkout / relative
+        item.parent.mkdir(parents=True, exist_ok=True)
+        item.write_text("", encoding="utf-8")
+    monkeypatch.setenv("MOLCASCADE_KARMADOCK_EXECUTABLE", str(interpreter))
+    monkeypatch.setenv("MOLCASCADE_KARMADOCK_REPO_PATH", str(checkout))
+
+
+def _write_docking_cascade(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    installed: bool = True,
+) -> Path:
+    """The starter cascade plus a docking tier, exported the way the builder does.
+
+    No target block, because there is nowhere in the builder to type one: the
+    receptor is a ``screen`` flag.  The engine's own paths are left out of the
+    file for the same reason and answered by the machine, so ``installed=False``
+    is a portable cascade arriving somewhere that cannot run it yet.
+    """
+
+    if installed:
+        _install_karmadock(tmp_path, monkeypatch)
+    registry = create_builtin_registry()
+    spec = CRITERIA_BY_ID["docking_score"]
+    option = next(item for item in spec.options if item.id == "karmadock")
+    criterion = build_criterion(spec, option, criterion_id="docking_score", registry=registry)
+    # The starter ships docking of its own now, under this very criterion id, so
+    # it comes out first: what these tests are about is one docking block whose
+    # installation and whose receptor they control, not three.
+    config = starter_without_docking(build_cascade_builder_payload()["default_cascade"])
+    config["tiers"] = [
+        *config["tiers"],
+        {
+            "id": "docking_tier",
+            "title": "Docking",
+            "mode": "serial",
+            "minimum_passes": None,
+            "note": None,
+            "enabled": True,
+            "criteria": [json.loads(criterion.model_dump_json(exclude_none=False))],
+        },
+    ]
+    path = tmp_path / "docking-cascade.json"
+    path.write_text(json.dumps(config), encoding="utf-8")
+    return path
+
+
+def test_validate_accepts_a_docking_cascade_that_names_no_receptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The regression: this file is complete, and used to read as broken.
+
+    A cascade names its target on the ``screen`` command line, so the exported
+    file carries none -- and ``validate`` compiled it anyway, producing four
+    Pydantic ``Field required`` paragraphs about ``receptor_path``.  An operator
+    reading that fixes it the only way the message suggests: by typing a receptor
+    into the JSON, once per campaign, for a field the builder never showed them.
+    """
+
+    config = _write_docking_cascade(tmp_path, monkeypatch)
+
+    assert main(["validate", str(config)]) == 0
+
+    printed = capsys.readouterr().out
+    assert "Valid cascade" in printed
+    assert "This cascade names no target" in printed
+    assert "--receptor RECEPTOR.pdb" in printed
+    # The site is the other half an operator has to supply, and all three forms
+    # are named because the engines do not agree on which one they read.
+    assert "--reference-ligand" in printed and "--box" in printed
+    assert "Field required" not in printed
+    assert "receptor_path" not in printed
+
+
+def test_validate_json_says_a_target_is_still_required(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Reported as a flag, not only as prose, so a script can act on it.
+
+    The pair matters: ``valid`` says the funnel's shape holds, ``target_required``
+    says a run still needs an argument.  Collapsing them would make a docking
+    cascade either permanently invalid or silently runnable.
+    """
+
+    config = _write_docking_cascade(tmp_path, monkeypatch)
+
+    assert main(["validate", str(config), "--json"]) == 0
+
+    result = json.loads(capsys.readouterr().out)
+    assert result["valid"] is True
+    assert result["target_required"] is True
+    assert result["library_required"] is True
+    assert any(stage["id"] == "docking_score" for stage in result["stages"])
+
+
+def test_validate_reports_an_installation_this_machine_cannot_find(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The question a portable cascade is written to defer, asked where it can be.
+
+    The builder cannot know where KarmaDock lives on the box that will run this,
+    so it exports the paths blank -- which means ``validate`` on that box is the
+    cheap way to ask whether it can answer them.  Reported, never fatal: the same
+    file is valid on the laptop that wrote it, where the answer is expected to be
+    no.
+    """
+
+    config = _write_docking_cascade(tmp_path, monkeypatch, installed=False)
+
+    assert main(["validate", str(config)]) == 0
+
+    printed = capsys.readouterr().out
+    assert "Valid cascade" in printed
+    assert "Not runnable here yet" in printed
+    # The stage, the field, where it looked, and both ways to answer it.
+    assert "docking_score" in printed
+    assert "'executable' is blank" in printed
+    assert "Looked in:" in printed
+    assert "export MOLCASCADE_KARMADOCK_EXECUTABLE=" in printed
+    assert "bash envs/bootstrap.sh karmadock" in printed
+
+
+def test_validate_confirms_the_installation_once_the_machine_answers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The other half, so the report above is not right by accident.
+
+    Also the check that ``validate`` and a real run agree: they call the same
+    function on the same compiled stages, so a cascade this says is runnable here
+    does not stop at the preflight an hour later.
+    """
+
+    config = _write_docking_cascade(tmp_path, monkeypatch, installed=True)
+
+    assert main(["validate", str(config), "--json"]) == 0
+
+    result = json.loads(capsys.readouterr().out)
+    assert result["engines_ready"] == ["docking_score"]
+    assert result["engines_note"] is None
+    assert result["engines_detail"] is None
+
+
+def test_validate_says_nothing_about_a_target_a_cascade_never_opens(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Most cascades dock into nothing, and must not be told about receptors.
+
+    Without this the courtesy would become noise on every property-filter
+    cascade, which is how a line that matters stops being read.
+    """
+
+    # The starter is no longer an example of one: it ships docking, so it does
+    # open a target and is told so.  Taking that tier out is what leaves a
+    # property-filter cascade -- the shape this line must stay quiet about.
+    config = tmp_path / "cascade.json"
+    starter = starter_without_docking(build_cascade_builder_payload()["default_cascade"])
+    config.write_text(json.dumps(starter), "utf-8")
+
+    assert main(["validate", str(config), "--json"]) == 0
+
+    result = json.loads(capsys.readouterr().out)
+    assert result["valid"] is True
+    assert result["target_required"] is False
 
 
 def test_validate_rejects_duplicate_json_keys_with_structured_error(
@@ -920,7 +1306,101 @@ def test_export_and_report_canonical_commands(
     assert report_result == {"path": str(report), "run_id": "handoff-cli"}
 
 
-@pytest.mark.parametrize("command", ["export", "report"])
+def test_trace_writes_a_directory_per_stage_and_reports_it(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The wiring, not the tracing: ``tests/integration/test_trace.py`` covers
+    what lands on disk, so what is left here is that the flags reach it and that
+    both output shapes say the same thing."""
+
+    config = _write_handoff_pipeline(tmp_path)
+    workspace = tmp_path / "workspace"
+    assert main(
+        [
+            "run",
+            str(config),
+            "--workspace",
+            str(workspace),
+            "--run-id",
+            "trace-cli",
+            "--json",
+        ]
+    ) == 0
+    capsys.readouterr()
+
+    destination = tmp_path / "trace"
+    assert main(
+        [
+            "trace",
+            "trace-cli",
+            "--workspace",
+            str(workspace),
+            "--output",
+            str(destination),
+            "--json",
+        ]
+    ) == 0
+    traced = json.loads(capsys.readouterr().out)
+    assert traced["path"] == str(destination)
+    assert traced["run_id"] == "trace-cli"
+    assert traced["status"] == "SUCCEEDED"
+    assert traced["index_path"] == str(destination / "index.csv")
+    assert traced["csv_count"] == 3
+    assert [stage["stage_id"] for stage in traced["stages"]] == [
+        "source",
+        "standardize",
+        "shortlist",
+    ]
+    assert [stage["rows"] for stage in traced["stages"]] == [2, 2, 2]
+    # No docking tier, so no pose file and a note saying so rather than an
+    # absence to be interpreted.
+    assert traced["shortlist_sdf"] is None
+    assert traced["pose_count"] == 0
+    assert any("No docking stage" in note for note in traced["notes"])
+    assert sorted(item.name for item in destination.iterdir()) == [
+        "00-source.csv",
+        "01-standardize.csv",
+        "02-shortlist.csv",
+        "index.csv",
+    ]
+
+    assert main(
+        [
+            "trace",
+            "trace-cli",
+            "--workspace",
+            str(workspace),
+            "--output",
+            str(destination),
+            "--json",
+        ]
+    ) == 1
+    error = json.loads(capsys.readouterr().err)
+    assert error["error"]["code"] == "TRACE_OUTPUT_EXISTS"
+
+    assert main(
+        [
+            "trace",
+            "trace-cli",
+            "--workspace",
+            str(workspace),
+            "--output",
+            str(destination),
+            "--overwrite",
+        ]
+    ) == 0
+    human = capsys.readouterr().out
+    assert "Run trace-cli: SUCCEEDED" in human
+    assert f"Traced to: {destination}" in human
+    assert "standardize" in human
+    assert "Index: index.csv (3 CSV file(s))" in human
+    assert "Note: No docking stage" in human
+    # Nothing docked, so the poses line is absent rather than reading zero.
+    assert "Poses:" not in human
+
+
+@pytest.mark.parametrize("command", ["export", "report", "trace"])
 @pytest.mark.parametrize("workspace_exists", [False, True])
 def test_export_and_report_missing_runs_do_not_create_workspace(
     tmp_path: Path,

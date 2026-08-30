@@ -41,12 +41,17 @@ from molcascade.cascade.defaults import (
 )
 from molcascade.cascade.lower import DECISION_JOIN_PLUGIN
 from molcascade.cascade.models import LibraryFormat, TierMode
+from molcascade.contracts import DECISION_V1, PARENT_V1
 from molcascade.environment import detect_environment
 from molcascade.environment.models import HostEnvironment
 from molcascade.io.atomic import atomic_write_bytes
 from molcascade.plugins.registry import PluginRegistry, create_builtin_registry
 
-BUILDER_SCHEMA_VERSION = 2
+# The shape of the payload the embedded script reads.  Bumped when a key it
+# depends on is added or changes meaning: 3 marks installation paths becoming
+# deferrable (``installed_path``, no baked-in per-machine verdict) and options
+# declaring the evidence they read but do not compute.
+BUILDER_SCHEMA_VERSION = 3
 DEFAULT_CONFIG_FILENAME = "cascade.json"
 
 # Distributions whose presence in a backend's ``requires`` means the tool will
@@ -210,6 +215,36 @@ _LIBRARY_FIELDS: tuple[dict[str, Any], ...] = (
 )
 
 
+def _evidence_payload(
+    option: BackendOption,
+    *,
+    registry: PluginRegistry,
+) -> tuple[list[str], list[str]]:
+    """What this tool reads from an earlier stage, and what it leaves behind.
+
+    Read from the installed plugin rather than restated in the catalogue,
+    because it is the plugin's ``inputs`` that :func:`lower_cascade` binds and
+    refuses over.  ``parent`` is the population every stage sees and
+    ``decision`` is wired by the tier's own policy join, so neither is a
+    dependency the builder can help with.
+
+    This exists so the browser can refuse to export a cascade that cannot be
+    lowered.  Uni-Dock and GNINA dock a 3D structure they do not generate: put
+    either one in a cascade with no conformer stage above it and lowering stops
+    with ``CASCADE_CRITERION_EVIDENCE_UNAVAILABLE`` -- which the operator meets
+    as a failure of the file the builder just handed them.
+    """
+
+    reference = option.plugin_ref
+    if not reference or reference not in registry:
+        return [], []
+    descriptor = registry.entry(reference).descriptor
+    needs = [
+        contract for contract in descriptor.inputs if contract not in {PARENT_V1.id, DECISION_V1.id}
+    ]
+    return needs, sorted(set(descriptor.outputs))
+
+
 def _option_payload(
     option: BackendOption,
     payload: dict[str, Any],
@@ -224,6 +259,17 @@ def _option_payload(
     """
 
     payload["accelerated"] = bool(_ACCELERATED_REQUIREMENTS.intersection(option.requires))
+    needs, produces = _evidence_payload(option, registry=registry)
+    payload["needs_evidence"] = needs
+    payload["produces_evidence"] = produces
+    # Nothing about the installation paths is read from this process.  It used to
+    # be -- each one carried a flag saying whether *this* shell exported the
+    # matching variable -- and because the payload is frozen into a static HTML
+    # file, that flag described the machine the cascade was drawn on forever
+    # after.  Assembling a docking cascade on a host with no engines installed
+    # therefore produced a file that could not be downloaded, whatever the run
+    # host had.  ``ThresholdField.installed_path`` states the same thing without
+    # measuring anything: this is a path the run resolves, so leave it blank.
     if payload.get("executable"):
         settings, gate_settings = criterion_defaults(option, registry=registry)
         payload["initial_settings"] = settings
@@ -340,6 +386,10 @@ def build_cascade_builder_payload(
             f"molcascade screen --config {DEFAULT_CONFIG_FILENAME} --library <your library file>"
         ),
         "machine": _machine_payload(host),
+        # Filled in only by the served render.  The key is always present so the
+        # browser tests one value rather than branching on whether a key exists,
+        # and so the file written to disk states plainly that it has no endpoint.
+        "save_endpoint": None,
     }
 
 
@@ -353,11 +403,23 @@ def _csp_hash(content: str) -> str:
     return "sha256-" + base64.b64encode(digest).decode("ascii")
 
 
-def render_cascade_builder(payload: dict[str, Any]) -> str:
-    """Render the complete offline document for ``payload``."""
+def render_cascade_builder(
+    payload: dict[str, Any], *, save_endpoint: dict[str, Any] | None = None
+) -> str:
+    """Render the complete document for ``payload``.
+
+    With no ``save_endpoint`` this is the offline artifact: no connect-src, no
+    token, nothing that reaches for a network.  ``molcascade generate config
+    --serve`` passes one, and the two changes it makes -- a relative endpoint in
+    the payload and ``connect-src 'self'`` -- are the whole difference between a
+    page that can only hand its file to the browser and one that can put it
+    beside the HTML.  The file written to ``--output`` is always the first kind.
+    """
 
     css = _asset("cascade.css")
     javascript = _asset("cascade.js")
+    if save_endpoint is not None:
+        payload = {**payload, "save_endpoint": save_endpoint}
     payload_text = json.dumps(
         payload,
         allow_nan=False,
@@ -366,11 +428,15 @@ def render_cascade_builder(payload: dict[str, Any]) -> str:
         sort_keys=True,
     )
     escaped_payload = html.escape(payload_text, quote=True)
+    # 'self' is the served origin and nothing else: the page may post back to the
+    # loopback port it came from, and still may not reach anywhere on the network.
+    # The offline document keeps 'none', which forbids even that.
+    connect = "'self'" if save_endpoint is not None else "'none'"
     csp = (
         "default-src 'none'; "
         f"script-src '{_csp_hash(javascript)}'; "
         f"style-src '{_csp_hash(css)}'; "
-        "img-src data:; connect-src 'none'; object-src 'none'; base-uri 'none'; "
+        f"img-src data:; connect-src {connect}; object-src 'none'; base-uri 'none'; "
         "form-action 'none'; frame-ancestors 'none'"
     )
     return f"""<!doctype html>

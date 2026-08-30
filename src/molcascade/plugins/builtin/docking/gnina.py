@@ -33,7 +33,7 @@ import math
 import tempfile
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Literal, NamedTuple
+from typing import Any, ClassVar, Literal, NamedTuple
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -48,6 +48,9 @@ from molcascade.parallel import ShardOutcome, ShardTask, iter_shard_batches
 from molcascade.plugins.api import PendingOutput, StageContext, StageRequest, StageResponse
 from molcascade.plugins.builtin.docking.common import (
     BoxedDockingEngineConfig,
+    MachinePath,
+    backend_root,
+    conda_environment,
     enforce_population_cap,
     finite_number,
     population_size,
@@ -58,6 +61,10 @@ from molcascade.plugins.builtin.docking.common import (
     shard_geometry,
     validated_config,
     verified_receptor,
+)
+from molcascade.plugins.builtin.docking.pose_quality import (
+    PoseQualitySession,
+    pose_quality_metadata,
 )
 from molcascade.plugins.manifest import (
     Cardinality,
@@ -70,7 +77,13 @@ _PARENT_PATH = Path("datasets/parents/part-00000.parquet")
 _SCORE_PATH = Path("datasets/docking_scores/part-00000.parquet")
 _ENGINE = "GNINA"
 _ENGINE_ID = "gnina"
-_IMPLEMENTATION_VERSION = 1
+# Bumped whenever a change here alters the numbers or the poses recorded, so the
+# `method_id` on every score row distinguishes them.  Provenance only: the
+# descriptor version has to move with it to invalidate a warm cache.  v2: repair
+# the pose against the receptor and check it before the score row is written.
+# v3: stop storing the batch-local ligand name in the pose, which made a
+# molecule's recorded bytes depend on how the work was sharded.
+_IMPLEMENTATION_VERSION = 3
 
 # Five hundred rows is fifteen to ninety minutes of CNN rescoring -- a tolerable
 # amount of work to lose to an interruption, and the shard is the unit that
@@ -116,6 +129,33 @@ class GninaConfig(BoxedDockingEngineConfig):
     in the tier whose ``receptor_id`` is the digest of the very bytes it opened.
     """
 
+    engine_id: ClassVar[str] = _ENGINE_ID
+
+    @classmethod
+    def installed_paths(cls) -> tuple[MachinePath, ...]:
+        """GNINA ships a single release binary, not a package.
+
+        ``envs/bootstrap.sh`` downloads it into the shared backend root and
+        writes a small wrapper beside it, so the wrapper is what gets looked for
+        -- it is the thing that sets the library path the static build needs.
+        """
+
+        return (
+            MachinePath(
+                field="executable",
+                label="the GNINA binary",
+                candidates=(
+                    backend_root() / "bin" / "gnina",
+                    *conda_environment(_ENGINE_ID, "bin/gnina"),
+                ),
+                remedy="bash envs/bootstrap.sh gnina",
+                note=(
+                    "GNINA is GPL-2.0-or-later, so the run also needs "
+                    "'--allow-copyleft' before it will start."
+                ),
+            ),
+        )
+
     #: How much CNN there is. ``rescore`` runs the empirical search and then
     #: scores the resulting poses with the network, which is the setting the
     #: published accuracy figures are for; ``refinement`` optimises against the
@@ -146,10 +186,10 @@ class GninaConfig(BoxedDockingEngineConfig):
     #: part of what produced the number.
     conformer_index: int = Field(default=0, ge=0, le=63)
 
-    #: Keep the docked pose in the score row. Off by default, as everywhere in
-    #: this tier: nothing downstream reads a molblock unless structures were
-    #: asked for.
-    keep_poses: bool = False
+    #: Keep the docked pose in the score row.  On by default, as everywhere in
+    #: this tier: ``molcascade trace`` exports the kept poses as SDF and cannot
+    #: reconstruct them afterwards.
+    keep_poses: bool = True
 
     #: Run on CPU when no card was assigned. Off by default and deliberately
     #: awkward to turn on: GNINA's CPU path works, and a shortlist that would
@@ -200,6 +240,7 @@ def _method_id(config: GninaConfig, *, receptor_id: str) -> str:
         {
             "engine": _ENGINE_ID,
             "implementation_version": _IMPLEMENTATION_VERSION,
+            "pose_quality": config.pose_quality.identity(),
             "receptor_id": receptor_id,
             "cnn_scoring": config.cnn_scoring,
             "cnn": config.cnn,
@@ -303,6 +344,27 @@ def _parse_records(text: str) -> list[tuple[str, str | None, dict[str, float | N
     return records
 
 
+def _untitled(molblock: str | None) -> str | None:
+    """Drop the scratch name from a pose that is about to be stored.
+
+    ``lig-000007`` is minted per batch and means nothing outside the call that
+    made it -- so a molecule's stored bytes would depend on which shard it
+    landed in, and an exported SDF would repeat the same handful of titles once
+    per shard.  The name is still the key GNINA's output is grouped by; it just
+    has no business surviving into an artifact, where ``parent_id`` is the
+    identity and the SD tags carry it.  Blanking rather than substituting is
+    what Uni-Dock and KarmaDock already write.
+    """
+
+    if molblock is None:
+        return None
+    lines = molblock.splitlines()
+    if not lines:
+        return molblock
+    lines[0] = ""
+    return "\n".join(lines) + "\n"
+
+
 class _Pose(NamedTuple):
     """One returned pose: the number ranked on, its companion, and the geometry."""
 
@@ -383,6 +445,10 @@ def _dock_batch(
         grouped: dict[str, list[_Pose]] = {}
         if output_file.is_file():
             text = output_file.read_text(encoding="utf-8", errors="replace")
+            # The checker needs the same geometry the operator would keep, so
+            # either request keeps it; the column is nulled afterwards if only
+            # the checker wanted it.
+            wants_pose = config.keep_poses or config.pose_quality.enabled
             for name, molblock, tags in _parse_records(text):
                 if name not in parent_ids:
                     continue
@@ -390,9 +456,13 @@ def _dock_batch(
                 if score is None:
                     continue
                 grouped.setdefault(name, []).append(
-                    _Pose(score, tags.get(secondary_tag), molblock if config.keep_poses else None)
+                    _Pose(
+                        score,
+                        tags.get(secondary_tag),
+                        _untitled(molblock) if wants_pose else None,
+                    )
                 )
-                if config.keep_poses and molblock is None:
+                if wants_pose and molblock is None:
                     poses_missing += 1
 
     unscored = 0
@@ -433,6 +503,9 @@ def _run_shard(task: ShardTask) -> ShardOutcome:
     _require_pdb_receptor(config)
     receptor, receptor_id = verified_receptor(config)
     method_id = _method_id(config, receptor_id=receptor_id)
+    # One session for the shard: the receptor is read once however many batches
+    # follow, and the counters accumulate across them.
+    pose_session = PoseQualitySession(config.pose_quality, receptor_path=config.receptor_path)
 
     input_count = 0
     score_count = 0
@@ -486,6 +559,9 @@ def _run_shard(task: ShardTask) -> ShardOutcome:
             )
             unscored += batch_unscored
             poses_missing += batch_missing
+            # Repaired and judged before the rows are written, so what lands in
+            # the score table is what passed.
+            rows = pose_session.apply(rows, keep_poses=config.keep_poses)
             score_count += len(rows)
             if rows:
                 score_writer.write_table(pa.Table.from_pylist(rows, schema=DOCKING_SCORE_V1.schema))
@@ -501,6 +577,7 @@ def _run_shard(task: ShardTask) -> ShardOutcome:
             "pose_missing_count": poses_missing,
             "receptor_id": receptor_id,
             "method_id": method_id,
+            **pose_session.report.metadata(),
         },
     )
 
@@ -524,7 +601,7 @@ class GninaPlugin:
 
     descriptor = PluginDescriptor(
         id="docking.gnina",
-        version="0.1.0",
+        version="0.3.0",
         kind=PluginKind.DOCK,
         inputs=(PARENT_V1.id, LIGAND_CONFORMER_V1.id),
         outputs=(PARENT_V1.id, DOCKING_SCORE_V1.id),
@@ -615,6 +692,7 @@ class GninaPlugin:
                 "unusable_geometry_count": result.total("unusable_geometry_count"),
                 "unscored_count": result.total("unscored_count"),
                 "pose_missing_count": result.total("pose_missing_count"),
+                **pose_quality_metadata(result.total, config=config.pose_quality),
                 **config.box,
                 **result.response_metadata(),
             },

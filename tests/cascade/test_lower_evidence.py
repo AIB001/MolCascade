@@ -241,9 +241,21 @@ def test_single_input_criteria_keep_exactly_one_binding() -> None:
 
     from molcascade.cascade.defaults import default_cascade
 
-    lowered = lower_cascade(default_cascade(), allow_missing_library=True)
+    lowered = lower_cascade(
+        default_cascade(), allow_missing_library=True, allow_missing_target=True
+    )
     for stage in lowered.pipeline.stages:
         ports = [binding.request_port for binding in stage.inputs]
-        assert ports in ([], ["primary"], ["parents", "evidence"]) or all(
+        assert ports in (
+            [],
+            ["primary"],
+            ["parents", "evidence"],
+            # A docking engine reads the population *and* the geometry the
+            # conformer tier embedded for it, which is two edges by design
+            # rather than by accident.  Listing the shape here is what keeps
+            # the guarantee useful: a third edge on a docking stage would
+            # still fail, and that is the failure this test is for.
+            ["primary", "ligand_conformer"],
+        ) or all(
             port == "parents" or port.startswith("decision_") for port in ports
         ), f"{stage.id} gained an unexpected binding: {ports}"

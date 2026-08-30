@@ -1,11 +1,16 @@
-"""Generate the 3D ligand geometry every docking engine in the tier will read.
+"""Generate the 3D ligand geometry the searching docking engines in the tier read.
 
 Embedding is done once, here, rather than inside each engine adapter.  Two
 reasons, and both are about being able to believe the scores afterwards: a
-consensus between Uni-Dock, KarmaDock and GNINA only means something if the
-three saw identical input geometry, and ETKDG plus an MMFF minimisation is the
-single largest CPU cost in the docking level -- paying it once instead of three
-times is most of the level's wall-clock.
+consensus between Uni-Dock and GNINA only means something if the two saw
+identical input geometry, and ETKDG plus an MMFF minimisation is the single
+largest CPU cost in the docking level -- paying it once instead of twice is most
+of the level's wall-clock.
+
+KarmaDock is not one of the readers.  It takes SMILES on its command line and
+embeds its own conformer internally, which is why its adapter binds ``parent/v1``
+rather than this table: subscribing to a geometry it never reads would record an
+input it did not have.
 
 A molecule that cannot be embedded is *not* dropped.  It keeps a row with a null
 molblock and the reason in ``embed_status``, so the score gate downstream

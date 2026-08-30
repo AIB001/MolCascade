@@ -199,6 +199,62 @@
     return spec ? spec.evidence === "decision" : null;
   }
 
+  /* Some tools read evidence they do not compute.  Uni-Dock and GNINA dock a 3D
+   * structure and generate none, so a cascade that names either one without a
+   * conformer block above it cannot be lowered at all -- `lower_cascade` stops
+   * with CASCADE_CRITERION_EVIDENCE_UNAVAILABLE.  The builder used to export
+   * that file happily, which meant the operator met the problem as a failure of
+   * something a tool had just generated for them.  So the dependency is read
+   * from the installed plugins into the payload, satisfied automatically when a
+   * block is added, and checked before every export. */
+
+  function evidenceNeeds(criterion) {
+    const option = optionFor(criterion);
+    return (option && option.needs_evidence) || [];
+  }
+
+  function evidenceProduced(criterion) {
+    const option = optionFor(criterion);
+    return (option && option.produces_evidence) || [];
+  }
+
+  /** The criterion this installation would use to produce one evidence contract. */
+  function evidenceProducer(contract) {
+    for (const spec of payload.criteria) {
+      for (const option of spec.options) {
+        if (!option.executable) continue;
+        if ((option.produces_evidence || []).indexOf(contract) < 0) continue;
+        return spec;
+      }
+    }
+    return null;
+  }
+
+  /** Evidence that enabled blocks above `criterionId` leave for it to read.
+   *
+   * Walked in funnel order and stopped at the block itself, which is the rule
+   * lowering applies: a producer beside it but earlier in the same tier counts,
+   * one below it does not.
+   */
+  function evidenceAbove(criterionId) {
+    const available = new Set();
+    for (const tier of state.tiers) {
+      if (!tier.enabled) continue;
+      for (const item of activeCriteria(tier)) {
+        if (item.id === criterionId) return available;
+        for (const contract of evidenceProduced(item)) available.add(contract);
+      }
+    }
+    return available;
+  }
+
+  function missingEvidence(criterion) {
+    const needs = evidenceNeeds(criterion);
+    if (!needs.length) return [];
+    const available = evidenceAbove(criterion.id);
+    return needs.filter((contract) => !available.has(contract));
+  }
+
   function usedIds() {
     const used = new Set();
     used.add(state.ingest.id);
@@ -318,6 +374,52 @@
     };
   }
 
+  /* Provision what a newly chosen tool reads but does not compute.
+   *
+   * A serial tier of its own, directly above the one that needs it: the
+   * producers are pure evidence with no threshold of their own, so a parallel
+   * tier would demand a decision they cannot make.  Added rather than merely
+   * complained about because the operator has no way to know that Uni-Dock
+   * needs conformers and KarmaDock does not, and the alternative -- exporting a
+   * file that will not lower -- is the failure this builder exists to prevent.
+   * It is an ordinary block afterwards: movable, editable and removable, and
+   * `collectIssues` says so if removing it breaks the cascade.
+   */
+  function provideEvidenceFor(criterion, tier) {
+    const provided = [];
+    // By producer rather than by contract: one block that computes two of the
+    // things a tool reads must be added once, not twice.
+    const added = new Set();
+    for (const contract of missingEvidence(criterion)) {
+      const spec = evidenceProducer(contract);
+      if (!spec || added.has(spec.id)) continue;
+      const option = spec.options.find((item) => item.id === spec.default_option_id);
+      if (!option) continue;
+      added.add(spec.id);
+      const host = {
+        id: uniqueId("t" + (state.tiers.length + 1) + "_" + spec.id),
+        title: spec.label,
+        mode: "serial",
+        minimum_passes: null,
+        criteria: [newCriterion(spec, option)],
+        note: null,
+        enabled: true,
+      };
+      state.tiers.splice(Math.max(0, findTier(tier.id)), 0, host);
+      provided.push(spec.label);
+    }
+    return provided;
+  }
+
+  function evidenceAdded(provided) {
+    if (!provided.length) return "";
+    return (
+      " It reads evidence it does not compute, so “" +
+      provided.join("”, “") +
+      "” was added above it."
+    );
+  }
+
   /** Insert a fresh criterion; `index` of null means "at the end of the tier". */
   function addCriterion(tierId, specId, index) {
     const spec = CRITERIA.get(specId);
@@ -332,9 +434,13 @@
     const at = index === null || index === undefined ? tier.criteria.length : index;
     tier.criteria.splice(Math.max(0, Math.min(at, tier.criteria.length)), 0, criterion);
     normalizeTier(tier);
+    const provided = provideEvidenceFor(criterion, tier);
     selection = { kind: "criterion", tier: tier.id, criterion: criterion.id };
     render();
-    announce("ok", "Added " + spec.label + " to “" + tier.title + "”.");
+    announce(
+      "ok",
+      "Added " + spec.label + " to “" + tier.title + "”." + evidenceAdded(provided)
+    );
   }
 
   /* Swapping the tool resets thresholds to the new tool's reviewed defaults.
@@ -352,8 +458,16 @@
     criterion.gate = option.gate_plugin
       ? { backend: option.gate_plugin, settings: clone(option.initial_gate_settings) }
       : null;
+    // Swapping the tool can introduce a dependency the old one did not have:
+    // KarmaDock predicts its own geometry, Uni-Dock docks one it is given.
+    const found = locate(criterion.id);
+    const provided = found ? provideEvidenceFor(criterion, state.tiers[found.tierIndex]) : [];
     render();
-    announce("warn", "Switched to " + option.engine + ". Thresholds were reset to its defaults.");
+    announce(
+      "warn",
+      "Switched to " + option.engine + ". Thresholds were reset to its defaults." +
+        evidenceAdded(provided)
+    );
   }
 
   function removeCriterion(tierId, criterionId) {
@@ -507,6 +621,76 @@
 
   /* ------------------------------------------------------------ validation */
 
+  /** Which settings container one threshold descriptor writes into. */
+  function settingsFor(criterion, descriptor) {
+    return descriptor.target === "gate"
+      ? (criterion.gate || {}).settings
+      : criterion.settings;
+  }
+
+  /* A text setting the run cannot start without, left blank.
+   *
+   * This used to be exportable, and the consequence was the whole reason this
+   * check exists: a cascade whose KarmaDock path was an empty string downloaded
+   * cleanly, then failed at `molcascade validate` with Pydantic's
+   * `string_too_short` on a field the operator had never seen named. Every such
+   * file had to be hand-edited after export, which is exactly what a builder is
+   * for avoiding.
+   *
+   * `required` is honoured alongside `!nullable` because they answer different
+   * questions: `nullable` is whether the *plugin's* field accepts null, and
+   * `required` is whether a cascade built *here* can run without it. See
+   * `ThresholdField` for the one field where those disagree.
+   *
+   * Installation paths are excluded, and that exclusion is the whole point of
+   * the split below. They are not settings a cascade carries -- they say where
+   * an engine is installed on a host this browser is usually not running on --
+   * so blocking a download over one made the builder unable to draw a docking
+   * cascade at all on a laptop, while `preflight_engine_paths` was already
+   * prepared to resolve them where it mattered. */
+  function missingRequiredSettings(criterion) {
+    const option = optionFor(criterion);
+    if (!option) return [];
+    const missing = [];
+    for (const descriptor of option.thresholds || []) {
+      if (descriptor.kind !== "text") continue;
+      if (!descriptor.required && descriptor.nullable) continue;
+      if (descriptor.installed_path) continue;
+      const container = settingsFor(criterion, descriptor);
+      const value = container ? getPath(container, descriptor.name) : undefined;
+      if (typeof value === "string" && value.trim()) continue;
+      missing.push("“" + criterionLabel(criterion) + "” needs " + descriptor.label + ".");
+    }
+    return missing;
+  }
+
+  /* The installation paths this criterion is leaving to whoever runs it.
+   *
+   * Said once per block rather than once per field, and as a note rather than a
+   * complaint: there is nothing here for the author to fix, and the run does not
+   * proceed in ignorance either. `preflight_engine_paths` looks for each of
+   * these before the first molecule is read -- in the config, in
+   * `MOLCASCADE_<ENGINE>_<FIELD>`, then where `envs/bootstrap.sh` installs
+   * things -- and stops with the install command if it finds nothing. */
+  function unresolvedMachinePaths(criterion) {
+    const option = optionFor(criterion);
+    if (!option) return null;
+    const labels = [];
+    for (const descriptor of option.thresholds || []) {
+      if (descriptor.kind !== "text" || !descriptor.installed_path) continue;
+      const container = settingsFor(criterion, descriptor);
+      const value = container ? getPath(container, descriptor.name) : undefined;
+      if (typeof value === "string" && value.trim()) continue;
+      labels.push(descriptor.label);
+    }
+    if (!labels.length) return null;
+    return (
+      "“" + criterionLabel(criterion) + "” leaves " + labels.join(" and ") +
+      " to the machine that runs it. MolCascade looks for them when the run " +
+      "starts and stops with the command that installs them if they are absent."
+    );
+  }
+
   function collectIssues() {
     const issues = [];
     const error = (text, where) =>
@@ -581,6 +765,27 @@
             tier.id
           );
         }
+        for (const issue of missingRequiredSettings(criterion)) {
+          error(issue, tier.id);
+        }
+        // An unmet evidence dependency is not a preference: lowering refuses
+        // the cascade outright, so this has to stop the export rather than
+        // colour the status bar.  Adding a block satisfies it automatically; a
+        // file loaded from disk, or one whose producer was moved below its
+        // consumer, arrives here instead.
+        for (const contract of missingEvidence(criterion)) {
+          const producer = evidenceProducer(contract);
+          error(
+            "“" + criterionLabel(criterion) + "” reads evidence it does not compute, and " +
+              "no enabled block above it produces it. " +
+              (producer
+                ? "Add “" + producer.label + "” to a tier above this one."
+                : "Nothing installed here produces " + contract + "."),
+            tier.id
+          );
+        }
+        const machinePaths = unresolvedMachinePaths(criterion);
+        if (machinePaths) warn(machinePaths, tier.id);
       }
       // The first tier is the only one that sees every molecule in the library,
       // so it is the only place where a slow check costs its full price. The
@@ -940,9 +1145,7 @@
     if (option) {
       for (const descriptor of option.thresholds) {
         if (descriptor.name === "batch_size") continue;
-        const container =
-          descriptor.target === "gate" ? (criterion.gate || {}).settings : criterion.settings;
-        const value = getPath(container || {}, descriptor.name);
+        const value = getPath(settingsFor(criterion, descriptor) || {}, descriptor.name);
         if (value === null || value === undefined || value === "") continue;
         parts.push(descriptor.label + " " + formatValue(value, descriptor));
         if (parts.length >= 2) break;
@@ -1387,11 +1590,27 @@
       return field(descriptor.label, select, descriptor.help);
     }
     if (descriptor.kind === "text") {
+      // An installation path is shown as optional, because it is: the run
+      // resolves it on the host that has the engine, which is usually not this
+      // one. The variable is still named, since an engine installed somewhere
+      // unusual is exactly the case the search cannot cover -- and naming it
+      // rather than this box keeps one machine's layout out of a shared file.
+      let help = descriptor.help;
+      let placeholder = null;
+      if (descriptor.installed_path) {
+        placeholder = "found when the run starts";
+        help =
+          (help ? help + " " : "") +
+          "Optional: MolCascade looks for this on the machine that runs the " +
+          "cascade. Fill it in, or export " + descriptor.environment_variable +
+          " there, only if the engine is installed somewhere unusual.";
+      }
       return field(
         descriptor.label,
         el("input", {
           type: "text",
           value: value === null || value === undefined ? "" : value,
+          placeholder: placeholder,
           on: {
             change: (event) => {
               const raw = event.target.value;
@@ -1399,7 +1618,7 @@
             },
           },
         }),
-        descriptor.help
+        help
       );
     }
     const unit = descriptor.unit ? " (" + descriptor.unit + ")" : "";
@@ -1504,12 +1723,13 @@
 
     if (option && option.thresholds.length) {
       const controls = option.thresholds.map((descriptor) => {
-        const container =
-          descriptor.target === "gate" ? (criterion.gate || {}).settings : criterion.settings;
+        const container = settingsFor(criterion, descriptor);
         const value = container ? getPath(container, descriptor.name) : undefined;
         return thresholdControl(descriptor, value, (next) => {
-          const bucket =
-            descriptor.target === "gate" ? (criterion.gate || {}).settings : criterion.settings;
+          // Read and write have to agree on which bag a setting lives in, and so
+          // does the check that reports it missing -- a gate field written to the
+          // criterion's own settings would leave an error nothing could clear.
+          const bucket = settingsFor(criterion, descriptor);
           if (!bucket) return;
           setPath(bucket, descriptor.name, next);
           render();
@@ -1945,20 +2165,68 @@
     dom.reviewDialog.showModal();
   }
 
-  function download() {
-    const blocking = blockingIssues();
-    if (blocking.length) {
-      setStatus("error", "Fix this first: " + blocking[0].text);
-      return;
-    }
-    const blob = new Blob([configText()], { type: "application/json;charset=utf-8" });
+  /* Hand the file to the browser, which puts it wherever downloads go.
+   *
+   * This is the only route a page opened from disk has, and it is why
+   * ``generate config --serve`` exists: the file lands in the downloads folder
+   * and has to be moved next to the library by hand, every single time.  When
+   * the served page falls back to here, `prefix` says why, so the operator is
+   * told the file moved rather than left to discover it. */
+  function downloadThroughBrowser(text, prefix) {
+    const blob = new Blob([text], { type: "application/json;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const anchor = el("a", { href: url, download: payload.default_filename });
     document.body.appendChild(anchor);
     anchor.click();
     document.body.removeChild(anchor);
     window.setTimeout(() => URL.revokeObjectURL(url), 5000);
-    setStatus("ok", "Saved " + payload.default_filename + ". Run: " + commandText());
+    const done = "Saved " + payload.default_filename + ". Run: " + commandText();
+    setStatus(prefix ? "warn" : "ok", prefix ? prefix + " " + done : done);
+  }
+
+  /* Post the file back to the command that served this page, which writes it
+   * beside the HTML under the name the run command already prints.
+   *
+   * The endpoint is relative on purpose: it resolves against the origin this
+   * document came from, which is the only origin `connect-src 'self'` permits,
+   * and it keeps an absolute URL out of a script that must stay inert when the
+   * same code is opened from a file.  A failure is never silent and never
+   * loses the file -- whatever went wrong, the browser download still runs. */
+  function saveThroughServer(text, endpoint) {
+    setStatus("", "Writing " + endpoint.path + "…");
+    const headers = { "Content-Type": "application/json" };
+    headers[endpoint.header] = endpoint.token;
+    window
+      .fetch(endpoint.url, { method: "POST", headers: headers, body: text })
+      .then((response) =>
+        response.json().then(
+          (body) => ({ ok: response.ok, body: body }),
+          () => ({ ok: false, body: {} })
+        )
+      )
+      .then((result) => {
+        if (!result.ok) throw new Error(result.body.error || "the server refused it");
+        setStatus("ok", "Wrote " + (result.body.path || endpoint.path) + ". Run: " + commandText());
+      })
+      .catch((error) => {
+        downloadThroughBrowser(
+          text,
+          "Could not write " + endpoint.path + " (" + error.message + ") —"
+        );
+      });
+  }
+
+  function download() {
+    const blocking = blockingIssues();
+    if (blocking.length) {
+      setStatus("error", "Fix this first: " + blocking[0].text);
+      return;
+    }
+    const text = configText();
+    /* Null in the document written to disk, so opening that file reaches for
+     * nothing; an object only in the render `--serve` builds in memory. */
+    if (payload.save_endpoint) saveThroughServer(text, payload.save_endpoint);
+    else downloadThroughBrowser(text, "");
   }
 
   function loadConfig(text) {

@@ -47,18 +47,32 @@ admet = ["admet-ai>=2.0"]
 # The docking tier's engines are compiled CUDA binaries or interpreters of their
 # own and cannot be pip-installed into this environment -- that is what makes
 # them isolated backends. What *can* be, and must be, is the converter that
-# turns a conformer into the PDBQT Uni-Dock reads.
-docking = ["meeko>=0.7,<0.8"]
+# turns a conformer into the PDBQT Uni-Dock reads, and the pose validator every
+# engine in the tier runs by default -- PoseBusters is in this extra rather than
+# an optional one of its own precisely because it is on by default, so an
+# environment that can dock is an environment that can check what it docked.
+# gemmi is meeko's dependency, not ours: meeko 0.7.1 imports it at package
+# import time and does not declare it, so `pip install meeko` alone yields a
+# package that raises ModuleNotFoundError the first time anything touches it.
+# It has to be named here because `molcascade doctor` cannot catch it -- the
+# probe asks importlib whether meeko *would be found*, not whether it would
+# import, so an undeclared transitive dependency is invisible to it and the
+# failure lands in the docking stage instead of the preflight.  Pinned to the
+# major meeko is tested against; drop the line when meeko declares it upstream.
+docking = ["gemmi>=0.6,<1", "meeko>=0.7,<0.8", "pdbfixer>=1.9,<2", "posebusters>=0.6,<1"]
 # Everything above, for the deployment machine that will run whatever a user
 # assembles in the builder rather than one known cascade.
 all-backends = [
   "FPSim2>=0.7",
   "admet-ai>=2.0",
   "chembl_structure_pipeline>=1.2",
+  "gemmi>=0.6,<1",  # meeko's undeclared import; see the docking extra above
   "medchem>=2.0",
   "meeko>=0.7,<0.8",
   "mordredcommunity>=2.0",
   "onnxruntime>=1.17",
+  "pdbfixer>=1.9,<2",
+  "posebusters>=0.6,<1",
 ]
 dev = [
   "hypothesis>=6.100,<7",
@@ -126,8 +140,8 @@ strict = true
 packages = ["molcascade"]
 
 # Scientific Python ships almost no type information: RDKit, PyArrow, Chemprop,
-# medchem, Mordred, FPSim2, Open Babel and the ChEMBL pipeline all lack stubs,
-# and PyYAML's are partial.  Without these overrides mypy reports 67 errors
+# medchem, Mordred, FPSim2, Open Babel, OpenMM, PDBFixer and the ChEMBL pipeline
+# all lack stubs, and PyYAML's are partial.  Without these overrides mypy reports 67 errors
 # about other people's packages, which is enough noise to hide the errors about
 # ours.  This silences the missing stubs only -- calls into these libraries are
 # still checked against whatever the runtime objects turn out to be, so an
@@ -141,7 +155,9 @@ module = [
     "mordred.*",
     "onnxruntime.*",
     "openbabel.*",
+    "openmm.*",
     "openpyxl.*",
+    "pdbfixer.*",
     "pyarrow.*",
     "rdkit.*",
     "yaml.*",

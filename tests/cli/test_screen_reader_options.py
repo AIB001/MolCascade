@@ -17,6 +17,7 @@ import json
 from pathlib import Path
 
 import pytest
+from fixtures.starter_cascade import starter_without_docking
 
 from molcascade.cascade import LibraryConfig, ScreeningConfig, load_screening_config
 from molcascade.cascade.library import XLSX_SOURCE, reader_settings, resolve_library
@@ -39,7 +40,11 @@ def _namespace(**overrides: object) -> argparse.Namespace:
 
 
 def _cascade_config(tmp_path: Path, **library: object) -> Path:
-    payload = build_cascade_builder_payload()["default_cascade"]
+    # Docking comes out: it is the one part of the starter that demands a
+    # receptor on the command line, and a receptor has nothing to do with how
+    # the library's spreadsheet is laid out.  Leaving it in would make every
+    # test in this module fail for a reason none of them are about.
+    payload = starter_without_docking(build_cascade_builder_payload()["default_cascade"])
     if library:
         payload = {**payload, "library": {**payload.get("library", {}), **library}}
     destination = tmp_path / "cascade.json"

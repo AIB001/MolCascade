@@ -25,14 +25,25 @@ import stat
 import subprocess
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import pyarrow.parquet as pq
-from pydantic import Field, ValidationError, field_validator
+from pydantic import Field, ValidationError, field_validator, model_validator
 
 from molcascade.config.models import StrictFrozenModel
 from molcascade.errors import PluginError
 from molcascade.parallel import ShardTask, read_side_input
+from molcascade.plugins.builtin._machine_paths import (
+    MachinePath,
+    absolute_path,
+    backend_root,
+    conda_environment,
+    engine_path,
+    environment_key,
+    fill_machine_paths,
+    path_from_environment,
+)
+from molcascade.plugins.builtin.docking.pose_quality import PoseQualityConfig
 
 #: How much of a failed engine's console output travels into the error context.
 #: Enough to show what it complained about, bounded so that a progress bar
@@ -44,21 +55,6 @@ MAX_LOG_TAIL = 4000
 MAX_RECEPTOR_BYTES = 256 * 1024 * 1024
 
 _READ_CHUNK = 4 * 1024 * 1024
-
-
-def absolute_path(value: str, *, field: str) -> str:
-    """Reject anything that is not an absolute path to a specific file.
-
-    A bare name would be resolved against this process's ``PATH`` or working
-    directory, and both are the wrong answer: an isolated engine lives in an
-    environment that deliberately is not on this ``PATH``, and a run's working
-    directory is not a stable part of its identity.
-    """
-
-    candidate = Path(value.strip()).expanduser()
-    if not value.strip() or not candidate.is_absolute():
-        raise ValueError(f"{field} must be an absolute path")
-    return str(candidate)
 
 
 def resolved_executable(configured: str, *, engine: str, hint: str) -> Path:
@@ -167,9 +163,11 @@ def verified_receptor(config: DockingEngineConfig) -> tuple[Path, str]:
         config.receptor_path,
         code="DOCKING_RECEPTOR_UNREADABLE",
         hint=(
-            "This is the prepared receptor structure for the docking tier. "
-            "MolCascade reads and hashes it but never edits it -- protonation, "
-            "tautomers, cofactors and missing loops are yours to decide."
+            "This is the prepared receptor structure for the docking tier -- "
+            "the one resolve_target repaired and hashed, not the file the "
+            "operator named. Protonation, tautomers and unresolved loops are "
+            "still yours to decide; what was repaired is listed in the run's "
+            "target notes."
         ),
     )
     if config.receptor_sha256 is not None and config.receptor_sha256 != digest:
@@ -414,12 +412,20 @@ class DockingEngineConfig(StrictFrozenModel):
     it is a number about.
     """
 
+    #: Which engine's environment overrides apply to this config.
+    engine_id: ClassVar[str] = ""
+
     schema_version: int = Field(default=1, ge=1, le=1)
     batch_size: int = Field(default=2_048, ge=1, le=250_000)
 
     #: Absolute path to the engine's program: the compiled binary, or the
-    #: interpreter inside the environment built for it.
-    executable: str = Field(min_length=1, max_length=4096)
+    #: interpreter inside the environment built for it.  May be left out of the
+    #: cascade entirely, in which case the run host answers it -- from
+    #: ``MOLCASCADE_<ENGINE>_EXECUTABLE`` or from where ``envs/bootstrap.sh``
+    #: installs, resolved by :func:`~molcascade.plugins.builtin._machine_paths.
+    #: fill_machine_paths` and required by
+    #: :func:`~molcascade.backends.preflight.preflight_engine_paths`.
+    executable: str = Field(default="", max_length=4096)
 
     #: Absolute path to the prepared receptor structure.
     receptor_path: str = Field(min_length=1, max_length=4096)
@@ -445,10 +451,46 @@ class DockingEngineConfig(StrictFrozenModel):
     #: the system temporary directory is a small tmpfs.
     scratch_dir: str | None = Field(default=None, max_length=4096)
 
+    #: Pose repair and validation, on by default for every engine.
+    #:
+    #: It lives here rather than in a separate cascade stage because a pose no
+    #: one checked is not a result an operator should have to opt in to
+    #: distrusting.  Measured on this project's own shortlist, 82% of poses that
+    #: passed the score gate were inside the protein's van der Waals surface,
+    #: and the score saw none of it (r = +0.01).  Turning it off is one field:
+    #: ``pose_quality: {enabled: false}``.
+    pose_quality: PoseQualityConfig = Field(default_factory=PoseQualityConfig)
+
+    @classmethod
+    def installed_paths(cls) -> tuple[MachinePath, ...]:
+        """Every path that describes *this machine's* installation, not the campaign.
+
+        The receptor and the reference ligand are deliberately absent: those are
+        facts about what is being screened, so they stay in the cascade where a
+        reviewer can see them.  These are the ones a host can answer for itself,
+        and each entry carries where to look and what installs it -- see
+        :class:`~molcascade.plugins.builtin._machine_paths.MachinePath`.
+
+        The base names the field without naming any candidate, because where an
+        engine's program lives is the one thing this class cannot know.  Each
+        engine overrides with its own.
+        """
+
+        return (MachinePath(field="executable", label="the engine's program"),)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _fill_machine_paths(cls, data: Any) -> Any:
+        return fill_machine_paths(
+            data,
+            engine_id=cls.engine_id,
+            paths=cls.installed_paths(),
+        )
+
     @field_validator("executable")
     @classmethod
     def _executable_is_absolute(cls, value: str) -> str:
-        return absolute_path(value, field="executable")
+        return engine_path(value, field="executable", engine_id=cls.engine_id)
 
     @field_validator("receptor_path")
     @classmethod
@@ -557,11 +599,18 @@ __all__ = [
     "MAX_RECEPTOR_BYTES",
     "BoxedDockingEngineConfig",
     "DockingEngineConfig",
+    "MachinePath",
     "absolute_path",
+    "backend_root",
+    "conda_environment",
     "enforce_population_cap",
+    "engine_path",
+    "environment_key",
+    "fill_machine_paths",
     "finite_number",
     "isolated_environment",
     "log_tail",
+    "path_from_environment",
     "population_size",
     "ranked",
     "require_gpu_lane",

@@ -362,6 +362,37 @@ def _property_tier(registry: PluginRegistry) -> TierConfig | None:
                 },
             ),
             _criterion_if_available(
+                "ring_topology",
+                registry,
+                settings={
+                    # The catalogue's own defaults, restated here so that reading
+                    # this file tells you what the starter cascade rejects
+                    # without opening another one.  All three are ceilings on
+                    # *shape*, and they exist because a generated library is the
+                    # one input where shape goes wrong in ways every other tier
+                    # in this funnel scores as excellent: a seven-ring flat
+                    # polycyclic with no rotatable bond passes Ro5, QED, the
+                    # alert catalogues and the ADMET panel, and is not a
+                    # molecule anyone would make.
+                    #
+                    # Set against the approved oral panel on the same standard
+                    # as the window above, these three reject 2 of 77 --
+                    # artemisinin and camptothecin -- which is the price of
+                    # excluding a failure mode nothing downstream can see.
+                    #
+                    # They are ceilings, not a preference, for the same reason
+                    # the size window is: this tier sees every molecule and its
+                    # mistakes are unrecoverable.  A project that wants "at most
+                    # two fused bicyclics" tightens 'max_fused_rings' to 2 and
+                    # sets 'max_fused_ring_total' to 4 -- measured at 10 of 77
+                    # on the same panel, which is a real cost and so is a
+                    # decision, not a default.
+                    "max_rings": 6,  # naphthyridine-fused kinase chemistry still fits
+                    "max_fused_rings": 4,  # one system; steroids are 4, so 4 not 3
+                    "max_ring_system_size": 18,  # atoms in one fused system
+                },
+            ),
+            _criterion_if_available(
                 "physchem_window",
                 registry,
                 option_id="mordred_descriptor_window",
@@ -399,9 +430,10 @@ def _property_tier(registry: PluginRegistry) -> TierConfig | None:
             "place a funnel can lose something it will never get back. The window is "
             "wide on purpose -- it is meant to exclude molecules that are not oral "
             "small molecules at all, not to express a preference among ones that are. "
-            "Measured against the approved oral panel the size window rejects 4 and "
-            "the aromatic ring cap rejects 1. Narrow it to a project window once you "
-            "know what you are looking for."
+            "Narrow it to a project window once you "
+            "know what you are looking for. Measured against the approved oral panel "
+            "the size window rejects 4, the aromatic ring cap 1 and the ring topology "
+            "ceilings 2."
         ),
     )
 
@@ -706,6 +738,125 @@ def _structure_qc_tier(registry: PluginRegistry) -> TierConfig | None:
     )
 
 
+def _conformer_tier(registry: PluginRegistry) -> TierConfig | None:
+    """One embedded, minimised conformer per survivor, for the docking tier below.
+
+    It is a tier of its own rather than a step inside each engine because two
+    engines follow it and they must dock *the same* geometry.  Embedding once
+    and handing both the identical conformer is what makes their two scores
+    comparable; embedding inside each would give Uni-Dock and KarmaDock
+    different starting coordinates and turn every disagreement between them
+    into a question about which conformer, not which scoring function.
+    """
+
+    criterion = _criterion_if_available(
+        "ligand_conformers",
+        registry,
+        settings={
+            # One conformer, not an ensemble.  Both engines below do their own
+            # conformational search from whatever they are given, so a second
+            # input conformer buys a second copy of that search rather than
+            # more coverage -- and at this position in the funnel that is the
+            # single most expensive thing this file could ask for.
+            "conformers_per_molecule": 1,
+            "embed_attempts": 3,
+            "minimize": True,
+            "max_minimize_iterations": 500,
+            "prune_rms_threshold": 0.5,
+        },
+    )
+    if criterion is None:
+        return None
+    return TierConfig(
+        id="t8_ligand_conformers",
+        title="3D conformer generation",
+        mode="serial",
+        criteria=(criterion,),
+        note=(
+            "The handoff from 2D to 3D. Everything above this line is a property of "
+            "the graph; everything below needs coordinates. A molecule that will not "
+            "embed leaves here, and the run records why rather than letting it reach "
+            "an engine that would report it as a bad score."
+        ),
+    )
+
+
+def _docking_tier(registry: PluginRegistry) -> TierConfig | None:
+    """Two engines, in parallel, against the same receptor and the same conformer.
+
+    ``all`` rather than ``serial`` is the whole design of this tier.  Run in
+    series, Uni-Dock's rejects never reach KarmaDock and the run can only say
+    what the first engine thought; run in parallel, both score every molecule
+    that arrives and the survivors are the ones *both* engines liked -- the
+    same set series would have produced, but with the per-engine numbers for
+    everything, so a disagreement is visible instead of invisible.  Consensus
+    between an empirical function and a learned one is the cheapest real
+    protection there is against a pose that is an artefact of one of them.
+
+    The cost of parallel is that KarmaDock sees the whole tier input rather
+    than Uni-Dock's survivors.  KarmaDock is a GPU screening model at
+    thousands of ligands a minute, so on the populations that reach here that
+    is minutes, and it buys the second opinion on every molecule rather than
+    on the ones the first engine already approved.
+
+    The thresholds are deliberately strict.  This tier is the last one before
+    the shortlist, so it is the only place where being wrong costs nothing but
+    compute: a molecule it rejects was going to be rejected by a chemist.
+    """
+
+    criteria = [
+        criterion
+        for criterion in (
+            _criterion_if_available(
+                "docking_score",
+                registry,
+                option_id="unidock",
+                config_id="docking_score",
+                label="Docking score · Uni-Dock",
+                # -9.5 kcal/mol is roughly the top few percent of a Vina
+                # distribution on a kinase pocket; it is a shortlist threshold,
+                # not a binding prediction, and Vina's own error bar is wider
+                # than the gap between -9.5 and -9.0.  What it is really doing
+                # is fixing the size of what reaches a human.
+                gate_settings={"maximum": -9.5},
+            ),
+            _criterion_if_available(
+                "docking_score",
+                registry,
+                option_id="karmadock",
+                # A second criterion on the same slot needs its own id: the
+                # config id is what the trace, the score table and the pose SDF
+                # are named after, and two stages cannot share one.
+                config_id="docking_score_2",
+                label="Docking score · KarmaDock",
+                # KarmaDock's MDN score is not a kcal/mol and does not convert
+                # to one -- higher is better, and 45 is its own scale.  Pairing
+                # it with the Vina cut is the point: two scales that cannot be
+                # averaged, so agreement means something.
+                gate_settings={"minimum": 45.0},
+            ),
+        )
+        if criterion is not None
+    ]
+    if not criteria:
+        return None
+    return TierConfig(
+        id="t9_docking",
+        title="Docking",
+        mode="all",
+        criteria=tuple(criteria),
+        note=(
+            "The last tier, and the only one that needs a protein: a run that reaches "
+            "it without '--receptor' and a binding site is refused before it reads its "
+            "first molecule. Both engines score every molecule that arrives and both "
+            "must pass, so the shortlist is what two independent functions agreed on. "
+            "Poses are kept and checked -- PoseBusters runs inside each engine -- so "
+            "what leaves here is a structure, not just a number. Delete this tier in "
+            "the builder if you are screening without a target."
+        ),
+    )
+
+
 def default_cascade(
     *,
     registry: PluginRegistry | None = None,
@@ -724,6 +875,8 @@ def default_cascade(
             _alerts_tier(active),
             _synthesis_tier(active),
             _structure_qc_tier(active),
+            _conformer_tier(active),
+            _docking_tier(active),
         )
         if tier is not None
     ]

@@ -87,7 +87,13 @@ class ReferenceSimilarityConfig(StrictFrozenModel):
     )
 
     schema_version: int = Field(default=1, ge=1, le=1)
-    reference_path: str | None = "leads.csv"
+    #: The lead set, as a path this machine can open.  There is deliberately no
+    #: default: ``"leads.csv"`` used to be one, and a relative name that almost
+    #: never exists is worse than nothing, because it passes ``molcascade
+    #: validate`` -- which reports ``Valid cascade`` and ``Backends ready`` --
+    #: and then fails at the first row of a run that has already been paid for.
+    #: Unset means the objective validator below refuses the stage up front.
+    reference_path: str | None = None
     reference_sha256: str | None = None
     references: tuple[ReferenceRecord, ...] = ()
     file_format: ReferenceFileFormat = ReferenceFileFormat.AUTO
@@ -131,6 +137,20 @@ class ReferenceSimilarityConfig(StrictFrozenModel):
         enum_type = enum_types[info.field_name]
         return enum_type(value) if isinstance(value, str) else value
 
+    @field_validator("reference_path", mode="before")
+    @classmethod
+    def _blank_reference_path_is_unset(cls, value: Any) -> Any:
+        """Treat an empty box in the builder as "not configured".
+
+        Otherwise a config exported with the field left blank carries
+        ``reference_path: ""``, which is a path to nothing and would be reported
+        as a missing file rather than as a stage nobody finished filling in.
+        """
+
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
     @field_validator("reference_sha256")
     @classmethod
     def _validate_sha256(cls, value: str | None) -> str | None:
@@ -143,7 +163,11 @@ class ReferenceSimilarityConfig(StrictFrozenModel):
         if self.references and self.reference_path is not None:
             raise ValueError("use either embedded references or reference_path, not both")
         if not self.references and self.reference_path is None:
-            raise ValueError("embedded references or reference_path is required")
+            raise ValueError(
+                "this criterion compares against a reference set and none was "
+                "given: set reference_path to a local CSV/TSV/SMI file of known "
+                "actives, or remove the criterion"
+            )
         if len(self.references) > self.max_reference_count:
             raise ValueError("embedded references exceed max_reference_count")
         if self.objective is SimilarityObjective.ANALOGUE:

@@ -29,6 +29,7 @@ from molcascade.cascade.models import (
     TierConfig,
     TierMode,
 )
+from molcascade.cascade.target import placeholder_target
 from molcascade.config.models import PipelineConfig
 from molcascade.contracts import DECISION_V1, PARENT_V1
 from molcascade.errors import ConfigError
@@ -78,6 +79,7 @@ class LoweredCascade:
     library_path: str
     origins: tuple[StageOrigin, ...] = field(default_factory=tuple)
     library_is_placeholder: bool = False
+    target_is_placeholder: bool = False
 
     def origin_of(self, stage_id: str) -> StageOrigin | None:
         return next((origin for origin in self.origins if origin.stage_id == stage_id), None)
@@ -453,6 +455,7 @@ def lower_cascade(
     library_path: str | None = None,
     library_format: LibraryFormat | None = None,
     allow_missing_library: bool = False,
+    allow_missing_target: bool = False,
     target: TargetConfig | None = None,
 ) -> LoweredCascade:
     """Render a cascade as an ordered, compilable :class:`PipelineConfig`.
@@ -460,6 +463,14 @@ def lower_cascade(
     Set ``allow_missing_library`` to compile a cascade that names no library --
     the shape of the funnel is checkable long before a file is chosen.  The
     result is marked as carrying a placeholder path and must not be executed.
+
+    ``allow_missing_target`` is the same courtesy for the protein, and needed for
+    the same reason: the receptor arrives on the command line, so a docking
+    cascade on disk normally carries no target block at all, and without this the
+    compiler's per-stage validation would make every such file look broken.  The
+    result is marked as carrying a placeholder target and must not be executed;
+    a run is refused, by stage and by flag, in
+    :func:`~molcascade.backends.preflight.preflight_docking_target`.
 
     ``target`` overrides the cascade's own target block, which is how the run-
     time flags (``--receptor`` and friends) reach the docking stages without the
@@ -469,6 +480,12 @@ def lower_cascade(
     active_registry = registry or create_builtin_registry()
     accumulator = _StageAccumulator()
     active_target = cascade.target if target is None else target
+    target_is_placeholder = False
+    if active_target is None and allow_missing_target:
+        active_target = placeholder_target(cascade, registry=active_registry)
+        # None when nothing in the cascade docks, which is not a placeholder --
+        # there was nothing to stand in for.
+        target_is_placeholder = active_target is not None
 
     source_descriptor = _descriptor(
         active_registry, cascade.ingest.backend, where="the ingest step"
@@ -545,6 +562,7 @@ def lower_cascade(
         library_path=resolved.path,
         origins=tuple(accumulator.origins),
         library_is_placeholder=resolved.is_placeholder,
+        target_is_placeholder=target_is_placeholder,
     )
 
 

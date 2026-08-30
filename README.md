@@ -62,7 +62,7 @@ what turns that choice into an install.
 | Structural validity (ChEMBL option) | `pip install "molcascade[standardize]"` | `chembl_structure_pipeline>=1.2` | EBI's curation checker on its published 0–9 penalty scale — a second toolkit's opinion, not RDKit's |
 | Similarity to reference leads (indexed option) | `pip install "molcascade[similarity]"` | `FPSim2>=0.7` | Popcount-bounded nearest-reference search; worth switching to above roughly 1,000 references |
 | Custom model prediction | `pip install "molcascade[custom-model]"` | `onnxruntime>=1.17` | Runs your own model from an ONNX bundle. ONNX is a data format, so nothing in the bundle executes as Python |
-| Docking score (Uni-Dock option) | `pip install "molcascade[docking]"` | `meeko>=0.7` | Turns a conformer — and the receptor, once — into the PDBQT Uni-Dock reads. The engines themselves are not pip packages; see [Docking engines](#docking-engines-live-in-their-own-environments) |
+| Docking score (Uni-Dock option) | `pip install "molcascade[docking]"` | `meeko>=0.7`, `pdbfixer>=1.9`, `gemmi` | Meeko turns a conformer — and the receptor, once — into the PDBQT Uni-Dock reads. PDBFixer repairs that receptor first: solvent and co-crystallised matter out, unresolved side chains rebuilt, metals kept, unresolved loops left alone and named in the run notes. The engines themselves are not pip packages; see [Docking engines](#docking-engines-live-in-their-own-environments). `gemmi` is meeko's own undeclared import, named here because installing meeko without it produces a package that imports fine to `doctor` and raises on first use |
 
 `pip install "molcascade[all-backends]"` installs all seven at once, which is the right choice
 for a machine that has to run whatever a user assembles in the builder. The quotes matter:
@@ -105,7 +105,7 @@ absolute path to what it should run — the same shape AiZynthFinder already use
 | Engine | Licence | What goes in `executable` | Weights |
 | --- | --- | --- | --- |
 | [Uni-Dock](https://github.com/dptech-corp/Uni-Dock) | Apache-2.0 | the `unidock` binary | none — its scoring functions are physics |
-| [KarmaDock](https://github.com/schrojunzhang/KarmaDock) | Apache-2.0 | the `python` inside its environment, plus `repo_path` | Zenodo record 7789066, downloaded **into the checkout**: `virtual_screening.py` loads them from a fixed path with no flag to redirect it |
+| [KarmaDock](https://github.com/schrojunzhang/KarmaDock) | Apache-2.0 | the `python` inside its environment, plus `repo_path` | committed to the checkout as `trained_models/karmadock_screening.pkl`, so there is nothing to fetch: `virtual_screening.py` loads them from that fixed path with no flag to redirect it |
 | [GNINA 1.3](https://github.com/gnina/gnina) | GPL-2.0-or-later | the `gnina` binary | compiled into the binary |
 
 GNINA is copyleft only because it links Open Babel, and the default deployment policy
@@ -131,10 +131,84 @@ $ molcascade doctor --allow-copyleft
   unavailable gnina                — local command is not installed: gnina
 ```
 
-### If you want a CUDA build of torch
+### Setting an engine's path once per machine
 
-Install it **before** the ADMET extra. Ask pip for `admet-ai` first and it resolves `torch`
-to the CPU wheel — 712 MB that then has to be replaced:
+Where an engine is installed is a fact about the machine, not about the campaign. Writing it
+into every `cascade.json` makes the file non-portable — the person you hand it to has to edit
+it before it will start — and makes you retype the same two paths into every config the
+builder generates. So a cascade may leave every installation path blank, and three things
+answer in turn, in this order:
+
+1. **the cascade**, if it names one;
+2. **`MOLCASCADE_<ENGINE>_<FIELD>`**, exported once in your shell profile;
+3. **where `envs/bootstrap.sh` installs** — a sibling conda environment named after the
+   engine, `~/molcascade-backends`, `~/aizynth-data`. Nothing to configure: an operator who
+   ran the bootstrap script has already said where things are by putting them there.
+
+Step 3 looks in `$MOLCASCADE_CONDA_ENVS` if you set it (a `:`-separated list that *replaces*
+the guesses — for a `--prefix` tree, a mamba root or a venv), otherwise in `$CONDA_ENVS_DIRS`,
+beside this environment and below it. `MOLCASCADE_BACKEND_ROOT` and `MOLCASCADE_AIZYNTH_DATA`
+move the other two trees, and the bootstrap script reads the same variables with the same
+defaults, so the two cannot drift apart.
+
+The variables for step 2:
+
+| Variable | Answers |
+| --- | --- |
+| `MOLCASCADE_UNIDOCK_EXECUTABLE` | the `unidock` binary |
+| `MOLCASCADE_KARMADOCK_EXECUTABLE` | the `python` inside KarmaDock's environment |
+| `MOLCASCADE_KARMADOCK_REPO_PATH` | the KarmaDock checkout |
+| `MOLCASCADE_GNINA_EXECUTABLE` | the `gnina` binary |
+| `MOLCASCADE_AIZYNTHFINDER_EXECUTABLE` | the `aizynthcli` inside AiZynthFinder's environment |
+| `MOLCASCADE_AIZYNTHFINDER_CONFIG_PATH` | the AiZynthFinder YAML naming your policy and stock |
+
+A path written in the cascade always wins, so a config that names its own is never silently
+redirected by the machine it lands on, and a host with two KarmaDocks gets the one it named. A
+path that came from a variable or from the search is validated, hashed into the stage's
+identity and recorded in the provenance exactly as a typed-in one would be — nothing becomes
+less reproducible for having been found rather than typed. What is found is always a specific
+absolute path this project's own installer writes, never a `PATH` search: an isolated engine's
+`bin` is deliberately not on this environment's `PATH`, so resolving a bare command name there
+would find the wrong installation or none, and that stays refused.
+
+Only *machine* paths work this way. The receptor, the reference ligand and your lead set are
+the questions a campaign is asking, so they stay in the file that describes it; a variable
+that supplied a receptor would let a cascade naming no protein run against whatever the last
+project left exported.
+
+**Nothing is decided when the cascade is written.** The builder runs on a laptop and the
+cascade runs on the box with the cards, so the page never bakes in one machine's answer: an
+installation path is exported blank, marked *found when the run starts*, and settled on the
+host that can actually look — once, before the first molecule is read. A gap there stops the
+run immediately, names every gap at once, says where it looked, and gives you both ways out:
+
+```
+1 installation path(s) this run needs are not resolved on this machine:
+  docking_score: the Uni-Dock binary was not found on this machine, and the cascade does
+      not name it ('executable' is blank). Looked in: /opt/conda/envs/unidock/bin/unidock,
+      /home/you/molcascade-backends/bin/unidock.
+      answer it once for this machine: export MOLCASCADE_UNIDOCK_EXECUTABLE=/path/to/it
+hint: Not installed yet? Run: bash envs/bootstrap.sh unidock. …
+```
+
+A path that is present but wrong is reported the same way and names where it came from:
+
+```
+nothing exists at the configured 'executable': /opt/envs/aizynth/bin/aizynthcli
+  (from MOLCASCADE_AIZYNTHFINDER_EXECUTABLE)
+```
+
+The other two kinds of missing tool are checked at the same moment, coarsest first: engines,
+then model weights that are not in the asset root (`molcascade assets fetch …`), then Python
+packages that are not importable in this environment (`pip install …`). Each names every gap it
+finds, so you install one class of thing per attempt rather than one file per attempt. See
+[Missing tools and weights](#missing-tools-and-weights).
+
+### torch and the GPU
+
+The ADMET extra brings a CUDA-enabled `torch` on its own — a plain `pip install` of it
+resolved `torch 2.13.0+cu130` and saw the card without any `--index-url` argument. If you
+need a specific CUDA minor, install it first and pip will keep it:
 
 ```bash
 python -m pip install torch --index-url https://download.pytorch.org/whl/cu124
@@ -142,6 +216,13 @@ python -m pip install "molcascade[admet]"
 ```
 
 `molcascade doctor` prints what it found, including whether torch sees a GPU.
+
+### A worked, pinned installation
+
+[`envs/README.md`](envs/README.md) records one machine's complete provisioning — exact
+versions for all four environments, the GNINA binary's checksum and its one non-static
+library, the absolute paths each isolated criterion wants, and `envs/bootstrap.sh` to
+reproduce the whole thing on a new host.
 
 ## Quick start
 
@@ -158,6 +239,22 @@ block names both the *question* it answers and the *tool* answering it, so swapp
 for `medchem`, `rd_filters`, or your own model is a change of block, not a rebuild. Tools
 whose package or weights are not installed here are shown greyed out, with the exact command
 that would provide them.
+
+A page opened from a file cannot choose where its download goes, so `cascade.json` lands in
+the browser's downloads folder and has to be moved next to the library every time. Add
+`--serve` to skip that: the same offline HTML is still written to `--output`, and a loopback
+server hands out a second copy of it whose **Download config** button writes `cascade.json`
+into the same directory as the HTML.
+
+```bash
+molcascade generate config --output ./molcascade-builder.html --serve
+# Serving it at http://127.0.0.1:PORT/ — Ctrl-C when you are done.
+```
+
+The server answers 127.0.0.1 only, accepts one request the page it served can make (a token
+it never writes to disk), refuses anything that is not a cascade file before writing a byte,
+and always writes to the one path named on the command line. The HTML it leaves behind
+carries no token and no endpoint — mail it to a colleague and they get the offline builder.
 
 Download the configuration from the builder, then screen a library with it:
 
@@ -198,6 +295,18 @@ A run whose cascade holds a docking tier and whose command line holds no recepto
 before the first molecule is read, naming the flags that would fix it. The receptor is read,
 hashed and validated — never edited: protonation, tautomers, cofactors, metals and missing
 loops decide the science, so MolCascade refuses to guess them.
+
+`molcascade validate` is the other side of that: a docking cascade with no receptor in it is
+*valid*, because that is the shape it is supposed to have, and validating it says so in one
+line rather than failing.
+
+```
+This cascade names no target; its docking stages were checked without one.
+hint: Pass '--receptor RECEPTOR.pdb' together with one binding-site definition: …
+```
+
+Which is the same courtesy the library already gets — neither the protein nor the molecules
+belong to the policy, so a file that names neither is finished, not broken.
 
 ### The docking scores come out beside the shortlist
 
@@ -315,7 +424,9 @@ conda run -n aizynth which aizynthcli                      # the path the stage 
 The **Retrosynthesis route search** block then asks for two absolute paths: that `aizynthcli`,
 and the `config.yml` that `download_public_data` wrote. Nothing is resolved on `PATH` — the
 whole point is that this environment cannot see that one — and both paths are checked before
-the first molecule is read, so a wrong one costs a second rather than a tier.
+the first molecule is read, so a wrong one costs a second rather than a tier. Both are
+per-machine, so both can come from the environment instead of the cascade: see [setting an
+engine's path once per machine](#setting-an-engines-path-once-per-machine).
 
 Two things are worth knowing before you enable it. Tree search is **seconds to minutes per
 molecule**, so it belongs at the very bottom of the funnel; the stage refuses more than
@@ -399,6 +510,44 @@ Prediction and synthesis modules intentionally separate evidence from policy. Fo
 ADMET-AI emits endpoint/model prediction rows; a prediction threshold gate turns one
 reviewed endpoint into a complete PASS/REJECT decision stream. Missing evidence is rejected,
 not silently accepted. The same pattern applies to synthetic-accessibility scores.
+
+### Ring topology, for libraries a model drew
+
+Property windows measure how heavy a molecule is, which on a generated library turns out to
+say almost nothing about what shape it is. Structure generators produce fused polycyclic
+sheets -- seven or eight rings in one system, no rotatable bond anywhere -- and those
+molecules pass Lipinski, score well on QED, raise no PAINS match, clear every ADMET
+endpoint, and then dock *better* than the flexible molecules beside them, because a rigid
+surface makes many contacts and pays no conformational entropy for them. Over one
+2,000-molecule run here, molecules with four or more fused rings were 71.5% of the input,
+48.7% after the synthesis tier, and 83.3% of the final shortlist: the funnel does not
+select against the shape, docking selects for it.
+
+The **Ring topology and rigidity** criterion is the optional block for this, and it sits in
+the physicochemical tier so it runs before anything expensive. It exists because the
+obvious existing rules do not do what their names suggest: `medchem`'s
+`N_FUSED_AROMATIC_RINGS_TOGETHER` and Mordred's `nFRing` both count fused *systems*, so
+pentacene scores 1 and passes any cap you can set. This gate counts the rings *inside* the
+largest system, ignoring aromaticity, and reports seven other numbers beside it.
+
+Three bounds ship on, each taking a published value rather than a preference: `max_rings`
+6 and `max_ring_system_size` 18 atoms are FAF-Drugs4's own drug-like thresholds, calibrated
+by its authors so that up to 90% of 916 approved oral drugs pass, and `max_fused_rings` 4
+is one step looser than Toxtree's three-fused-aromatic-ring alert, which is what lets the
+steroids through. Together they leave 30 of 33 approved drugs standing, costing morphine,
+camptothecin and artemisinin.
+
+The other five -- largest single ring, a rotatable-bond floor, ring-atom fraction, sp3
+fraction and bridgehead count -- ship empty, and that is the finding rather than an
+omission. Each is a reasonable thing to want on a generated library and none has a
+threshold the literature supports against real drugs: a floor of three rotors would reject
+caffeine, estradiol and olanzapine, which have none; a 0.75 ring-atom ceiling would reject
+olanzapine at 0.91; and Lovering's sp3 figures are cohort means, so a 0.25 floor rejects
+imatinib at 0.24. They are configurable because on a model-generated library they are
+exactly the right knobs, and they are off because a default has to survive the drugs that
+already work. Every bound is nullable, every PASS decision carries all eight measured
+values into the trace CSV, and `tests/plugins/test_ring_topology_gate.py` pins the drug
+panel so that moving a default names the drugs it costs.
 
 ### Parallel and Serial criteria
 

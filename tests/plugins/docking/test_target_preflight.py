@@ -24,7 +24,7 @@ from pathlib import Path
 import pytest
 
 from molcascade.backends.preflight import preflight_docking_target
-from molcascade.cascade.models import BoxConfig, TargetConfig
+from molcascade.cascade.models import BoxConfig, ReceptorPreparation, TargetConfig
 from molcascade.cascade.target import (
     BOX_PADDING_ANGSTROM,
     box_from_structure,
@@ -94,6 +94,15 @@ M  END
 $$$$
 """
 
+#: Take the receptor exactly as written above.
+#:
+#: ``resolve_target`` repairs a receptor before deriving anything from it, which
+#: is the right default and the wrong thing for these tests to carry: repair
+#: needs pdbfixer installed, and it would run on a three-atom alanine that
+#: exists to be read by eye.  Repair has its own file.  Here the receptor stays
+#: one fixed set of bytes, so every assertion below is about derivation alone.
+_AS_SUPPLIED = ReceptorPreparation(enabled=False)
+
 #: The box every fixture above describes: the atoms' extent plus padding on
 #: each side. Stated once, checked against each format.
 _EXPECTED_CENTRE = (10.0, 20.0, 30.0)
@@ -127,7 +136,7 @@ def _stage(**config: object) -> StageConfig:
     return StageConfig(
         id="dock",
         slot="dock",
-        plugin="docking.unidock@0.1.0",
+        plugin="docking.unidock@0.2.0",
         config=dict(config),  # type: ignore[arg-type]
     )
 
@@ -466,6 +475,7 @@ def test_resolve_derives_only_what_the_cascade_s_engines_require(
     target = TargetConfig(
         name="site",
         receptor_path=str(receptor),
+        preparation=_AS_SUPPLIED,
         reference_ligand_path=str(ligand),
     )
     resolved = resolve_target(
@@ -490,6 +500,7 @@ def test_an_explicit_box_is_never_recomputed(receptor: Path, tmp_path: Path) -> 
     target = TargetConfig(
         name="site",
         receptor_path=str(receptor),
+        preparation=_AS_SUPPLIED,
         box=BoxConfig(
             center_x=1.5, center_y=2.5, center_z=3.5, size_x=11.0, size_y=12.0, size_z=13.0
         ),
@@ -520,6 +531,7 @@ def test_a_derived_box_travels_beside_the_ligand_it_came_from(
         TargetConfig(
             name="site",
             receptor_path=str(receptor),
+            preparation=_AS_SUPPLIED,
             reference_ligand_path=str(ligand),
         ),
         requirements=frozenset({"receptor_path", "reference_ligand_path", "center_x"}),
@@ -559,6 +571,7 @@ def test_a_hand_written_box_that_misses_the_hand_written_ligand_is_refused(
     target = TargetConfig(
         name="site",
         receptor_path=str(receptor),
+        preparation=_AS_SUPPLIED,
         reference_ligand_path=str(ligand),
         # The ligand's centre is (10, 20, 30); this box reaches x = 5 at most.
         box=BoxConfig(
@@ -588,6 +601,7 @@ def test_a_hand_written_box_around_the_same_site_is_kept(receptor: Path, tmp_pat
         TargetConfig(
             name="site",
             receptor_path=str(receptor),
+            preparation=_AS_SUPPLIED,
             reference_ligand_path=str(ligand),
             box=tight,
         ),
@@ -613,6 +627,7 @@ def test_an_operator_supplied_pdbqt_is_used_instead_of_deriving_one(
     target = TargetConfig(
         name="site",
         receptor_path=str(receptor),
+        preparation=_AS_SUPPLIED,
         receptor_pdbqt_path=str(prepared),
         box=BoxConfig(
             center_x=1.0, center_y=2.0, center_z=3.0, size_x=10.0, size_y=10.0, size_z=10.0

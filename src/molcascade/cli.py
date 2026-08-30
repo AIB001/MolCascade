@@ -44,9 +44,11 @@ from molcascade.assets import (
 from molcascade.assets.fetch import fetch_asset, render_manifest
 from molcascade.backends import Availability, ProbePolicy, create_backend_registry
 from molcascade.backends.preflight import (
+    TARGET_RUN_TIME_HINT,
     copyleft_backends,
     preflight_backends,
     preflight_docking_target,
+    preflight_engine_paths,
 )
 from molcascade.cascade import (
     LibraryConfig,
@@ -92,6 +94,7 @@ from molcascade.runtime import (
     stage_cache_key,
 )
 from molcascade.runtime.models import validate_run_id
+from molcascade.trace import trace_run
 from molcascade.ui import generate_cascade_builder, generate_config_builder
 from molcascade.ui.report import generate_run_report
 
@@ -144,6 +147,15 @@ def _json_dump(value: Any, stream: TextIO) -> None:
     stream.write("\n")
 
 
+#: Context keys ending here hold a tool's own account of why it failed, captured
+#: from a subprocess.  That is the one part of ``context`` a person needs to
+#: read, so human output carries it too; everything else in there -- paths,
+#: counts, return codes -- is for a machine and stays behind ``--json``.  The
+#: suffix is the whole convention: any backend that shells out opts in by naming
+#: its key for it.
+_TRANSCRIPT_CONTEXT_SUFFIX = "_output"
+
+
 def _render_error(error: MolCascadeError, *, as_json: bool) -> None:
     if as_json:
         _json_dump({"ok": False, "error": error.as_dict()}, sys.stderr)
@@ -151,6 +163,18 @@ def _render_error(error: MolCascadeError, *, as_json: bool) -> None:
     print(f"molcascade: error [{error.code}]: {error.message}", file=sys.stderr)
     if error.hint:
         print(f"hint: {error.hint}", file=sys.stderr)
+    for key, value in sorted(error.context.items()):
+        # Without this the transcript reaches only ``--json``, which an operator
+        # has to already suspect exists before they can ask for it -- and they
+        # would have to reproduce the failure a second time to see it.
+        if not key.endswith(_TRANSCRIPT_CONTEXT_SUFFIX) or not isinstance(value, str):
+            continue
+        transcript = value.strip()
+        if not transcript:
+            continue
+        print(f"{key}:", file=sys.stderr)
+        for line in transcript.splitlines():
+            print(f"  {line}", file=sys.stderr)
 
 
 def _parallel_parser_options(parser: argparse.ArgumentParser) -> None:
@@ -213,7 +237,11 @@ def _target_parser_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--receptor",
         type=Path,
-        help="Protein structure to dock into, in PDB. Read and hashed, never edited",
+        help=(
+            "Protein structure to dock into, in PDB. Hashed, then repaired -- "
+            "solvent and co-crystallised matter removed, unresolved side chains "
+            "rebuilt -- with every change named in the run's target notes"
+        ),
     )
     parser.add_argument(
         "--reference-ligand",
@@ -240,16 +268,53 @@ def _target_parser_options(parser: argparse.ArgumentParser) -> None:
             "automatic meeko preparation cannot cope with the structure"
         ),
     )
+    parser.add_argument(
+        "--no-receptor-prepare",
+        dest="prepare_receptor",
+        action="store_const",
+        const=False,
+        default=None,
+        help=(
+            "Dock the structure exactly as supplied. For a PDB already prepared "
+            "by hand; note that meeko refuses any structure with an incomplete "
+            "residue in it"
+        ),
+    )
+    parser.add_argument(
+        "--receptor-keep-waters",
+        dest="keep_waters",
+        action="store_const",
+        const=True,
+        default=None,
+        help="Keep crystallographic waters, for a site where a bridging water is part of the model",
+    )
+    parser.add_argument(
+        "--receptor-keep-heterogens",
+        dest="keep_heterogens",
+        action="store_const",
+        const=True,
+        default=None,
+        help=(
+            "Keep co-crystallised ligands, sugars and buffers as part of the "
+            "receptor. Metals are kept either way"
+        ),
+    )
 
 
 @dataclass(frozen=True, slots=True)
 class _TargetArguments:
-    """The five target flags, carried as one value.
+    """The target flags, carried as one value.
 
     They are only ever used together -- a receptor without a site is an error
     and a site without a receptor is a different one -- so threading them
-    through the entry points as five parameters would be five chances to pass
-    four.  The empty instance is what the forms that cannot spell them pass.
+    through the entry points one parameter at a time would be one chance per
+    flag to drop one.  The empty instance is what the forms that cannot spell
+    them pass.
+
+    The three preparation flags default to ``None`` rather than to the recipe's
+    own defaults, because absent has to be distinguishable from off: a cascade
+    that turned preparation off in its target block must stay off through a run
+    that says nothing about it.
     """
 
     receptor: Path | None = None
@@ -257,6 +322,9 @@ class _TargetArguments:
     pocket: Path | None = None
     box: str | None = None
     receptor_pdbqt: Path | None = None
+    prepare_receptor: bool | None = None
+    keep_waters: bool | None = None
+    keep_heterogens: bool | None = None
 
     @classmethod
     def from_namespace(cls, arguments: argparse.Namespace) -> _TargetArguments:
@@ -266,6 +334,9 @@ class _TargetArguments:
             pocket=arguments.pocket,
             box=arguments.box,
             receptor_pdbqt=arguments.receptor_pdbqt,
+            prepare_receptor=getattr(arguments, "prepare_receptor", None),
+            keep_waters=getattr(arguments, "keep_waters", None),
+            keep_heterogens=getattr(arguments, "keep_heterogens", None),
         )
 
     def as_kwargs(self) -> dict[str, Any]:
@@ -275,6 +346,9 @@ class _TargetArguments:
             "pocket": self.pocket,
             "box": self.box,
             "receptor_pdbqt": self.receptor_pdbqt,
+            "prepare_receptor": self.prepare_receptor,
+            "keep_waters": self.keep_waters,
+            "keep_heterogens": self.keep_heterogens,
         }
 
 
@@ -386,13 +460,32 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=_DEFAULT_BUILDER_OUTPUT,
     )
-    generate_config.add_argument(
+    # Two different documents and two different ways of reaching one of them;
+    # a mutually exclusive group is what says "--serve serves the cascade
+    # builder" without a hand-written check further down.
+    generate_mode = generate_config.add_mutually_exclusive_group()
+    generate_mode.add_argument(
         "--pipeline",
         action="store_true",
         help=(
             "Generate the flat schema-1 pipeline graph editor instead of the "
             "tier-first cascade builder"
         ),
+    )
+    generate_mode.add_argument(
+        "--serve",
+        action="store_true",
+        help=(
+            "Also serve the builder on 127.0.0.1 so its Download button writes "
+            "cascade.json next to the generated HTML instead of into the "
+            "browser's downloads folder"
+        ),
+    )
+    generate_config.add_argument(
+        "--port",
+        type=int,
+        default=0,
+        help="Port for --serve (default: any free port)",
     )
 
     validate = commands.add_parser(
@@ -610,6 +703,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     export.add_argument("--json", action="store_true", dest="json_output")
 
+    trace = commands.add_parser(
+        "trace",
+        help="Write one CSV per stage, plus docked-pose SDFs, into a readable directory",
+    )
+    trace.add_argument("run_id")
+    trace.add_argument("--workspace", type=Path, default=_DEFAULT_WORKSPACE)
+    trace.add_argument(
+        "--output",
+        type=Path,
+        help="Directory to write. Defaults to <run-id>-trace in the current directory.",
+    )
+    trace.add_argument(
+        "--overwrite",
+        action="store_true",
+        help=(
+            "Replace a trace directory this tool wrote. Refuses to remove a "
+            "directory holding anything else."
+        ),
+    )
+    trace.add_argument("--json", action="store_true", dest="json_output")
+
     report = commands.add_parser("report", help="Generate a self-contained run report")
     report.add_argument("run_id")
     report.add_argument("--workspace", type=Path, default=_DEFAULT_WORKSPACE)
@@ -745,12 +859,21 @@ def _resolve_molecule_format(molecules: Path, requested: str) -> str:
     return "delimited"
 
 
-def _generate_config(output: Path, *, pipeline: bool = False) -> int:
+def _generate_config(
+    output: Path, *, pipeline: bool = False, serve: bool = False, port: int = 0
+) -> int:
     """Write the offline builder a first-time user opens in their browser.
 
     The cascade builder is the default surface.  ``--pipeline`` still reaches
     the flat graph editor, which is not an older skin of the same thing: it
     authors a schema-1 pipeline directly, which the cascade builder cannot do.
+
+    ``--serve`` does not change what is written; the HTML on disk is the same
+    offline artifact either way.  It adds a loopback server that hands out a
+    second render of it and writes what that page posts back beside the HTML,
+    which is the only way a browser will put the file where the operator wants
+    it -- a page opened from ``file://`` cannot choose a directory, and cannot
+    ask, because ``showSaveFilePicker`` is unavailable on a non-secure origin.
     """
 
     if pipeline:
@@ -759,8 +882,36 @@ def _generate_config(output: Path, *, pipeline: bool = False) -> int:
         return 0
     destination = generate_cascade_builder(output)
     print(f"Generated screening cascade builder: {destination}")
-    print("Open it in a browser, design the cascade, then download the config file.")
-    print("Screen a library with: molcascade screen --config cascade.json --library LIBRARY")
+    if not serve:
+        print("Open it in a browser, design the cascade, then download the config file.")
+        print("Screen a library with: molcascade screen --config cascade.json --library LIBRARY")
+        return 0
+    return _serve_config(destination, port=port)
+
+
+def _serve_config(destination: Path, *, port: int) -> int:
+    """Run the builder's save endpoint until the operator stops it.
+
+    Blocking is the point: the address has to stay valid for as long as someone
+    is designing a cascade, and the exports are the reason the command was run,
+    so the command reports each one and ends when the operator says so rather
+    than when the first file lands.
+    """
+
+    from molcascade.ui.serve import serve_cascade_builder
+
+    server = serve_cascade_builder(destination, port=port)
+    print(f"Serving it at {server.url}")
+    print(f"Its Download button writes {server.destination} — no copying required.")
+    print("Press Ctrl-C when you are done.")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print()
+    finally:
+        server.shutdown()
+    saved = len(server.saves)
+    print(f"Stopped. Wrote {server.destination} {saved} time{'' if saved == 1 else 's'}.")
     return 0
 
 
@@ -768,18 +919,44 @@ def _validate(config_path: Path, *, as_json: bool) -> int:
     screening = load_screening_config(config_path)
     registry = create_builtin_registry()
     placeholder_library = False
+    placeholder_target = False
     if screening.cascade is not None:
         lowered = lower_cascade(
             screening.cascade,
             registry=registry,
             allow_missing_library=True,
+            # The receptor arrives on the 'screen' command line, so a docking
+            # cascade on disk carries no target block.  Compiling one without a
+            # stand-in reports four Pydantic 'Field required' paragraphs about a
+            # file the operator was never meant to name here, which reads as "the
+            # cascade the builder exported is broken".  It is not; it is
+            # incomplete in exactly the way the library is, and is reported the
+            # same way.
+            allow_missing_target=True,
         )
         config = lowered.pipeline
         placeholder_library = lowered.library_is_placeholder
+        placeholder_target = lowered.target_is_placeholder
     else:
         assert screening.pipeline is not None  # ScreeningConfig always carries one kind
         config = screening.pipeline
     compiled = PipelineCompiler(registry).compile(config)
+    # The same three questions the run asks, asked in the same order and answered
+    # here without stopping anything.  A cascade leaves every installation path
+    # blank on purpose, so 'validate' on the host that will run it is the cheap
+    # way to find out whether this machine can answer them -- and on the laptop
+    # that authored it, an unanswered path is expected rather than a defect.
+    engine_note: str | None = None
+    engine_detail: str | None = None
+    try:
+        engines = preflight_engine_paths(compiled.stages, registry=registry)
+    except ConfigError as error:
+        engines = ()
+        # Both halves, as the backends branch below does: the message says which
+        # stage cannot find what and where it looked, the hint says how to
+        # provide it.  Either one alone leaves out the other's question.
+        engine_detail = str(error)
+        engine_note = error.hint or str(error)
     # Reported, never fatal.  A configuration is valid or not on its own terms;
     # whether *this* machine holds the weights is a property of the machine, and
     # authoring a cascade on a laptop to run on the GPU box has to keep working.
@@ -793,21 +970,36 @@ def _validate(config_path: Path, *, as_json: bool) -> int:
         asset_note = error.hint or str(error)
     # Same rule for the packages: naming the pip command here is the whole point
     # of validating on the machine that will not run the cascade.
+    backend_detail: str | None = None
     try:
         installed = preflight_backends(compiled.stages)
         backend_note: str | None = None
     except PluginError as error:
         installed = ()
+        # Both halves, because they answer different questions: the message says
+        # which stage is unhappy and why, the hint says what to do about it.
+        # Printing only the hint turned "this lead file does not exist" into a
+        # bare "pip install rdkit", which sends the operator to fix an
+        # installation that was never broken.
+        backend_detail = str(error)
         backend_note = error.hint or str(error)
     payload = {
         "valid": True,
         "kind": screening.kind,
         "name": config.name,
         "library_required": placeholder_library,
+        "target_required": placeholder_target,
+        "engines_ready": list(engines),
+        "engines_note": engine_note,
+        "engines_detail": engine_detail,
         "assets_ready": list(provisioned),
         "assets_note": asset_note,
         "backends_ready": list(installed),
         "backends_note": backend_note,
+        # The detail travels in the JSON too, so a script reading this is not
+        # left with only the hint -- which names a remedy without ever naming
+        # the stage or the path that needs it.
+        "backends_detail": backend_detail,
         "revision_id": compiled.revision_id,
         "stages": [
             {
@@ -836,6 +1028,24 @@ def _validate(config_path: Path, *, as_json: bool) -> int:
         print(f"Enabled stages: {len(compiled.stages)}")
         if placeholder_library:
             print("This cascade names no library; pass one with: molcascade screen --library PATH")
+        if placeholder_target:
+            # Two lines, like the backends branch below: the first says what was
+            # checked without, the second says what to type.  Sharing the hint
+            # with the run-time refusal keeps the two from naming different flags.
+            print("This cascade names no target; its docking stages were checked without one.")
+            print(f"hint: {TARGET_RUN_TIME_HINT}")
+        if engines:
+            print(f"Installations found: {', '.join(engines)}")
+        if engine_note is not None:
+            # The detail is printed whole rather than summarised: it already
+            # names the stage, the field, everywhere it looked and the variable
+            # that answers it, which is the whole of "why will this not run
+            # here".
+            if engine_detail is not None and engine_detail != engine_note:
+                print(f"Not runnable here yet: {engine_detail}")
+                print(f"hint: {engine_note}")
+            else:
+                print(f"Not runnable here yet: {engine_note}")
         if provisioned:
             print(f"Vendored assets ready: {', '.join(provisioned)}")
         if asset_note is not None:
@@ -843,7 +1053,11 @@ def _validate(config_path: Path, *, as_json: bool) -> int:
         if installed:
             print(f"Backends ready: {', '.join(installed)}")
         if backend_note is not None:
-            print(f"Not runnable here yet: {backend_note}")
+            if backend_detail is not None and backend_detail != backend_note:
+                print(f"Not runnable here yet: {backend_detail}")
+                print(f"hint: {backend_note}")
+            else:
+                print(f"Not runnable here yet: {backend_note}")
     return 0
 
 
@@ -1409,10 +1623,9 @@ def _run_pipeline(
     # file was never fetched -- the exact failure 'screen' refuses to ship.  The
     # extra compile is free by comparison: it reads no molecules.
     compiled = PipelineCompiler(registry).compile(config)
+    preflight_engine_paths(compiled.stages, registry=registry)
     preflight_assets(compiled.stages)
-    preflight_backends(
-        compiled.stages, policy=_probe_policy(allow_copyleft=allow_copyleft)
-    )
+    preflight_backends(compiled.stages, policy=_probe_policy(allow_copyleft=allow_copyleft))
     permitted = _permitted_licenses(compiled.stages, allow_copyleft=allow_copyleft)
     resources = _stage_resources(workers=workers, device=device)
     if not as_json:
@@ -1502,14 +1715,19 @@ def _docking_target(
     pocket: Path | None,
     box: str | None,
     receptor_pdbqt: Path | None,
+    prepare_receptor: bool | None = None,
+    keep_waters: bool | None = None,
+    keep_heterogens: bool | None = None,
 ) -> tuple[TargetConfig | None, tuple[str, ...]]:
     """Settle what this run docks into before it compiles anything.
 
-    Everything expensive or fragile about a target happens here, once: meeko
-    turns the PDB into a PDBQT, a reference ligand becomes six numbers, and the
-    receptor's bytes are hashed.  Doing it now rather than inside the docking
-    stage is what stops a run from spending the whole funnel and then finding
-    out that meeko cannot read the structure.
+    Everything expensive or fragile about a target happens here, once: the
+    structure is hashed and repaired, meeko turns the repaired PDB into a
+    PDBQT, and a reference ligand becomes six numbers.  Doing it now rather
+    than inside the docking stage is what stops a run from spending the whole
+    funnel and then finding out that meeko cannot read the structure -- and,
+    because all four consumers of the receptor read what this leaves behind, it
+    is what stops two of them from docking into different proteins.
     """
 
     merged = merge_target(
@@ -1519,6 +1737,9 @@ def _docking_target(
         pocket=pocket,
         box=box,
         receptor_pdbqt=receptor_pdbqt,
+        prepare_receptor=prepare_receptor,
+        keep_waters=keep_waters,
+        keep_heterogens=keep_heterogens,
     )
     if merged is None:
         return None, ()
@@ -1644,6 +1865,12 @@ def _screen(
     preflight_docking_target(pipeline.stages, registry=registry)
     compiled = PipelineCompiler(registry).compile(pipeline)
 
+    # Where each out-of-process engine is installed, asked here because it is
+    # the one thing the machine that *authored* the cascade could not answer.
+    # Ahead of the two checks below so that a host with nothing provisioned
+    # hears about its engines, its weights and its packages in that order --
+    # coarsest first, and each with the command that fixes it.
+    preflight_engine_paths(compiled.stages, registry=registry)
     # Before the first molecule is read, not when execution reaches the stage
     # that opens the file.  An adapter discovering its weights are missing
     # halfway down the funnel has already spent the expensive part of the run.
@@ -1985,6 +2212,78 @@ def _export_shortlist(
     return 0
 
 
+def _trace_run(
+    run_id: str,
+    *,
+    workspace: Path,
+    output: Path | None,
+    overwrite: bool,
+    as_json: bool,
+) -> int:
+    runner, _ = _runner_for_existing_run(workspace, run_id)
+    result = trace_run(runner, run_id, output, overwrite=overwrite)
+    if as_json:
+        _json_dump(
+            {
+                "path": str(result.path),
+                "run_id": result.run_id,
+                "status": result.status,
+                "index_path": str(result.index_path),
+                "csv_count": result.csv_count,
+                "pose_count": result.pose_count,
+                "shortlist_sdf": (
+                    None if result.shortlist_sdf is None else str(result.shortlist_sdf)
+                ),
+                "stages": [
+                    {
+                        "stage_id": stage.stage_id,
+                        "order": stage.order,
+                        "slot": stage.slot,
+                        "plugin": stage.plugin,
+                        "status": stage.status,
+                        "tier_id": stage.tier_id,
+                        "tier_title": stage.tier_title,
+                        "entering": stage.entering,
+                        "rows": stage.row_count,
+                        "kept_pct": stage.kept_pct,
+                        "csv_file": stage.csv_name,
+                        "sdf_file": stage.sdf_name,
+                        "evidence_columns": list(stage.evidence_columns),
+                    }
+                    for stage in result.stages
+                ],
+                "skipped": [
+                    {"stage_id": stage_id, "reason": reason} for stage_id, reason in result.skipped
+                ],
+                "notes": list(result.notes),
+            },
+            sys.stdout,
+        )
+        return 0
+    print(f"Run {result.run_id}: {result.status}")
+    print(f"Traced to: {result.path}")
+    width = max((len(stage.stage_id) for stage in result.stages), default=9)
+    for stage in result.stages:
+        if stage.csv_name is None:
+            print(f"  {stage.stage_id.ljust(width)}  {'-':>9}          (not traced)")
+            continue
+        kept = stage.kept_pct
+        share = "" if kept is None else f"{kept:6.2f}%"
+        # The percentage is against what the stage was handed on its own input
+        # binding, so parallel siblings each read against the tier's input rather
+        # than against each other.
+        mark = "  + poses" if stage.sdf_name is not None else ""
+        rows = 0 if stage.row_count is None else stage.row_count
+        print(f"  {stage.stage_id.ljust(width)}  {rows:>9,}  {share:>7}{mark}")
+    print(f"Index: {result.index_path.name} ({result.csv_count} CSV file(s))")
+    if result.pose_count:
+        names = ", ".join(path.name for path in result.sdf_paths)
+        print(f"Poses: {result.pose_count} record(s) in {names}")
+    for note in result.notes:
+        print(f"Note: {note}")
+    return 0
+
+
 def _report(
     run_id: str,
     *,
@@ -2312,7 +2611,12 @@ def _dispatch_compatibility(
 
 def _dispatch_canonical(arguments: argparse.Namespace) -> int:
     if arguments.command == "generate":
-        return _generate_config(arguments.output, pipeline=arguments.pipeline)
+        return _generate_config(
+            arguments.output,
+            pipeline=arguments.pipeline,
+            serve=arguments.serve,
+            port=arguments.port,
+        )
     if arguments.command == "validate":
         return _validate(arguments.config, as_json=arguments.json_output)
     if arguments.command == "plugins":
@@ -2401,6 +2705,14 @@ def _dispatch_canonical(arguments: argparse.Namespace) -> int:
         )
     if arguments.command == "export":
         return _export_shortlist(
+            arguments.run_id,
+            workspace=arguments.workspace,
+            output=arguments.output,
+            overwrite=arguments.overwrite,
+            as_json=arguments.json_output,
+        )
+    if arguments.command == "trace":
+        return _trace_run(
             arguments.run_id,
             workspace=arguments.workspace,
             output=arguments.output,

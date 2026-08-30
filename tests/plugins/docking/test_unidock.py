@@ -276,6 +276,12 @@ def _settings(executable: Path, target: _Target, **overrides: object) -> dict[st
         "size_z": 20.0,
         "batch_size": 64,
         "seed": 4_242,
+        # These tests drive the adapter against a stub receptor and a fake
+        # engine, so pose repair and checking are switched off: they are
+        # exercised against a real protein in test_pose_quality.py.  Leaving the
+        # switch here also keeps it covered -- if the off-switch stopped working,
+        # this whole file would start needing a parsable receptor.
+        "pose_quality": {"enabled": False},
     }
     settings.update(overrides)
     return settings
@@ -400,15 +406,25 @@ def test_poses_come_back_ranked_best_first(tmp_path: Path, engine: Any) -> None:
         assert [row["pose_rank"] for row in poses] == [0, 1, 2]
         scores = [row["score"] for row in poses]
         assert scores == sorted(scores)
-    # keep_poses is the only reason a molblock should be present at all.
+    # keep_poses is what decides whether a molblock is present at all.
     assert all(row["pose_molblock"] for row in rows)
 
 
 @_needs_meeko
-def test_poses_are_not_stored_unless_they_were_asked_for(tmp_path: Path, engine: Any) -> None:
+def test_turning_pose_storage_off_leaves_the_column_empty(tmp_path: Path, engine: Any) -> None:
+    """``keep_poses`` ships on, so the off state is the one worth pinning.
+
+    Written out rather than left to the default: a screen that only wants the
+    numbers turns this off to avoid carrying a few hundred megabytes of
+    molblock, and that saving is only real if the column really is empty.
+    """
+
     target = _target(tmp_path)
     rows, _parents, _metadata = _run(
-        tmp_path, "no-poses", _settings(engine(), target), smiles=(_SMILES[0],)
+        tmp_path,
+        "no-poses",
+        _settings(engine(), target, keep_poses=False),
+        smiles=(_SMILES[0],),
     )
 
     assert [row["pose_molblock"] for row in rows] == [None]
@@ -654,7 +670,7 @@ def test_a_relative_executable_is_rejected_by_configuration(tmp_path: Path) -> N
 
 
 def test_the_engine_is_registered_as_a_docking_stage() -> None:
-    descriptor = create_builtin_registry().get("docking.unidock@0.1.0").descriptor
+    descriptor = create_builtin_registry().get("docking.unidock@0.2.0").descriptor
 
     assert descriptor.kind is PluginKind.DOCK
     assert descriptor.inputs == (PARENT_V1.id, LIGAND_CONFORMER_V1.id)

@@ -176,8 +176,15 @@ def test_builder_payload_contains_strict_default_and_multiple_local_tools() -> N
     ]["science_note"]
     similarity = by_key["applicability.rdkit_reference_similarity@0.1.0"]
     assert similarity["display_name"] == "RDKit lead similarity / uniqueness"
-    assert similarity["default_config"]["objective"] == "annotate"
-    assert similarity["default_config"]["reference_path"] == "leads.csv"
+    # No seed config, for the same reason karmadock and aizynthfinder have none:
+    # the model refuses to be built without the one fact only this operator has.
+    # ``reference_path`` used to default to ``"leads.csv"``, which was worse than
+    # having no default at all -- a relative name that almost never exists still
+    # passes ``molcascade validate``, so the failure arrived on the first row of a
+    # run that had already been paid for.  The field itself is still advertised,
+    # so the form can ask for it; only the invented answer is gone.
+    assert similarity["default_config"] == {}
+    assert similarity["config_schema"]["properties"]["reference_path"]["default"] is None
     assert "explicit local reference set" in similarity["science_note"]
 
 

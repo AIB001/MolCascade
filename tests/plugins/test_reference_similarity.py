@@ -6,12 +6,16 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from pydantic import ValidationError
 
 from molcascade.artifacts import ArtifactRef
 from molcascade.contracts import APPLICABILITY_V1, DECISION_V1, PARENT_V1
 from molcascade.errors import PluginError
 from molcascade.plugins.api import StageContext, StageInput, StageRequest
-from molcascade.plugins.builtin.similarity import RDKitReferenceSimilarityPlugin
+from molcascade.plugins.builtin.similarity import (
+    RDKitReferenceSimilarityPlugin,
+    ReferenceSimilarityConfig,
+)
 
 
 def _parent(parent_id: str, smiles: str) -> dict[str, object]:
@@ -155,3 +159,49 @@ def test_reference_set_identity_is_independent_of_file_location(tmp_path: Path) 
         identities.append(str(response.metadata["reference_set_id"]))
 
     assert identities[0] == identities[1]
+
+
+def test_a_criterion_with_no_reference_set_is_refused_at_config_time() -> None:
+    """The complaint has to arrive before the run, not on the first row of it.
+
+    ``reference_path`` used to default to ``"leads.csv"``.  A cascade that named
+    no lead file therefore carried a relative path to a file that almost never
+    existed, which passed ``molcascade validate`` -- printing ``Valid cascade``
+    and ``Backends ready`` -- and then failed at the first molecule of a run
+    that had already paid for every tier above this one.  There is now no
+    default, so the model itself refuses, and the message names the field and
+    the remedy rather than the constraint that happened to trip.
+    """
+
+    with pytest.raises(ValidationError) as caught:
+        ReferenceSimilarityConfig()
+    message = str(caught.value)
+    assert "this criterion compares against a reference set and none was given" in message
+    assert "set reference_path to a local CSV/TSV/SMI file of known actives" in message
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\t"])
+def test_a_blank_reference_path_reads_as_unset(blank: str) -> None:
+    """An untouched field in the builder is "not configured", not a path named "".
+
+    The builder exports every text field it shows, whether or not anyone typed
+    in it, so ``"reference_path": ""`` is the shape that actually arrives.
+    Taken literally it would be reported as a missing file, sending the operator
+    to look for something that was never named.
+    """
+
+    with pytest.raises(ValidationError) as caught:
+        ReferenceSimilarityConfig(reference_path=blank)
+    assert "none was given" in str(caught.value)
+
+
+def test_embedded_references_are_still_a_complete_answer() -> None:
+    """Requiring a reference set is not requiring a *file*.
+
+    A small lead set can travel inside the cascade, and that config has to keep
+    validating -- it is the one shape that needs nothing from the machine.
+    """
+
+    config = ReferenceSimilarityConfig(references=[{"reference_id": "lead", "smiles": "CCO"}])
+    assert config.reference_path is None
+    assert len(config.references) == 1
