@@ -363,12 +363,25 @@ def test_a_scripted_browser_session_exports_an_executable_cascade(
     #     shipping docking, this fails instead of letting the rest of the
     #     section quietly re-observe the defaults.  The tier that feeds it goes
     #     too, since a producer left behind would answer the dependency that
-    #     step 9 exists to watch being provisioned.
+    #     step 9 exists to watch being provisioned -- and so does anything below
+    #     it that reads the docking score, which would otherwise be left in the
+    #     page's own error state.  Asserted by role instead of by a count: the
+    #     three roles are the guarantee, and the number of tiers filling them is
+    #     free to change.
     shipped = steps["shippedDocking"]
-    assert len(shipped["removed"]) == 2
+    # The conformer generator that feeds docking is itself in the ``docking.``
+    # namespace, so the engines and their feeder come out of the driver's first
+    # filter together; the other two groups are what that filter cannot see --
+    # any further producer of what docking reads, and everything below it that
+    # reads what docking produces.
+    assert len(shipped["docking"]) >= 2, "the starter stopped shipping docking and its feeder"
+    assert shipped["consumers"], "the starter stopped shipping metrics below docking"
+    assert sorted(shipped["removed"]) == sorted(
+        shipped["consumers"] + shipped["docking"] + shipped["feeders"]
+    )
     assert all(tier not in shipped["remaining"] for tier in shipped["removed"])
-    # Removing the pair leaves a cascade that still exports; a starter whose
-    # docking cannot be taken out again is one an operator is stuck with.
+    # Removing the neighbourhood leaves a cascade that still exports; a starter
+    # whose docking cannot be taken out again is one an operator is stuck with.
     assert shipped["downloadDisabled"] is False
     assert shipped["status"]["className"] != "status-bar error"
 
@@ -910,6 +923,16 @@ def test_the_campaign_still_has_to_be_written_down(
     assert docking.config["repo_path"] == str(tmp_path / "KarmaDock")
 
 
+def _needs_of(payload: dict[str, Any], plugin_ref: str) -> list[str]:
+    """Contracts one backend reads but does not compute, as the payload states them."""
+
+    for spec in payload["criteria"]:
+        for option in spec["options"]:
+            if option["plugin_ref"] == plugin_ref:
+                return list(option["needs_evidence"])
+    return []
+
+
 def _producer_tier(payload: dict[str, Any], contract: str) -> dict[str, Any] | None:
     """A tier holding whatever this installation uses to compute ``contract``.
 
@@ -1003,10 +1026,25 @@ def test_a_tool_that_reads_evidence_it_does_not_compute_declares_it_and_can_be_f
         assert refused.value.code == "CASCADE_CRITERION_EVIDENCE_UNAVAILABLE"
         assert any(contract in str(refused.value) for contract in needs)
 
-        for contract in needs:
+        # Provisioned transitively: what produces the docking score is an engine
+        # that reads a conformer it does not compute, so satisfying one block can
+        # leave the block that satisfied it wanting.  The browser walks the same
+        # chain; stopping at one level would have this pass only for the tools
+        # whose producer happens to need nothing.
+        pending = list(needs)
+        provisioned: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        while pending:
+            contract = pending.pop(0)
+            if contract in seen:
+                continue
+            seen.add(contract)
             producer = _producer_tier(payload, contract)
             assert producer is not None, f"nothing here produces {contract}"
-            config["tiers"].insert(len(config["tiers"]) - 1, producer)
+            # At the front, so a producer's own producer ends up above it.
+            provisioned.insert(0, producer)
+            pending.extend(_needs_of(payload, producer["criteria"][0]["backend"]))
+        config["tiers"] = config["tiers"][:-1] + provisioned + config["tiers"][-1:]
         # Lowering only, not compiling: this cascade still owes a receptor, which
         # is the campaign's to name and is the subject of the test above.
         lowered = lower_cascade(

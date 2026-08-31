@@ -104,7 +104,9 @@ from molcascade.cascade.models import (
     LibraryConfig,
     StepConfig,
     TierConfig,
+    TierMode,
 )
+from molcascade.contracts.schemas import DOCKING_SCORE_V1
 from molcascade.plugins.registry import PluginRegistry, create_builtin_registry
 
 DEFAULT_SEED = 20_260_823
@@ -154,9 +156,14 @@ def build_criterion(
     label: str | None = None,
     settings: dict[str, Any] | None = None,
     gate_settings: dict[str, Any] | None = None,
+    evidence_from: dict[str, str] | None = None,
     registry: PluginRegistry | None = None,
 ) -> CriterionConfig:
-    """Create a criterion bound to one executable option."""
+    """Create a criterion bound to one executable option.
+
+    ``evidence_from`` names the stage that should supply a contract this
+    criterion consumes; see :class:`CriterionConfig` for when it is needed.
+    """
 
     if option.plugin_ref is None:
         raise ValueError(
@@ -181,6 +188,7 @@ def build_criterion(
         label=label or f"{spec.label} · {option.engine}",
         settings=base_settings,
         gate=gate,
+        evidence_from=dict(evidence_from or {}),
     )
 
 
@@ -207,6 +215,7 @@ def _criterion_if_available(
     label: str | None = None,
     settings: dict[str, Any] | None = None,
     gate_settings: dict[str, Any] | None = None,
+    evidence_from: dict[str, str] | None = None,
 ) -> CriterionConfig | None:
     """Build one criterion, or return ``None`` if this machine cannot run it.
 
@@ -233,6 +242,7 @@ def _criterion_if_available(
         label=label,
         settings=settings,
         gate_settings=gate_settings,
+        evidence_from=evidence_from,
         registry=registry,
     )
 
@@ -846,13 +856,115 @@ def _docking_tier(registry: PluginRegistry) -> TierConfig | None:
         mode="all",
         criteria=tuple(criteria),
         note=(
-            "The last tier, and the only one that needs a protein: a run that reaches "
-            "it without '--receptor' and a binding site is refused before it reads its "
-            "first molecule. Both engines score every molecule that arrives and both "
-            "must pass, so the shortlist is what two independent functions agreed on. "
+            "The only tier that needs a protein: a run that reaches it without "
+            "'--receptor' and a binding site is refused before it reads its first "
+            "molecule. Both engines score every molecule that arrives and both must "
+            "pass, so what leaves here is what two independent functions agreed on. "
             "Poses are kept and checked -- PoseBusters runs inside each engine -- so "
-            "what leaves here is a structure, not just a number. Delete this tier in "
-            "the builder if you are screening without a target."
+            "it is a structure, not just a number. Screening without a target means "
+            "deleting this tier and the post-docking metrics that read it."
+        ),
+    )
+
+
+#: Adapters whose docking scores are interaction energies in kcal/mol.  The
+#: post-docking metrics below are only defined on that scale -- ligand
+#: efficiency divides a score by heavy atoms, and dividing KarmaDock's MDN
+#: score by heavy atoms produces a ratio with no name -- so the tier is built
+#: only when one of these is present, rather than built and then refused at
+#: run time on a machine that happens to have only KarmaDock.
+_KCAL_DOCKING_ADAPTERS = ("docking.unidock@",)
+
+
+def _kcal_docking_source(docking: TierConfig | None) -> str | None:
+    """The stage id of the first kcal/mol docking criterion in ``docking``."""
+
+    if docking is None:
+        return None
+    return next(
+        (
+            criterion.id
+            for criterion in docking.criteria
+            if criterion.enabled and criterion.backend.startswith(_KCAL_DOCKING_ADAPTERS)
+        ),
+        None,
+    )
+
+
+def _docking_metrics_tier(
+    registry: PluginRegistry, docking: TierConfig | None
+) -> TierConfig | None:
+    """What the docking score looks like once size and strain are paid for.
+
+    A docking score is extensive and charges nothing for internal strain, so it
+    rewards mass and rewards a bent conformer.  Both criteria here read the
+    score and the pose that earned it and turn them into something a threshold
+    can be set on honestly.  Neither is a rescoring function: they re-express
+    the number the engine already produced.
+
+    Both must sit *below* the docking tier rather than inside it.  Criteria
+    within a tier are parallel branches over the same input population and
+    cannot see each other's outputs, so a criterion placed beside Uni-Dock
+    would fail to compile with ``CASCADE_CRITERION_EVIDENCE_UNAVAILABLE``.
+    That is also why this returns ``None`` when the docking tier is absent.
+
+    ``evidence_from`` pins Uni-Dock explicitly.  The default docking tier has
+    two engines and both emit ``docking_score/v1``, so lowering refuses to
+    guess -- and the choice is a real one: KarmaDock scores a pose it has
+    already relaxed through a force field (see ``karmadock.py`` on raw poses
+    reaching six-figure MMFF energies), so its strain has been flattened by its
+    own pipeline before this tier can measure it.  Uni-Dock hands over the raw
+    Vina pose, which is where strain still carries information.  Writing the
+    choice here rather than relying on tier order puts it in the exported plan.
+
+    ``all`` rather than ``serial``: the two metrics are independent readings of
+    the same pose and every molecule that arrives should have both, so a
+    molecule rejected for strain still carries its efficiency number into the
+    trace instead of a blank.
+    """
+
+    source = _kcal_docking_source(docking)
+    if source is None:
+        return None
+    evidence_from = {DOCKING_SCORE_V1.id: source}
+    criteria = [
+        criterion
+        for criterion in (
+            _criterion_if_available(
+                "pose_strain",
+                registry,
+                evidence_from=evidence_from,
+            ),
+            _criterion_if_available(
+                "size_normalized_docking_score",
+                registry,
+                evidence_from=evidence_from,
+            ),
+        )
+        if criterion is not None
+    ]
+    if not criteria:
+        return None
+    return TierConfig(
+        id="t10_docking_metrics",
+        title="Post-docking metrics",
+        # Spelled as the enum rather than "all" like the tiers above: the
+        # string form is accepted by a validator but is a type error, and
+        # there is no reason for new code to inherit that.
+        mode=TierMode.ALL,
+        criteria=tuple(criteria),
+        note=(
+            "Reads the docking tier above it -- Uni-Dock specifically, named in each "
+            "criterion's 'evidence_from' -- and asks what the score cost. Strain is "
+            "the MMFF94s penalty the molecule pays to hold the docked conformer, in "
+            "kcal/mol and not in the TEU of the torsion-library literature, so 8.0 "
+            "here is not the 6.5 of a TEU filter; it keeps about two thirds of a "
+            "kinase shortlist. Ligand efficiency is the score per heavy atom, and "
+            "0.30 is the classic guideline rather than a tight cut -- it keeps close "
+            "to nine molecules in ten. Neither one is a ring filter: strain "
+            "correlates with fused-ring count at r = -0.014, and flat fused systems "
+            "are the most heavy-atom-efficient class there is. Delete this tier if "
+            "you want the raw engine numbers and nothing else."
         ),
     )
 
@@ -865,6 +977,8 @@ def default_cascade(
     """Build the starter cascade against the plugins this installation has."""
 
     active = registry or create_builtin_registry()
+    # Held in a local because the tier below it needs to name a stage inside it.
+    docking = _docking_tier(active)
 
     tiers = [
         tier
@@ -876,7 +990,8 @@ def default_cascade(
             _synthesis_tier(active),
             _structure_qc_tier(active),
             _conformer_tier(active),
-            _docking_tier(active),
+            docking,
+            _docking_metrics_tier(active, docking),
         )
         if tier is not None
     ]

@@ -300,8 +300,7 @@ STAGE_GROUPS: tuple[StageGroup, ...] = (
         title="Alerts and liabilities",
         subtitle="PAINS, aggregators, unstable groups",
         purpose=(
-            "Substructure alert catalogues. Alerts are triage hypotheses, not "
-            "measured instability."
+            "Substructure alert catalogues. Alerts are triage hypotheses, not measured instability."
         ),
         default_mode="all",
         accent="#d7684b",
@@ -369,6 +368,18 @@ STAGE_GROUPS: tuple[StageGroup, ...] = (
             "The same receptor as the docking tier above it, and GNINA's licence "
             "accepted: --allow-copyleft."
         ),
+    ),
+    StageGroup(
+        id="docking_metrics",
+        title="Post-docking metrics",
+        subtitle="What the score looks like once size and strain are paid for",
+        purpose=(
+            "A docking score is extensive and charges nothing for internal strain, "
+            "so it rewards mass and rewards a bent conformer. These read the score "
+            "and the pose that earned it. They need a docking tier above them."
+        ),
+        default_mode="all",
+        accent="#3f7d5c",
     ),
     StageGroup(
         id="similarity",
@@ -2239,7 +2250,7 @@ CRITERIA: tuple[CriterionSpec, ...] = (
                     "metaflow and boto3 besides. So the adapter talks to aizynthcli "
                     "across a process boundary instead.\n\n"
                     "Set it up once:\n"
-                    "  conda create -n aizynth \"python>=3.10,<3.13\"\n"
+                    '  conda create -n aizynth "python>=3.10,<3.13"\n'
                     "  conda run -n aizynth python -m pip install aizynthfinder\n"
                     "  conda run -n aizynth download_public_data <folder>\n"
                     "Then paste the path that 'conda run -n aizynth which aizynthcli' "
@@ -2914,8 +2925,7 @@ CRITERIA: tuple[CriterionSpec, ...] = (
                         kind="text",
                         environment_variable="MOLCASCADE_GNINA_EXECUTABLE",
                         help=(
-                            "Absolute path to the binary. MolCascade does not build or "
-                            "install it."
+                            "Absolute path to the binary. MolCascade does not build or install it."
                         ),
                     ),
                     ThresholdField(
@@ -2960,10 +2970,7 @@ CRITERIA: tuple[CriterionSpec, ...] = (
                         minimum=1,
                         maximum=512,
                         step=1,
-                        help=(
-                            "Monte-Carlo effort before any CNN work. Vina's own default "
-                            "is 8."
-                        ),
+                        help=("Monte-Carlo effort before any CNN work. Vina's own default is 8."),
                     ),
                     ThresholdField(
                         name="num_modes",
@@ -3049,6 +3056,314 @@ CRITERIA: tuple[CriterionSpec, ...] = (
                             "is stronger for Vina affinity, so which end filters depends "
                             "on the scale chosen above."
                         ),
+                    ),
+                ),
+            ),
+        ),
+    ),
+    CriterionSpec(
+        id="pose_strain",
+        label="Docked-pose internal strain",
+        question="What does the pose that scored well cost the molecule to hold?",
+        stage="docking_metrics",
+        evidence="derived_metric",
+        summary=(
+            "A search will bend a ligand into any shape that scores and the score "
+            "never charges for it. This measures the bill in kcal/mol against the "
+            "molecule's own freely embedded conformers. Reads the poses a docking "
+            "tier above it stored, so that tier must keep them."
+        ),
+        options=(
+            BackendOption(
+                id="mmff94s_local",
+                label="MMFF94s local strain",
+                engine="RDKit",
+                summary=(
+                    "Restrained relaxation of the docked pose, minus the lowest "
+                    "energy among freely embedded conformers of the same molecule."
+                ),
+                plugin_ref="derived.pose_strain@0.1.0",
+                gate_plugin="derived.numeric_evidence_gate@0.1.0",
+                license_spdx="BSD-3-Clause",
+                citation=(
+                    "Gu S, Smith MS, Yang Y, Irwin JJ, Shoichet BK. Ligand strain energy "
+                    "in large library docking. J Chem Inf Model. 2021;61(9):4331-4341. "
+                    "doi:10.1021/acs.jcim.1c00368"
+                ),
+                requires=("rdkit",),
+                recommended=True,
+                # Measured here, not quoted: about a second per molecule on one
+                # core at twelve reference conformers, which is why this belongs
+                # below a docking threshold rather than over a library.
+                throughput_per_second=1.05,
+                defaults={
+                    "schema_version": 1,
+                    "backend": "mmff94s_local",
+                    "reference_conformers": 12,
+                    "prune_rms_threshold": 0.5,
+                    "restraint_tolerance_angstrom": 0.25,
+                    "restraint_force_constant": 500.0,
+                    "max_minimize_iterations": 800,
+                    "negative_tolerance_kcal_mol": 0.05,
+                    "seed": 20_260_823,
+                },
+                gate_defaults={
+                    "schema_version": 1,
+                    "metric_id": "pose_strain",
+                    "expected_units": "KCAL_PER_MOL",
+                    "expected_direction": "LOWER_BETTER",
+                    "maximum": 8.0,
+                    "on_unscorable": "reject",
+                },
+                notes=(
+                    "The threshold is in kcal/mol and is not Gu and Shoichet's "
+                    "number. Their torsion library reports Torsion Energy Units, so "
+                    "6.5 TEU is not 6.5 kcal/mol and must not be copied across; the "
+                    "paper is the reference for the idea, not for the value.\n\n"
+                    "8 kcal/mol was chosen against this project's own measurement: on "
+                    "200 poses from a real 103,515-molecule STK17B run the median is "
+                    "2.7 and the 90th percentile 13.1, and 8 keeps 65%. Re-measure it "
+                    "for another engine -- a pose that has already been through a "
+                    "force-field correction step, as KarmaDock's has, has had its "
+                    "strain removed before this ever sees it, which is why the default "
+                    "cascade pins this to Uni-Dock.\n\n"
+                    "Roughly one molecule in ten measures a small negative strain, "
+                    "which is a reference search that fell short rather than a "
+                    "perfect pose. Those rows are OUT_OF_DOMAIN and keep their value, "
+                    "and the gate rejects them by default: accepting them would turn "
+                    "the method's largest failure mode into the one unchecked route "
+                    "through this tier.\n\n"
+                    "This is not a ring or shape filter. Measured across those same "
+                    "poses, strain correlates with fused-ring count at r = -0.014 and "
+                    "with aromatic-ring count at -0.038 -- a flat fused system has "
+                    "nothing to twist, so it scores *well* here. Use the 3D shape "
+                    "criteria for ring topology."
+                ),
+                thresholds=(
+                    ThresholdField(
+                        name="maximum",
+                        label="Strain ceiling",
+                        target="gate",
+                        unit="kcal/mol",
+                        minimum=0.0,
+                        maximum=100.0,
+                        step=0.5,
+                        nullable=True,
+                        help=(
+                            "Not the torsion-library number: this scale is kcal/mol. 8 "
+                            "keeps about two thirds of a docked shortlist."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="on_unscorable",
+                        label="Molecules with no usable number",
+                        kind="choice",
+                        target="gate",
+                        choices=(
+                            ("reject", "Reject them"),
+                            ("accept", "Keep them"),
+                        ),
+                        help=(
+                            "A tenth of molecules have a reference state the conformer "
+                            "search did not find. Keeping them makes that the one "
+                            "unchecked path through this tier."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="reference_conformers",
+                        label="Reference conformers",
+                        kind="integer",
+                        minimum=1,
+                        maximum=256,
+                        step=1,
+                        help=(
+                            "The strain is measured against the best of these, so too "
+                            "few reports strain that is not there. Cost is linear: this "
+                            "is the field that sets the second-per-molecule price."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="negative_tolerance_kcal_mol",
+                        label="Zero-strain band",
+                        unit="kcal/mol",
+                        minimum=0.0,
+                        maximum=1.0,
+                        step=0.01,
+                        help=(
+                            "A pose already at its own minimum can measure -0.0. Inside "
+                            "this band a negative strain is read as zero; below it the "
+                            "row is flagged and keeps its measured value."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="seed",
+                        label="Conformer seed",
+                        kind="integer",
+                        minimum=0,
+                        maximum=2**31 - 1,
+                        step=1,
+                        help=(
+                            "The embedding is seeded, so the measurement is "
+                            "reproducible. Changing this is a different measurement and "
+                            "the run records which one."
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    ),
+    CriterionSpec(
+        id="size_normalized_docking_score",
+        label="Size-normalised docking score",
+        question="Is this score good for the size of the molecule that earned it?",
+        stage="docking_metrics",
+        evidence="derived_metric",
+        summary=(
+            "A Vina-family score grows with heavy atoms, so an absolute threshold on "
+            "it selects for mass. This writes three corrections of one score and "
+            "decides nothing; the threshold below picks which one decides."
+        ),
+        options=(
+            BackendOption(
+                id="native_normalized_score",
+                label="Ligand efficiency and two alternatives",
+                engine="MolCascade",
+                summary=(
+                    "Score per heavy atom, score per heavy-atom power, and the "
+                    "residual against a fitted size baseline -- all three, every time."
+                ),
+                plugin_ref="derived.normalized_docking_score@0.1.0",
+                gate_plugin="derived.numeric_evidence_gate@0.1.0",
+                license_spdx="Apache-2.0",
+                citation=(
+                    "Hopkins AL, Groom CR, Alex A. Ligand efficiency: a useful metric "
+                    "for lead selection. Drug Discov Today. 2004;9(10):430-431. "
+                    "doi:10.1016/S1359-6446(04)03069-7"
+                ),
+                requires=("rdkit",),
+                recommended=True,
+                # Arithmetic over a score that already exists.
+                throughput_per_second=10_000,
+                defaults={
+                    "schema_version": 1,
+                    "expected_score_kind": "VINA_KCAL_MOL",
+                    "hac_exponent": 2.0,
+                    "baseline_slope": -0.0427,
+                    "baseline_intercept": -7.66,
+                },
+                gate_defaults={
+                    "schema_version": 1,
+                    "metric_id": "ligand_efficiency",
+                    "expected_units": "KCAL_PER_MOL_PER_HEAVY_ATOM",
+                    "expected_direction": "HIGHER_BETTER",
+                    "minimum": 0.30,
+                    "on_unscorable": "reject",
+                },
+                notes=(
+                    "Only kcal/mol scales are accepted. Dividing KarmaDock's "
+                    "mixture-density score by heavy atoms gives a real number with no "
+                    "units and no published threshold, so the stage stops rather than "
+                    "writing it.\n\n"
+                    "All three readings are always written, because they disagree about "
+                    "which end of the size range they favour and the disagreement is "
+                    "the useful part. Ligand efficiency divides by heavy atoms, which "
+                    "corrects as though score were strictly proportional to size -- an "
+                    "implied -0.34 kcal/mol per heavy atom at 26 heavy atoms, about "
+                    "sevenfold the slope measured on this project's own 4,740 "
+                    "gate-passing molecules, so it prefers small compact molecules. "
+                    "score/HAC^n corrects less. The baseline residual uses a fitted "
+                    "slope and so is the one that does not systematically prefer either "
+                    "end -- its default coefficients are measured here, not from the "
+                    "literature, and need re-fitting for another receptor or scoring "
+                    "function.\n\n"
+                    "The default gate is the classic LE >= 0.30 and it barely cuts: on "
+                    "the run it was measured against it keeps 89%, and the median was "
+                    "0.34. It is a documented floor rather than a filter. Tighten it "
+                    "against your own distribution -- 0.318 kept 73% there, 0.34 kept "
+                    "51% -- or switch the gate's metric to the residual.\n\n"
+                    "Heavy atoms are counted from the registered structure rather than "
+                    "read from a properties tier, because properties are computed after "
+                    "every tier has run and a post-docking tier cannot bind to them."
+                ),
+                thresholds=(
+                    ThresholdField(
+                        name="metric_id",
+                        label="Which correction decides",
+                        kind="choice",
+                        target="gate",
+                        choices=(
+                            ("ligand_efficiency", "Ligand efficiency (score / heavy atoms)"),
+                            ("score_per_hac_pow", "Score / heavy atoms^n"),
+                            ("score_baseline_residual", "Residual against a size baseline"),
+                        ),
+                        help=(
+                            "All three are computed and stored whichever you pick. "
+                            "Change the units below to match, or the gate refuses to "
+                            "compare a threshold against a scale it was not written for."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="expected_units",
+                        label="Scale of that correction",
+                        kind="choice",
+                        target="gate",
+                        choices=(
+                            ("KCAL_PER_MOL_PER_HEAVY_ATOM", "kcal/mol per heavy atom"),
+                            ("KCAL_PER_MOL_PER_HEAVY_ATOM_POW", "kcal/mol per heavy atom^n"),
+                            ("KCAL_PER_MOL", "kcal/mol (residual)"),
+                        ),
+                        help=(
+                            "Must match the metric above. This is the check that stops a "
+                            "threshold chosen for one scale being applied to another."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="minimum",
+                        label="Floor",
+                        target="gate",
+                        minimum=-100.0,
+                        maximum=100.0,
+                        step=0.01,
+                        nullable=True,
+                        help=(
+                            "0.30 is the literature figure for ligand efficiency and it "
+                            "keeps almost everything a docked shortlist contains. Read "
+                            "your own distribution before trusting it to filter."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="hac_exponent",
+                        label="Heavy-atom exponent",
+                        minimum=1.0,
+                        maximum=4.0,
+                        step=0.1,
+                        help=(
+                            "The n in score/HAC^n. 2 is the value the REvoLd screen "
+                            "settled on; 1 is ligand efficiency, which is written "
+                            "separately anyway."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="baseline_slope",
+                        label="Baseline slope",
+                        unit="kcal/mol per heavy atom",
+                        minimum=-1.0,
+                        maximum=1.0,
+                        step=0.001,
+                        help=(
+                            "Fitted on this project's own docked population. Re-fit it "
+                            "for a different receptor or scoring function; a wrong slope "
+                            "makes the residual prefer one end of the size range."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="baseline_intercept",
+                        label="Baseline intercept",
+                        unit="kcal/mol",
+                        minimum=-30.0,
+                        maximum=30.0,
+                        step=0.01,
+                        help="The other half of the same fit; it shifts the residual only.",
                     ),
                 ),
             ),

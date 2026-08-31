@@ -313,7 +313,9 @@ function needsOf(tierId) {
  * Consumers first, then the feeder.  Deleting a producer while a block above
  * still reads it is refused -- that refusal is a guarantee of its own, checked
  * further down -- so the reverse order would leave the session wedged in an
- * error state. */
+ * error state.  The post-docking metrics are consumers too: they read the
+ * docking score, so they go with it or the page stays in the error the export
+ * check further down would otherwise be reporting about them. */
 const catalogueOptions = {};
 for (const spec of JSON.parse(payloadText).criteria) {
   for (const option of spec.options) {
@@ -341,12 +343,47 @@ const shippedFeeders = exported().tiers.filter(
       return option.produces_evidence.some((contract) => shippedNeeds.indexOf(contract) >= 0);
     })
 );
-const removedShipped = shippedDocking.concat(shippedFeeders).map((tier) => tier.id);
+/* Tiers left reading a contract no surviving tier above them produces, found by
+ * walking the funnel in order rather than by name: the metrics below docking
+ * today, whatever is added below them tomorrow. */
+function orphanedWithout(removed) {
+  const orphaned = [];
+  for (;;) {
+    const gone = removed.concat(orphaned);
+    const available = [];
+    const found = [];
+    for (const tier of exported().tiers) {
+      if (gone.indexOf(tier.id) >= 0) continue;
+      const needs = [];
+      for (const criterion of tier.criteria) {
+        const option = catalogueOptions[criterion.backend];
+        for (const contract of option ? option.needs_evidence : []) needs.push(contract);
+      }
+      if (needs.some((contract) => available.indexOf(contract) < 0)) found.push(tier.id);
+      for (const criterion of tier.criteria) {
+        const option = catalogueOptions[criterion.backend];
+        for (const contract of option ? option.produces_evidence : []) available.push(contract);
+      }
+    }
+    if (!found.length) return orphaned;
+    for (const id of found) orphaned.push(id);
+  }
+}
+
+const dockingNeighbourhood = shippedDocking.concat(shippedFeeders).map((tier) => tier.id);
+const shippedConsumers = orphanedWithout(dockingNeighbourhood);
+const removedShipped = shippedConsumers.concat(dockingNeighbourhood);
 for (const tierId of removedShipped) {
   focusKey("tx:" + tierId).click();
 }
 steps.shippedDocking = {
   removed: removedShipped,
+  // Recorded by the role each tier played rather than as one count, so that a
+  // tier added below docking tomorrow shows up as a consumer here instead of
+  // as an off-by-one in a number nobody can read.
+  docking: shippedDocking.map((tier) => tier.id),
+  feeders: shippedFeeders.map((tier) => tier.id),
+  consumers: shippedConsumers,
   remaining: shape().map((tier) => tier.id),
   status: status(),
   downloadDisabled: document.getElementById("action-download").disabled,

@@ -11,11 +11,13 @@ that is already satisfied so the refusal under test never happens -- and in
 three test modules, so the stripping lives here rather than three times.
 
 Everything is derived rather than named.  The docking tiers are found by the
-plugin namespace their blocks are drawn from, and the feeder above them by the
-contracts those blocks read.  Renaming a tier in ``default_cascade`` therefore
-cannot quietly turn this into a no-op, and a starter that ships no docking at
-all raises here rather than handing back a cascade the caller believes it
-modified.
+plugin namespace their blocks are drawn from, the feeder above them by the
+contracts those blocks read, and the tiers below them by what those blocks
+produce -- the post-docking metrics read the docking score, so stripping docking
+without them leaves a cascade that cannot be lowered for a reason no caller is
+asking about.  Renaming a tier in ``default_cascade`` therefore cannot quietly
+turn this into a no-op, and a starter that ships no docking at all raises here
+rather than handing back a cascade the caller believes it modified.
 """
 
 from __future__ import annotations
@@ -60,5 +62,40 @@ def starter_without_docking(default_cascade: dict[str, Any]) -> dict[str, Any]:
         if consumed.intersection(registry.entry(item["backend"]).descriptor.outputs)
     }
     assert drop, "the starter ships no docking; this helper has become a no-op"
+    drop |= _orphaned_by(config, drop, registry)
     config["tiers"] = [tier for tier in config["tiers"] if tier["id"] not in drop]
     return config
+
+
+def _orphaned_by(config: dict[str, Any], drop: set[str], registry: Any) -> set[str]:
+    """Tiers left reading a contract no *earlier* surviving tier produces.
+
+    The feeder above docking is not the only neighbour: the post-docking
+    metrics below it consume ``docking_score/v1``, so removing docking alone
+    leaves a cascade that cannot be lowered at all -- and every caller here
+    goes on to assert something about a *different* refusal.
+
+    Two details make this a loop rather than one pass.  A tier is orphaned only
+    when every producer of what it needs is going away, so a contract two
+    surviving tiers emit survives losing one of them; and dropping a tier can
+    orphan the one below it in turn.  Producers are counted only from tiers that
+    come earlier in the funnel, which is the rule lowering applies.
+    """
+
+    orphaned: set[str] = set()
+    while True:
+        surviving = [tier for tier in config["tiers"] if tier["id"] not in drop | orphaned]
+        available: set[str] = set()
+        found: set[str] = set()
+        for tier in surviving:
+            needs: set[str] = set()
+            for item in tier["criteria"]:
+                descriptor = registry.entry(item["backend"]).descriptor
+                needs |= set(descriptor.inputs) - {PARENT_V1.id, DECISION_V1.id}
+            if needs - available:
+                found.add(tier["id"])
+            for item in tier["criteria"]:
+                available |= set(registry.entry(item["backend"]).descriptor.outputs)
+        if not found:
+            return orphaned
+        orphaned |= found

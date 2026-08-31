@@ -357,6 +357,9 @@ def test_single_input_criteria_keep_exactly_one_binding() -> None:
             # the guarantee useful: a third edge on a docking stage would
             # still fail, and that is the failure this test is for.
             ["primary", "ligand_conformer"],
+            # And a post-docking metric reads the population *and* the score one
+            # named engine gave it: the same shape, one tier further down.
+            ["primary", "docking_score"],
         ) or all(port == "parents" or port.startswith("decision_") for port in ports), (
             f"{stage.id} gained an unexpected binding: {ports}"
         )
