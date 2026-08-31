@@ -114,12 +114,17 @@ class NormalizedDockingScoreConfig(StrictFrozenModel):
     @field_validator("expected_score_kind", mode="before")
     @classmethod
     def _parse_score_kind(cls, value: object) -> object:
-        if isinstance(value, str) and value not in NormalizedScoreKind.__members__:
-            raise ValueError(
-                "size normalization is defined only for kcal/mol docking scales "
-                f"({', '.join(_SUPPORTED_SCORE_KINDS)}); "
-                f"{value!r} has no interaction-energy units"
-            )
+        # Strict validation wants the member itself, and a config that arrived
+        # as JSON only has the string.
+        if isinstance(value, str):
+            try:
+                return NormalizedScoreKind(value)
+            except ValueError as error:
+                raise ValueError(
+                    "size normalization is defined only for kcal/mol docking scales "
+                    f"({', '.join(_SUPPORTED_SCORE_KINDS)}); "
+                    f"{value!r} has no interaction-energy units"
+                ) from error
         return value
 
 

@@ -478,6 +478,34 @@ def test_normalized_score_refuses_a_scale_it_has_no_definition_for_at_config_tim
     assert excinfo.value.code == "PLUGIN_CONFIG_INVALID"
 
 
+def test_normalized_score_accepts_the_scale_spelled_the_way_a_builder_writes_it(
+    tmp_path: Path,
+) -> None:
+    """Every exported cascade names the scale as a string, so the string must work.
+
+    Strict validation does not coerce, which for an enum field means a bare
+    ``str`` is refused before any validator of ours is consulted -- unless that
+    validator returns the member.  A validator that only checks membership passes
+    the string straight through and every JSON-shaped config is then rejected
+    with the message written for an unsupported scale, pointing at the scale
+    instead of at the type.  The dump round-trip is the same path a second time,
+    which is what a sharded plugin does to its own settings inside each worker.
+    """
+
+    pinned = NormalizedDockingScoreConfig(expected_score_kind="VINARDO_KCAL_MOL")
+    assert pinned.expected_score_kind is NormalizedScoreKind.VINARDO_KCAL_MOL
+    assert NormalizedDockingScoreConfig.model_validate(pinned.model_dump(mode="json")) == pinned
+
+    output, response = _run(
+        tmp_path,
+        [_pose("p1", -6.0, score_kind="VINARDO_KCAL_MOL")],
+        {"expected_score_kind": "VINARDO_KCAL_MOL"},
+        parent_ids=("p1",),
+    )
+    rows = _by_metric(_read(output, response, "derived_metrics"))
+    assert rows[("p1", "ligand_efficiency")]["status"] == "OK"
+
+
 def test_normalized_score_never_declares_the_field_that_injects_a_target() -> None:
     """The one field name that would make this tier score the wrong receptor.
 

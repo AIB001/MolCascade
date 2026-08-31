@@ -43,6 +43,7 @@ from molcascade.plugins.builtin.normalized_docking_score import (
     NormalizedDockingScorePlugin,
 )
 from molcascade.plugins.builtin.policy import NativeDecisionJoinPlugin
+from molcascade.plugins.builtin.pose_strain import PoseStrainPlugin
 from molcascade.plugins.builtin.property_gate import RDKitPropertyRangeGatePlugin
 from molcascade.plugins.builtin.rd_filters_alerts import RdFiltersAlertsPlugin
 from molcascade.plugins.builtin.ring_topology_gate import RDKitRingTopologyGatePlugin
@@ -92,6 +93,7 @@ BUILTIN_STAGE_PLUGINS: tuple[StagePlugin, ...] = (
     GninaPlugin(),
     NativeDockingScoreEvidenceGatePlugin(),
     NormalizedDockingScorePlugin(),
+    PoseStrainPlugin(),
     NativeDerivedMetricEvidenceGatePlugin(),
     ADMETAIV2PredictorPlugin(),
     ChempropCheckpointPlugin(),
