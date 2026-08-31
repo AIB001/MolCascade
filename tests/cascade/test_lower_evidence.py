@@ -4,9 +4,10 @@ Until now a criterion could only ever see the parent population, so any tool
 needing precomputed evidence -- 3D conformers shared by three docking engines,
 a fingerprint table shared by several similarity criteria -- had to recompute it
 per consumer or could not be expressed at all.  These tests pin the binding
-rule: the *latest upstream* producer wins, a sibling in the same parallel tier
-is never upstream, and a criterion whose evidence nobody produces stops the
-cascade instead of being wired to whatever happens to be nearby.
+rule: one upstream producer binds automatically, two make the cascade stop and
+ask, a sibling in the same parallel tier is never upstream, and a criterion
+whose evidence nobody produces stops the cascade instead of being wired to
+whatever happens to be nearby.
 """
 
 from __future__ import annotations
@@ -153,18 +154,118 @@ def test_a_criterion_binds_the_latest_upstream_producer_of_its_evidence() -> Non
     ]
 
 
-def test_the_nearer_of_two_producers_wins() -> None:
+def _two_producers(consumer: dict[str, object]) -> CascadeConfig:
+    return _cascade(
+        _tier("prep_a", {"id": "coarse", "backend": "docking.prep@0.1.0"}),
+        _tier("prep_b", {"id": "refined", "backend": "docking.prep_v2@0.1.0"}),
+        _tier("dock", consumer),
+    )
+
+
+def _two_producer_registry() -> PluginRegistry:
+    return _registry(_prep(), _prep("docking.prep_v2"), _consumer())
+
+
+def test_two_producers_of_one_contract_stop_the_cascade() -> None:
+    """Lowering refuses to pick, because picking wrong is silent and total.
+
+    Whether a second producer *supersedes* the first or *partitions* the rows
+    with it is not written anywhere lowering can read.  Two conformer stages
+    refining the same molecules are the first; two docking engines are the
+    second, and there each stage's table holds only the poses that engine
+    produced.  Binding a downstream consumer to the wrong half of a partition
+    does not give it different evidence, it gives it none -- every row missing,
+    every molecule unscorable, a fail-closed gate rejecting the entire
+    population while looking merely strict.  A guess that fails that way is
+    worse than a question, so this asks.
+    """
+
+    with pytest.raises(ConfigError) as raised:
+        lower_cascade(
+            _two_producers({"id": "unidock", "backend": "docking.engine@0.1.0"}),
+            registry=_two_producer_registry(),
+            allow_missing_library=True,
+        )
+    assert raised.value.code == "CASCADE_CRITERION_EVIDENCE_AMBIGUOUS"
+    assert raised.value.context["contract"] == _CONFORMER
+    # Both candidates named, so the message says what the choices are rather
+    # than only that a choice exists.
+    assert raised.value.context["candidate_stages"] == ["coarse", "refined"]
+    assert "evidence_from" in (raised.value.hint or "")
+
+
+def test_evidence_from_picks_the_producer_the_criterion_means() -> None:
     lowered = lower_cascade(
-        _cascade(
-            _tier("prep_a", {"id": "coarse", "backend": "docking.prep@0.1.0"}),
-            _tier("prep_b", {"id": "refined", "backend": "docking.prep_v2@0.1.0"}),
-            _tier("dock", {"id": "unidock", "backend": "docking.engine@0.1.0"}),
+        _two_producers(
+            {
+                "id": "unidock",
+                "backend": "docking.engine@0.1.0",
+                "evidence_from": {_CONFORMER: "refined"},
+            }
         ),
-        registry=_registry(_prep(), _prep("docking.prep_v2"), _consumer()),
+        registry=_two_producer_registry(),
         allow_missing_library=True,
     )
-    evidence = _bindings(lowered.pipeline, "unidock")[1]
-    assert evidence["stage"] == "refined"
+    assert _bindings(lowered.pipeline, "unidock")[1]["stage"] == "refined"
+
+
+def test_evidence_from_can_reach_past_the_nearer_producer() -> None:
+    """The pin is a choice, not a confirmation of what lowering would do anyway."""
+
+    lowered = lower_cascade(
+        _two_producers(
+            {
+                "id": "unidock",
+                "backend": "docking.engine@0.1.0",
+                "evidence_from": {_CONFORMER: "coarse"},
+            }
+        ),
+        registry=_two_producer_registry(),
+        allow_missing_library=True,
+    )
+    assert _bindings(lowered.pipeline, "unidock")[1]["stage"] == "coarse"
+
+
+def test_evidence_from_naming_a_stage_that_produces_nothing_is_refused() -> None:
+    """A typo must not fall back to a default; that is the bug this replaces."""
+
+    with pytest.raises(ConfigError) as raised:
+        lower_cascade(
+            _two_producers(
+                {
+                    "id": "unidock",
+                    "backend": "docking.engine@0.1.0",
+                    "evidence_from": {_CONFORMER: "refined_typo"},
+                }
+            ),
+            registry=_two_producer_registry(),
+            allow_missing_library=True,
+        )
+    assert raised.value.code == "CASCADE_CRITERION_EVIDENCE_SOURCE_UNKNOWN"
+    assert raised.value.context["requested_stage"] == "refined_typo"
+    assert raised.value.context["candidate_stages"] == ["coarse", "refined"]
+
+
+def test_evidence_from_survives_into_the_exported_plan() -> None:
+    """The choice has to be auditable, not just effective.
+
+    A reviewer reading the exported cascade must be able to see which stage fed
+    a metric.  If the pin only lived in memory, a plan file would describe two
+    different pipelines depending on the tier order it happened to be lowered
+    with.
+    """
+
+    cascade = _two_producers(
+        {
+            "id": "unidock",
+            "backend": "docking.engine@0.1.0",
+            "evidence_from": {_CONFORMER: "coarse"},
+        }
+    )
+    exported = cascade.model_dump(mode="json")
+    criterion = exported["tiers"][2]["criteria"][0]
+    assert criterion["evidence_from"] == {_CONFORMER: "coarse"}
+    assert CascadeConfig.model_validate(exported) == cascade
 
 
 def test_evidence_nobody_produces_stops_the_cascade() -> None:
@@ -256,6 +357,6 @@ def test_single_input_criteria_keep_exactly_one_binding() -> None:
             # the guarantee useful: a third edge on a docking stage would
             # still fail, and that is the failure this test is for.
             ["primary", "ligand_conformer"],
-        ) or all(
-            port == "parents" or port.startswith("decision_") for port in ports
-        ), f"{stage.id} gained an unexpected binding: {ports}"
+        ) or all(port == "parents" or port.startswith("decision_") for port in ports), (
+            f"{stage.id} gained an unexpected binding: {ports}"
+        )

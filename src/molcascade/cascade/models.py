@@ -40,6 +40,9 @@ DEFAULT_TARGET_COUNT = 45_000
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,127}$")
 _PLUGIN_REF_RE = re.compile(r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*@\d+\.\d+\.\d+[0-9A-Za-z.+-]*$")
+#: A data contract reference, ``family/vN``.  Contract ids carry a slash, so
+#: they are not identifiers and cannot reuse ``_IDENTIFIER_RE``.
+_CONTRACT_REF_RE = re.compile(r"^[a-z][a-z0-9_.-]{0,95}/v\d+$")
 
 
 def _validate_identifier(value: str) -> str:
@@ -167,6 +170,13 @@ class CriterionConfig(StrictFrozenModel):
     and ``backend`` names the *exact tool* answering it.  Keeping the two
     separate is what lets a user swap RDKit for ``medchem``, ``rd_filters``, or
     their own model without rebuilding the cascade.
+
+    ``evidence_from`` maps a data contract this criterion consumes to the id of
+    the stage that should supply it.  It is only needed when more than one
+    earlier stage produces that contract -- two docking engines both emitting
+    ``docking_score/v1``, say -- in which case lowering refuses to guess.
+    Naming the source here rather than inferring it from tier order puts the
+    choice in the exported plan, where a methods section can quote it.
     """
 
     id: str = Field(min_length=1, max_length=128)
@@ -176,11 +186,27 @@ class CriterionConfig(StrictFrozenModel):
     settings: dict[str, JsonValue] = Field(default_factory=dict)
     gate: GateConfig | None = None
     enabled: bool = True
+    evidence_from: dict[str, str] = Field(default_factory=dict)
 
     @field_validator("id")
     @classmethod
     def _validate_id(cls, value: str) -> str:
         return _validate_identifier(value)
+
+    @field_validator("evidence_from")
+    @classmethod
+    def _validate_evidence_from(cls, value: dict[str, str]) -> dict[str, str]:
+        for contract_id, stage_id in value.items():
+            if not _CONTRACT_REF_RE.fullmatch(contract_id):
+                raise ValueError(
+                    f"evidence_from key {contract_id!r} must be a contract reference "
+                    "such as 'docking_score/v1'"
+                )
+            _validate_identifier(stage_id)
+        # Copied but not recursively frozen: unlike ``settings`` this is a flat
+        # map of two identifier strings, read once while lowering and never
+        # handed to a plugin, so there is no nested structure to protect.
+        return dict(value)
 
     @field_validator("criterion")
     @classmethod

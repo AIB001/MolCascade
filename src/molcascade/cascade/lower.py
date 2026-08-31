@@ -141,7 +141,7 @@ class _StageAccumulator:
         self.stages: list[dict[str, Any]] = []
         self.origins: list[StageOrigin] = []
         self.kinds: set[PluginKind] = set()
-        self._producers: dict[str, tuple[str, str]] = {}
+        self._producers: dict[str, list[tuple[str, str]]] = {}
 
     def add(
         self,
@@ -165,22 +165,38 @@ class _StageAccumulator:
         self.origins.append(origin)
         self.kinds.add(descriptor.kind)
         for port, contract in descriptor.output_ports.items():
-            self._producers[contract] = (stage_id, port)
+            history = self._producers.setdefault(contract, [])
+            if history and history[-1][0] == stage_id:
+                # One stage naming the same contract on two ports keeps only its
+                # last port, exactly as the single-producer map did before this
+                # became a list.  Ambiguity between *stages* is the new error;
+                # ambiguity inside one stage is unchanged behaviour.
+                history[-1] = (stage_id, port)
+            else:
+                history.append((stage_id, port))
 
-    def producers(self) -> dict[str, tuple[str, str]]:
-        """Snapshot which stage and port last produced each contract."""
+    def producers(self) -> dict[str, tuple[tuple[str, str], ...]]:
+        """Snapshot every stage and port that has produced each contract, in order.
 
-        return dict(self._producers)
+        The whole history rather than the latest entry, because a contract with
+        two producers upstream is a question the cascade has to answer out loud
+        rather than a race the last writer wins.  ``_evidence_bindings`` reads
+        the last entry when there is only one, which is every pipeline that
+        lowered before this returned a list.
+        """
+
+        return {contract: tuple(history) for contract, history in self._producers.items()}
 
 
 def _evidence_bindings(
     descriptor: PluginDescriptor,
     *,
-    producers: Mapping[str, tuple[str, str]],
+    producers: Mapping[str, tuple[tuple[str, str], ...]],
     backend: str,
     where: str,
+    evidence_from: Mapping[str, str] = MappingProxyType({}),
 ) -> list[dict[str, str]]:
-    """Bind every side contract a stage consumes to its latest producer.
+    """Bind every side contract a stage consumes to the stage that produces it.
 
     A criterion reads the population on its ``primary`` port.  Anything else it
     declares -- 3D conformers shared by several docking engines, a fingerprint
@@ -190,14 +206,25 @@ def _evidence_bindings(
 
     Decisions are excluded on purpose: they are wired by the tier's policy join,
     which is the only place allowed to decide what a decision stream means.
+
+    When two earlier stages produce the same contract the binding is genuinely
+    undecidable and the cascade refuses to lower.  This matters more than it
+    reads: a tier that docks with two engines emits ``docking_score/v1`` twice,
+    each stage's table holding only its own engine's rows, so silently taking
+    one of them hands a downstream consumer a table where none of the rows it
+    expects exist.  That failure surfaces as evidence which is uniformly
+    missing -- a gate that appears merely strict -- rather than as a wiring
+    mistake, which is why it is caught here at lowering time instead.
+    ``CriterionConfig.evidence_from`` is how a criterion says which one it
+    means, and it says so in the exported plan where a reader can audit it.
     """
 
     bindings: list[dict[str, str]] = []
     for contract_id in descriptor.inputs:
         if contract_id in {PARENT_V1.id, DECISION_V1.id}:
             continue
-        producer = producers.get(contract_id)
-        if producer is None:
+        candidates = producers.get(contract_id, ())
+        if not candidates:
             raise ConfigError(
                 f"{where} uses {backend!r}, which needs {contract_id!r} evidence that no "
                 "earlier stage produces",
@@ -213,9 +240,48 @@ def _evidence_bindings(
                     "available_contracts": sorted(producers),
                 },
             )
-        bindings.append(
-            _binding(_evidence_port_name(contract_id), producer[0], producer[1])
-        )
+        pinned = evidence_from.get(contract_id)
+        if pinned is not None:
+            chosen = next((entry for entry in reversed(candidates) if entry[0] == pinned), None)
+            if chosen is None:
+                raise ConfigError(
+                    f"{where} pins {contract_id!r} evidence to stage {pinned!r}, which does "
+                    "not produce that contract above this tier",
+                    code="CASCADE_CRITERION_EVIDENCE_SOURCE_UNKNOWN",
+                    hint=(
+                        "Name one of the stages that does produce it, and check the stage "
+                        "id rather than the criterion label -- a criterion with a gate "
+                        "lowers to more than one stage."
+                    ),
+                    context={
+                        "backend": backend,
+                        "where": where,
+                        "contract": contract_id,
+                        "requested_stage": pinned,
+                        "candidate_stages": [stage for stage, _ in candidates],
+                    },
+                )
+        elif len(candidates) > 1:
+            raise ConfigError(
+                f"{where} uses {backend!r}, which needs {contract_id!r} evidence that "
+                f"{len(candidates)} earlier stages produce",
+                code="CASCADE_CRITERION_EVIDENCE_AMBIGUOUS",
+                hint=(
+                    "Set this criterion's 'evidence_from' to the stage you mean, for "
+                    f'example {{"{contract_id}": "{candidates[0][0]}"}}. Each producing '
+                    "stage holds only its own rows, so binding the wrong one leaves the "
+                    "evidence empty rather than merely different."
+                ),
+                context={
+                    "backend": backend,
+                    "where": where,
+                    "contract": contract_id,
+                    "candidate_stages": [stage for stage, _ in candidates],
+                },
+            )
+        else:
+            chosen = candidates[-1]
+        bindings.append(_binding(_evidence_port_name(contract_id), chosen[0], chosen[1]))
     return bindings
 
 
@@ -227,7 +293,7 @@ def _lower_criterion(
     accumulator: _StageAccumulator,
     parent_stage: str,
     parent_port: str,
-    producers: Mapping[str, tuple[str, str]],
+    producers: Mapping[str, tuple[tuple[str, str], ...]],
     target: TargetConfig | None = None,
 ) -> tuple[str, str, tuple[str, str] | None]:
     """Emit a criterion's producer and optional gate.
@@ -250,6 +316,7 @@ def _lower_criterion(
         _evidence_bindings(
             producer,
             producers=producers,
+            evidence_from=criterion.evidence_from,
             backend=criterion.backend,
             where=where,
         )
