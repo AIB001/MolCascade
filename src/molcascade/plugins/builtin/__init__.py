@@ -21,6 +21,7 @@ from molcascade.plugins.builtin.docking import (
 )
 from molcascade.plugins.builtin.druglikeness import RDKitDrugLikenessPlugin
 from molcascade.plugins.builtin.evidence_gates import (
+    NativeDerivedMetricEvidenceGatePlugin,
     NativeDockingScoreEvidenceGatePlugin,
     NativePredictionEvidenceGatePlugin,
     NativeSynthesisScoreEvidenceGatePlugin,
@@ -87,6 +88,7 @@ BUILTIN_STAGE_PLUGINS: tuple[StagePlugin, ...] = (
     KarmaDockPlugin(),
     GninaPlugin(),
     NativeDockingScoreEvidenceGatePlugin(),
+    NativeDerivedMetricEvidenceGatePlugin(),
     ADMETAIV2PredictorPlugin(),
     ChempropCheckpointPlugin(),
     CustomModelPredictorPlugin(),

@@ -14,7 +14,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Self
 
-from pydantic import Field, ValidationError, field_validator, model_validator
+from pydantic import Field, JsonValue, ValidationError, field_validator, model_validator
 
 from molcascade.chemistry.datasets import (
     iter_contract_batches,
@@ -25,6 +25,7 @@ from molcascade.config.canonical import canonical_sha256
 from molcascade.config.models import StrictFrozenModel
 from molcascade.contracts import (
     DECISION_V1,
+    DERIVED_METRIC_V1,
     DOCKING_SCORE_V1,
     PARENT_V1,
     PREDICTION_V1,
@@ -185,8 +186,97 @@ class DockingScoreEvidenceGateConfig(_NumericBoundsConfig):
         return DockingScoreDirection(value) if isinstance(value, str) else value
 
 
+class DerivedMetricUnits(StrEnum):
+    """Scales defined by ``derived_metric/v1``.
+
+    A derived number without its scale cannot be gated.  Strain measured as an
+    MMFF94s energy difference and strain read off a torsion library are both
+    small positive reals, and both are called strain, but ``8`` means "keep
+    three quarters of the population" on one scale and something else entirely
+    on the other.  The operator therefore names the scale the threshold was
+    chosen for, and evidence on a different scale fails closed.
+    """
+
+    KCAL_PER_MOL = "KCAL_PER_MOL"
+    KCAL_PER_MOL_PER_HEAVY_ATOM = "KCAL_PER_MOL_PER_HEAVY_ATOM"
+    KCAL_PER_MOL_PER_HEAVY_ATOM_POW = "KCAL_PER_MOL_PER_HEAVY_ATOM_POW"
+    TEU = "TEU"
+    COUNT = "COUNT"
+
+
+class DerivedMetricDirection(StrEnum):
+    """Direction values defined by ``derived_metric/v1``."""
+
+    HIGHER_BETTER = "HIGHER_BETTER"
+    LOWER_BETTER = "LOWER_BETTER"
+
+
+class DerivedMetricStatus(StrEnum):
+    """Status values defined by ``derived_metric/v1``."""
+
+    OK = "OK"
+    NOT_APPLICABLE = "NOT_APPLICABLE"
+    OUT_OF_DOMAIN = "OUT_OF_DOMAIN"
+    BACKEND_FAILED = "BACKEND_FAILED"
+
+
+class UnscorableAction(StrEnum):
+    """What to do with a molecule the metric declined to score."""
+
+    REJECT = "reject"
+    ACCEPT = "accept"
+
+
+class DerivedMetricEvidenceGateConfig(_NumericBoundsConfig):
+    """Bind one derived metric, one method and one scale to a numeric window."""
+
+    metric_id: str = Field(min_length=1, max_length=256)
+    #: The digest of the parameters the metric was computed with.  Left unset it
+    #: is resolved from the evidence, which is the common case: one featurizer
+    #: wrote the column.  Set, it is a promise that this threshold was chosen for
+    #: *those* parameters, so a re-run under a different exponent or conformer
+    #: seed is refused rather than compared against a window it does not fit.
+    method_id: str | None = Field(default=None, min_length=1, max_length=4096)
+    expected_units: DerivedMetricUnits
+    expected_direction: DerivedMetricDirection
+    #: A molecule whose row carries a status other than ``OK`` has no number the
+    #: window can be applied to, and the default is to reject it.  That is not
+    #: caution for its own sake: on the MMFF94s strain backend roughly a tenth of
+    #: molecules have a reference state the conformer search failed to find, and
+    #: accepting them would turn the largest systematic failure mode of the
+    #: method into the one route through the gate that nothing is checked on.
+    on_unscorable: UnscorableAction = UnscorableAction.REJECT
+
+    @field_validator("metric_id", "method_id")
+    @classmethod
+    def _identities_are_unambiguous(cls, value: str | None) -> str | None:
+        if value is not None and (
+            value != value.strip() or any(character in value for character in "\r\n\x00")
+        ):
+            raise ValueError(
+                "metric_id and method_id must not contain surrounding or control whitespace"
+            )
+        return value
+
+    @field_validator("expected_units", mode="before")
+    @classmethod
+    def _parse_units(cls, value: Any) -> Any:
+        return DerivedMetricUnits(value) if isinstance(value, str) else value
+
+    @field_validator("expected_direction", mode="before")
+    @classmethod
+    def _parse_derived_direction(cls, value: Any) -> Any:
+        return DerivedMetricDirection(value) if isinstance(value, str) else value
+
+    @field_validator("on_unscorable", mode="before")
+    @classmethod
+    def _parse_unscorable_action(cls, value: Any) -> Any:
+        return UnscorableAction(value) if isinstance(value, str) else value
+
+
 _GateConfig = (
-    DockingScoreEvidenceGateConfig
+    DerivedMetricEvidenceGateConfig
+    | DockingScoreEvidenceGateConfig
     | PredictionEvidenceGateConfig
     | SynthesisScoreEvidenceGateConfig
 )
@@ -383,7 +473,12 @@ def _retained_evidence_outside_current_population(
 ) -> int:
     """Count valid upstream evidence rows ignored after an earlier serial filter."""
 
-    if table not in {"docking_evidence", "prediction_evidence", "synthesis_evidence"}:
+    if table not in {
+        "derived_evidence",
+        "docking_evidence",
+        "prediction_evidence",
+        "synthesis_evidence",
+    }:
         raise ValueError("unknown internal evidence table")
     row = connection.execute(
         f"""
@@ -716,6 +811,322 @@ def _insert_docking_evidence(
                 ) from error
             count += 1
     return count
+
+
+def _insert_derived_evidence(
+    connection: sqlite3.Connection,
+    stage_input: StageInput,
+    *,
+    batch_size: int,
+) -> int:
+    """Load every metric in the table, not only the one this gate reads.
+
+    One featurizer writes several metrics at once -- a ligand efficiency, a
+    size-normalised score and a baseline residual come out of the same pass over
+    the docking scores -- so the table this gate is handed usually holds columns
+    it will not threshold.  Loading all of them costs one integer comparison per
+    row and buys an error message that can list what *is* available when the
+    configured ``metric_id`` is a typo.
+
+    ``source_json`` is deliberately not loaded.  It is provenance for the trace,
+    not an input to any threshold.
+    """
+
+    connection.execute(
+        """
+        CREATE TABLE derived_evidence (
+            parent_id TEXT NOT NULL,
+            metric_id TEXT NOT NULL,
+            method_id TEXT NOT NULL,
+            value REAL,
+            units TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            status TEXT NOT NULL,
+            PRIMARY KEY (parent_id, metric_id, method_id)
+        ) WITHOUT ROWID
+        """
+    )
+    count = 0
+    allowed_units = {item.value for item in DerivedMetricUnits}
+    allowed_directions = {item.value for item in DerivedMetricDirection}
+    allowed_statuses = {item.value for item in DerivedMetricStatus}
+    value_required = {
+        DerivedMetricStatus.OK.value,
+        DerivedMetricStatus.OUT_OF_DOMAIN.value,
+    }
+    for batch in iter_contract_batches(
+        stage_input,
+        DERIVED_METRIC_V1,
+        batch_size=batch_size,
+    ):
+        for row in batch.to_pylist():
+            parent_id = str(row["parent_id"])
+            metric_id = str(row["metric_id"])
+            method_id = str(row["method_id"])
+            units = str(row["units"])
+            direction = str(row["direction"])
+            status = str(row["status"])
+            if (
+                not metric_id
+                or not method_id
+                or units not in allowed_units
+                or direction not in allowed_directions
+                or status not in allowed_statuses
+            ):
+                raise PluginError(
+                    "derived metric evidence contains an invalid identity, scale, "
+                    "direction or status",
+                    code="EVIDENCE_GATE_IDENTITY_INVALID",
+                    context={
+                        "parent_id": parent_id,
+                        "metric_id": metric_id,
+                        "method_id": method_id,
+                        "units": units,
+                        "direction": direction,
+                        "status": status,
+                    },
+                )
+            value = row.get("value")
+            if status in value_required and value is None:
+                # The contract cannot express this: ``value`` has to stay
+                # nullable so a failure keeps its row.  A row that claims a
+                # number was computed and then carries none means the producer
+                # disagrees with itself, and neither half can be trusted enough
+                # to gate on -- least of all by reading the null as a rejection,
+                # which would look exactly like a molecule that missed the
+                # window.
+                raise PluginError(
+                    "derived metric evidence claims a status that requires a value "
+                    "but carries none",
+                    code="DERIVED_METRIC_GATE_STATUS_INCONSISTENT",
+                    context={
+                        "parent_id": parent_id,
+                        "metric_id": metric_id,
+                        "method_id": method_id,
+                        "status": status,
+                    },
+                )
+            _ensure_finite(
+                value,
+                field="value",
+                parent_id=parent_id,
+                label="derived metric evidence",
+            )
+            try:
+                connection.execute(
+                    "INSERT INTO derived_evidence VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        parent_id,
+                        metric_id,
+                        method_id,
+                        None if value is None else float(value),
+                        units,
+                        direction,
+                        status,
+                    ),
+                )
+            except sqlite3.IntegrityError as error:
+                raise PluginError(
+                    "derived metric evidence contains a duplicate metric row",
+                    code="EVIDENCE_GATE_DUPLICATE_EVIDENCE",
+                    context={
+                        "parent_id": parent_id,
+                        "metric_id": metric_id,
+                        "method_id": method_id,
+                    },
+                ) from error
+            count += 1
+    return count
+
+
+def _require_metric_present(
+    connection: sqlite3.Connection,
+    *,
+    metric_id: str,
+) -> None:
+    """Refuse a metric_id nothing in the current population wrote.
+
+    Without this the gate would run perfectly and reject everything, because a
+    LEFT JOIN on a name no row carries is indistinguishable from a featurizer
+    that scored nobody.  The available names are the whole diagnosis, so they go
+    in the error.
+    """
+
+    present = connection.execute(
+        """
+        SELECT 1 FROM derived_evidence e
+        JOIN parents p ON p.parent_id = e.parent_id
+        WHERE e.metric_id = ? LIMIT 1
+        """,
+        (metric_id,),
+    ).fetchone()
+    if present is not None:
+        return
+    available: list[JsonValue] = [
+        str(row[0])
+        for row in connection.execute(
+            "SELECT DISTINCT metric_id FROM derived_evidence ORDER BY metric_id"
+        ).fetchmany(32)
+    ]
+    raise PluginError(
+        "derived metric evidence contains no rows for the configured metric",
+        code="DERIVED_METRIC_GATE_METRIC_UNAVAILABLE",
+        hint="Set metric_id to one of the metrics the upstream stage wrote.",
+        context={"metric_id": metric_id, "available_metric_ids": available},
+    )
+
+
+def _outcome_for_status(status: str, *, action: UnscorableAction) -> tuple[bool, str]:
+    """Turn a non-OK status into a decision without consulting the value.
+
+    The value is deliberately not compared against the window here.  A strain of
+    -19.4 kcal/mol sits comfortably inside ``maximum=8`` and means the reference
+    conformer search failed, so reading it as a pass would admit precisely the
+    molecules the metric knows it could not measure.
+    """
+
+    if action is UnscorableAction.ACCEPT:
+        return True, "DERIVED_METRIC_UNSCORABLE_ACCEPTED"
+    return False, f"DERIVED_METRIC_{status}"
+
+
+def _evaluate_derived_metric(
+    connection: sqlite3.Connection,
+    *,
+    stage_id: str,
+    config: DerivedMetricEvidenceGateConfig,
+) -> tuple[int, str, str]:
+    _require_metric_present(connection, metric_id=config.metric_id)
+    method_id = _resolve_optional_identity(
+        connection,
+        configured=config.method_id,
+        query=(
+            "SELECT DISTINCT e.method_id FROM derived_evidence e "
+            "JOIN parents p ON p.parent_id = e.parent_id "
+            "WHERE e.metric_id = ? ORDER BY e.method_id"
+        ),
+        parameters=(config.metric_id,),
+        identity_name="method_id for the configured metric",
+        label="derived metric evidence gate",
+    )
+    observed = connection.execute(
+        """
+        SELECT DISTINCT units, direction
+        FROM derived_evidence
+        WHERE metric_id = ? AND method_id = ?
+        ORDER BY units, direction
+        """,
+        (config.metric_id, method_id),
+    ).fetchmany(3)
+    mismatched_units: list[JsonValue] = [
+        units
+        for units in sorted({str(row[0]) for row in observed})
+        if units != config.expected_units.value
+    ]
+    if mismatched_units:
+        raise PluginError(
+            "derived metric evidence is on a different scale than the configured policy",
+            code="DERIVED_METRIC_GATE_UNITS_MISMATCH",
+            context={
+                "metric_id": config.metric_id,
+                "method_id": method_id,
+                "expected_units": config.expected_units.value,
+                "observed_units": mismatched_units,
+            },
+        )
+    mismatched_directions: list[JsonValue] = [
+        direction
+        for direction in sorted({str(row[1]) for row in observed})
+        if direction != config.expected_direction.value
+    ]
+    if mismatched_directions:
+        raise PluginError(
+            "derived metric evidence direction conflicts with the configured policy",
+            code="EVIDENCE_GATE_DIRECTION_MISMATCH",
+            context={
+                "metric_id": config.metric_id,
+                "method_id": method_id,
+                "expected_direction": config.expected_direction.value,
+                "observed_directions": mismatched_directions,
+            },
+        )
+    policy_id = "derived-metric-gate:sha256:" + canonical_sha256(
+        {
+            "implementation_version": 1,
+            "metric_id": config.metric_id,
+            "method_id": method_id,
+            "units": config.expected_units.value,
+            "direction": config.expected_direction.value,
+            "minimum": config.minimum,
+            "maximum": config.maximum,
+            "bounds_inclusive": True,
+            "missing_policy": "REJECT",
+            "unscorable_policy": config.on_unscorable.value,
+        }
+    )
+    passed_count = 0
+    cursor = connection.execute(
+        """
+        SELECT p.parent_id, p.identity_policy_id, p.parent_smiles,
+               p.registration_key, p.stereo_key, p.formula,
+               p.duplicate_count, p.input_rank, e.value, e.status
+        FROM parents p
+        LEFT JOIN derived_evidence e
+          ON e.parent_id = p.parent_id AND e.metric_id = ? AND e.method_id = ?
+        ORDER BY p.input_rank
+        """,
+        (config.metric_id, method_id),
+    )
+    while rows := cursor.fetchmany(config.batch_size):
+        for row in rows:
+            parent = tuple(row[:8])
+            value = None if row[8] is None else float(row[8])
+            status = None if row[9] is None else str(row[9])
+            if status is None:
+                # Absent evidence is a different failure from a metric that
+                # declined to score: the molecule was never measured at all, so
+                # ``on_unscorable`` has no bearing on it and it fails closed.
+                passed, reason_code = _outcome_for_value(
+                    None,
+                    minimum=config.minimum,
+                    maximum=config.maximum,
+                    reason_prefix="DERIVED_METRIC",
+                )
+            elif status != DerivedMetricStatus.OK.value:
+                passed, reason_code = _outcome_for_status(
+                    status,
+                    action=config.on_unscorable,
+                )
+            else:
+                passed, reason_code = _outcome_for_value(
+                    value,
+                    minimum=config.minimum,
+                    maximum=config.maximum,
+                    reason_prefix="DERIVED_METRIC",
+                )
+            _insert_result(
+                connection,
+                parent=parent,
+                stage_id=stage_id,
+                passed=passed,
+                reason_code=reason_code,
+                policy_id=policy_id,
+                detail={
+                    "metric_id": config.metric_id,
+                    "method_id": method_id,
+                    "units": config.expected_units.value,
+                    "direction": config.expected_direction.value,
+                    "value": value,
+                    "status": status,
+                    "minimum": config.minimum,
+                    "maximum": config.maximum,
+                    "bounds_inclusive": True,
+                    "unscorable_policy": config.on_unscorable.value,
+                    "derived_not_measured": True,
+                },
+            )
+            passed_count += int(passed)
+    return passed_count, method_id, policy_id
 
 
 def _evaluate_prediction(
@@ -1350,14 +1761,140 @@ class NativeDockingScoreEvidenceGatePlugin:
         )
 
 
+class NativeDerivedMetricEvidenceGatePlugin:
+    """Filter parents on one derived metric computed by one method.
+
+    The numbers this gate reads are arithmetic over evidence an earlier tier
+    already produced -- a docking score divided by heavy-atom count, a pose
+    energy minus a conformer-ensemble minimum -- and the repository keeps that
+    arithmetic in a featurizer rather than folding it into a threshold, so that
+    what was computed stays visible in the trace whether or not it decided
+    anything.  This is the half that decides.
+
+    One gate reads one metric.  A campaign that wants both a strain ceiling and
+    an efficiency floor states them as two criteria, which is what lets the
+    tier's own policy join say whether that means both, either, or two of three.
+    """
+
+    descriptor = PluginDescriptor(
+        id="derived.numeric_evidence_gate",
+        version="0.1.0",
+        kind=PluginKind.GATE,
+        inputs=(PARENT_V1.id, DERIVED_METRIC_V1.id),
+        outputs=(PARENT_V1.id, DECISION_V1.id),
+        output_ports={"primary": PARENT_V1.id, "decisions": DECISION_V1.id},
+        cardinality=Cardinality.FILTER,
+        determinism=Determinism.DETERMINISTIC,
+        display_name="Derived-metric threshold gate",
+        description="Exact metric/method/scale window, rejecting absent and unscorable rows.",
+    )
+    config_model = DerivedMetricEvidenceGateConfig
+
+    def execute(self, request: StageRequest, context: StageContext) -> StageResponse:
+        config = _validated_config(
+            request,
+            DerivedMetricEvidenceGateConfig,
+            label="derived metric evidence gate",
+        )
+        assert isinstance(config, DerivedMetricEvidenceGateConfig)
+        parent_input, evidence_input = _classify_inputs(
+            dict(request.inputs),
+            evidence_contract=DERIVED_METRIC_V1,
+            label="derived metric evidence gate",
+        )
+        database_path = _prepare_staging(
+            context,
+            database_name=".derived-metric-evidence-gate.sqlite3",
+        )
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = open_stage_database(database_path)
+            _create_common_schema(connection)
+            input_count = _insert_parents(
+                connection,
+                parent_input,
+                batch_size=config.batch_size,
+            )
+            evidence_count = _insert_derived_evidence(
+                connection,
+                evidence_input,
+                batch_size=config.batch_size,
+            )
+            retained_evidence_ignored_count = (
+                _retained_evidence_outside_current_population(
+                    connection,
+                    table="derived_evidence",
+                )
+            )
+            passed_count, method_id, policy_id = _evaluate_derived_metric(
+                connection,
+                stage_id=request.stage_id,
+                config=config,
+            )
+            _write_outputs(
+                connection,
+                context,
+                batch_size=config.batch_size,
+            )
+        except BaseException:
+            if connection is not None:
+                connection.close()
+                connection = None
+            _remove_work_files(context, database_path)
+            raise
+        finally:
+            if connection is not None:
+                connection.close()
+            database_path.unlink(missing_ok=True)
+            for suffix in ("-journal", "-wal", "-shm"):
+                Path(f"{database_path}{suffix}").unlink(missing_ok=True)
+
+        return StageResponse(
+            outputs={
+                "primary": PendingOutput(
+                    PARENT_V1.id,
+                    (_PARENT_PATH.as_posix(),),
+                    {"row_count": passed_count},
+                ),
+                "decisions": PendingOutput(
+                    DECISION_V1.id,
+                    (_DECISION_PATH.as_posix(),),
+                    {"row_count": input_count, "policy_id": policy_id},
+                ),
+            },
+            metadata={
+                "input_count": input_count,
+                "evidence_count": evidence_count,
+                "retained_evidence_ignored_count": retained_evidence_ignored_count,
+                "output_count": passed_count,
+                "rejected_count": input_count - passed_count,
+                "metric_id": config.metric_id,
+                "method_id": method_id,
+                "expected_units": config.expected_units.value,
+                "expected_direction": config.expected_direction.value,
+                "policy_id": policy_id,
+                "missing_policy": "REJECT",
+                "unscorable_policy": config.on_unscorable.value,
+                "bounds_inclusive": True,
+                "derived_not_measured": True,
+            },
+        )
+
+
 __all__ = [
+    "DerivedMetricDirection",
+    "DerivedMetricEvidenceGateConfig",
+    "DerivedMetricStatus",
+    "DerivedMetricUnits",
     "DockingScoreDirection",
     "DockingScoreEvidenceGateConfig",
     "DockingScoreKind",
+    "NativeDerivedMetricEvidenceGatePlugin",
     "NativeDockingScoreEvidenceGatePlugin",
     "NativePredictionEvidenceGatePlugin",
     "NativeSynthesisScoreEvidenceGatePlugin",
     "PredictionEvidenceGateConfig",
     "SynthesisScoreDirection",
     "SynthesisScoreEvidenceGateConfig",
+    "UnscorableAction",
 ]
