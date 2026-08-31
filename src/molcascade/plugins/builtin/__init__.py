@@ -39,6 +39,9 @@ from molcascade.plugins.builtin.hard_gate import RDKitHardGatePlugin
 from molcascade.plugins.builtin.medchem_alerts import MedchemAlertsPlugin
 from molcascade.plugins.builtin.medchem_rules import MedchemRulesPlugin
 from molcascade.plugins.builtin.mordred_gate import MordredDescriptorGatePlugin
+from molcascade.plugins.builtin.normalized_docking_score import (
+    NormalizedDockingScorePlugin,
+)
 from molcascade.plugins.builtin.policy import NativeDecisionJoinPlugin
 from molcascade.plugins.builtin.property_gate import RDKitPropertyRangeGatePlugin
 from molcascade.plugins.builtin.rd_filters_alerts import RdFiltersAlertsPlugin
@@ -88,6 +91,7 @@ BUILTIN_STAGE_PLUGINS: tuple[StagePlugin, ...] = (
     KarmaDockPlugin(),
     GninaPlugin(),
     NativeDockingScoreEvidenceGatePlugin(),
+    NormalizedDockingScorePlugin(),
     NativeDerivedMetricEvidenceGatePlugin(),
     ADMETAIV2PredictorPlugin(),
     ChempropCheckpointPlugin(),
