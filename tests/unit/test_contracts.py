@@ -8,6 +8,7 @@ from molcascade.contracts import (
     CLUSTER_ASSIGNMENT_V1,
     CONTRACTS,
     DECISION_V1,
+    DERIVED_METRIC_V1,
     DRUG_LIKENESS_V1,
     FINGERPRINT_V1,
     PARENT_SOURCE_MAP_V1,
@@ -61,6 +62,7 @@ def test_builtin_contracts_are_exact_versioned_and_toolkit_neutral() -> None:
         "parent/v1",
         "parent_source_map/v1",
         "decision/v1",
+        "derived_metric/v1",
         "docking_score/v1",
         "drug_likeness/v1",
         "fingerprint/v1",
@@ -320,6 +322,153 @@ def test_enum_values_are_checked_in_batch() -> None:
     assert caught.value.code == "CONTRACT_ENUM_INVALID"
     assert caught.value.context["column"] == "outcome"
     assert caught.value.context["invalid"] == ["MAYBE"]
+
+
+def _derived_metric_row(**overrides: object) -> dict[str, list[object]]:
+    """One valid ``derived_metric/v1`` row, so each test states only its own point.
+
+    Every column is spelled out because the evidence contracts declare no
+    optional columns: a nullable column may be null, but it may not be absent.
+    """
+
+    row: dict[str, object] = {
+        "parent_id": "p1",
+        "metric_id": "ligand_efficiency",
+        "method_id": "le:hac",
+        "value": 0.34,
+        "units": "KCAL_PER_MOL_PER_HEAVY_ATOM",
+        "direction": "HIGHER_BETTER",
+        "status": "OK",
+        "status_detail": None,
+        "source_json": None,
+    }
+    row.update(overrides)
+    return {name: [value] for name, value in row.items()}
+
+
+def _derived_metric_rows(*rows: dict[str, list[object]]) -> dict[str, list[object]]:
+    columns = rows[0].keys()
+    assert all(row.keys() == columns for row in rows)
+    return {name: [value for row in rows for value in row[name]] for name in columns}
+
+
+def test_derived_metric_keeps_one_row_per_metric_and_method() -> None:
+    """Several metrics on one molecule coexist; the same metric twice does not.
+
+    The primary key is what lets a strain number, a ligand efficiency and a
+    specificity delta share a table without a column per metric, and what stops
+    a re-run under different parameters from quietly overwriting the earlier
+    measurement instead of sitting beside it.
+    """
+
+    distinct = _table(
+        DERIVED_METRIC_V1,
+        _derived_metric_rows(
+            _derived_metric_row(),
+            _derived_metric_row(metric_id="pose_strain", method_id="mmff94s:12", value=1.84),
+            _derived_metric_row(method_id="le:hac^2", value=0.013),
+        ),
+    )
+    validate_table(distinct, DERIVED_METRIC_V1)
+
+    repeated = _table(
+        DERIVED_METRIC_V1,
+        _derived_metric_rows(_derived_metric_row(), _derived_metric_row(value=0.41)),
+    )
+    with pytest.raises(ContractError) as caught:
+        validate_table(repeated, DERIVED_METRIC_V1)
+
+    assert caught.value.code == "CONTRACT_PRIMARY_KEY_DUPLICATE"
+    assert caught.value.context["primary_key"] == ["parent_id", "metric_id", "method_id"]
+
+
+def test_derived_metric_records_a_failure_without_inventing_a_number() -> None:
+    """A metric that could not be computed keeps its row, with a null value."""
+
+    table = _table(
+        DERIVED_METRIC_V1,
+        _derived_metric_row(
+            metric_id="pose_strain",
+            method_id="mmff94s:12",
+            value=None,
+            units="KCAL_PER_MOL",
+            direction="LOWER_BETTER",
+            status="BACKEND_FAILED",
+            status_detail="MMFF typing failed",
+        ),
+    )
+
+    validate_table(table, DERIVED_METRIC_V1)
+
+
+def test_derived_metric_out_of_domain_keeps_the_number_it_measured() -> None:
+    """Negative strain is evidence the reference search failed, not a null.
+
+    Nulling it would erase the only signal that says so, which is why
+    OUT_OF_DOMAIN is a status rather than a reason to drop the value.
+    """
+
+    table = _table(
+        DERIVED_METRIC_V1,
+        _derived_metric_row(
+            metric_id="pose_strain",
+            method_id="mmff94s:12",
+            value=-19.42,
+            units="KCAL_PER_MOL",
+            direction="LOWER_BETTER",
+            status="OUT_OF_DOMAIN",
+            status_detail="ensemble minimum above the relaxed pose",
+        ),
+    )
+
+    validate_table(table, DERIVED_METRIC_V1)
+
+
+def test_derived_metric_requires_units_even_where_the_value_is_missing() -> None:
+    """``units`` is the anchor a gate checks its threshold against.
+
+    A row that carries no scale cannot be gated at all, so it is refused at the
+    contract rather than left for a gate to interpret.
+    """
+
+    table = _table(
+        DERIVED_METRIC_V1,
+        _derived_metric_row(value=None, units=None, status="BACKEND_FAILED"),
+    )
+
+    with pytest.raises(ContractError) as caught:
+        validate_table(table, DERIVED_METRIC_V1)
+
+    assert caught.value.code == "CONTRACT_NULL_VALUE"
+    assert caught.value.context["null_counts"] == {"units": 1}
+
+
+def test_derived_metric_units_and_direction_are_closed_vocabularies() -> None:
+    """Spelling a unit freely is what the enum exists to catch.
+
+    ``8`` in kcal/mol and ``8`` in torsion energy units are different filter
+    strengths, and both are small positive reals -- nothing in the row itself
+    would reveal the mix-up later.
+    """
+
+    misspelled = _table(DERIVED_METRIC_V1, _derived_metric_row(units="kcal/mol/heavy_atom"))
+    with pytest.raises(ContractError) as units_caught:
+        validate_table(misspelled, DERIVED_METRIC_V1)
+    assert units_caught.value.code == "CONTRACT_ENUM_INVALID"
+    assert units_caught.value.context["column"] == "units"
+    assert units_caught.value.context["invalid"] == ["kcal/mol/heavy_atom"]
+
+    house_style = _table(DERIVED_METRIC_V1, _derived_metric_row(direction="HIGHER_IS_BETTER"))
+    with pytest.raises(ContractError) as direction_caught:
+        validate_table(house_style, DERIVED_METRIC_V1)
+    assert direction_caught.value.code == "CONTRACT_ENUM_INVALID"
+    assert direction_caught.value.context["column"] == "direction"
+
+    unknown_status = _table(DERIVED_METRIC_V1, _derived_metric_row(status="UNSCORABLE"))
+    with pytest.raises(ContractError) as status_caught:
+        validate_table(unknown_status, DERIVED_METRIC_V1)
+    assert status_caught.value.code == "CONTRACT_ENUM_INVALID"
+    assert status_caught.value.context["column"] == "status"
 
 
 def test_mapping_role_enum_is_exposed_as_immutable_metadata() -> None:

@@ -437,6 +437,65 @@ DOCKING_SCORE_V1 = DataContract(
 )
 
 
+DERIVED_METRIC_V1 = DataContract(
+    id="derived_metric/v1",
+    schema=_schema(
+        "derived_metric/v1",
+        [
+            pa.field("parent_id", pa.string(), nullable=False),
+            pa.field("metric_id", pa.string(), nullable=False),
+            pa.field("method_id", pa.string(), nullable=False),
+            pa.field("value", pa.float64(), nullable=True),
+            pa.field("units", pa.string(), nullable=False),
+            pa.field("direction", pa.string(), nullable=False),
+            pa.field("status", pa.string(), nullable=False),
+            pa.field("status_detail", pa.string(), nullable=True),
+            pa.field("source_json", pa.large_string(), nullable=True),
+        ],
+    ),
+    primary_key=("parent_id", "metric_id", "method_id"),
+    enums={
+        "units": (
+            "KCAL_PER_MOL",
+            "KCAL_PER_MOL_PER_HEAVY_ATOM",
+            "KCAL_PER_MOL_PER_HEAVY_ATOM_POW",
+            "TEU",
+            "COUNT",
+        ),
+        "direction": ("HIGHER_BETTER", "LOWER_BETTER"),
+        "status": ("OK", "NOT_APPLICABLE", "OUT_OF_DOMAIN", "BACKEND_FAILED"),
+    },
+    invariants={
+        "units_declared": (
+            "units is never empty, so a threshold can be checked against the scale it "
+            "was written for; the same small number means different things in "
+            "kcal/mol and in torsion energy units, and nothing else in a row "
+            "distinguishes them"
+        ),
+        "failure_recorded": (
+            "a molecule the metric could not be computed for keeps a row with a null "
+            "value and the reason in status, so a downstream gate sees an explicit "
+            "absence rather than a missing row it might read as a pass"
+        ),
+        "out_of_domain_keeps_its_value": (
+            "OUT_OF_DOMAIN records the number that was computed rather than nulling "
+            "it: a strain below zero is evidence that the reference state search "
+            "failed, and that evidence is the value itself"
+        ),
+        "derived_not_measured": (
+            "every value here is arithmetic on earlier evidence -- a docking score "
+            "divided by a size, a pose energy minus an ensemble minimum -- and "
+            "inherits every limitation of the score it came from"
+        ),
+        "method_carries_its_parameters": (
+            "method_id is a digest over the metric's own parameters, so changing an "
+            "exponent, a baseline fit or a conformer seed produces a new row rather "
+            "than overwriting a measurement made under different settings"
+        ),
+    },
+)
+
+
 SCAFFOLD_ASSIGNMENT_V1 = DataContract(
     id="scaffold_assignment/v1",
     schema=_schema(
@@ -577,6 +636,7 @@ BUILTIN_CONTRACTS = (
     SYNTHESIS_SCORE_V1,
     LIGAND_CONFORMER_V1,
     DOCKING_SCORE_V1,
+    DERIVED_METRIC_V1,
     SCAFFOLD_ASSIGNMENT_V1,
     CLUSTER_ASSIGNMENT_V1,
     SELECTION_DECISION_V1,
@@ -588,6 +648,7 @@ __all__ = [
     "BUILTIN_CONTRACTS",
     "CLUSTER_ASSIGNMENT_V1",
     "DECISION_V1",
+    "DERIVED_METRIC_V1",
     "DOCKING_SCORE_V1",
     "DRUG_LIKENESS_V1",
     "FINGERPRINT_V1",
