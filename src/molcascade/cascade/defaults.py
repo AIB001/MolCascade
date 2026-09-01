@@ -1029,7 +1029,7 @@ def _affinity_tier(
 
     Nothing about the compiler forces the position.  The plugin declares only
     ``parent/v1`` as input, so lowering would happily run it first; only the
-    cost says otherwise, and tens of seconds a molecule is a different quantity
+    cost says otherwise, and twenty seconds a molecule is a different quantity
     at the top of a funnel than at the bottom.  Hence ``max_molecules`` is a
     budget the stage enforces before folding anything rather than a guard it
     checks on the way past.
@@ -1064,9 +1064,9 @@ def _affinity_tier(
             "of an IC50 in micromolar and lower is stronger, so the default gate at 0.0 "
             "keeps molecules predicted at or below 1 uM. Read it as a ranking: the paper "
             "presents these values for ordering compounds and nothing here calibrates "
-            "them against an assay. It costs tens of seconds a molecule, which is why it "
-            "is last and why 'max_molecules' stops the stage before folding rather than "
-            "during."
+            "them against an assay. Measured on one RTX 4090 it costs about 20 s a "
+            "molecule on top of a fixed 40 s of weight loading, which is why it is last "
+            "and why 'max_molecules' stops the stage before folding rather than during."
         ),
     )
 

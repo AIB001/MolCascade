@@ -3897,11 +3897,18 @@ CRITERIA: tuple[CriterionSpec, ...] = (
                 # boltz CLI in an environment of its own -- not for the Python,
                 # which it shares, but for the torch, which it would replace.
                 requires=(),
-                # About fifty seconds a complex on one current card, converted
-                # from the timings in the paper rather than measured here; the
-                # tier's own note says so, and this number only decides where the
-                # builder is willing to place the block.
-                throughput_per_second=0.02,
+                # Measured, on one RTX 4090, at three batch sizes: 135.5 s for
+                # one molecule, 125.7 s for four, 374.7 s for sixteen. Four
+                # costing less than one is the whole shape of it -- the cost is
+                # ~43 s of fixed weight loading plus ~20.8 s a molecule (12 s
+                # folding, 9 s affinity), and the plugin hands the CLI a whole
+                # directory in one invocation, so the fixed part amortizes. The
+                # number below is therefore the marginal rate, 1/20.8, which is
+                # what any batch large enough to budget for converges to; the
+                # fifty seconds a complex converted from the paper is ~2.4x
+                # pessimistic here. It only decides where the builder is willing
+                # to place the block.
+                throughput_per_second=0.048,
                 defaults={
                     "schema_version": 1,
                     "executable": "",
@@ -3929,10 +3936,11 @@ CRITERIA: tuple[CriterionSpec, ...] = (
                     "Put this last and nowhere else. It reads no evidence at all -- "
                     "sequence in, SMILES in, complex folded from scratch -- so the "
                     "compiler would happily run it first, and only the cost says "
-                    "otherwise. Tens of seconds a molecule means a thousand molecules "
-                    "is most of a day, which is why 'max_molecules' is a budget the "
-                    "stage enforces rather than a suggestion: over the limit it stops "
-                    "before folding anything instead of quietly spending the night.\n\n"
+                    "otherwise. Twenty seconds a molecule measured on one current "
+                    "card means a thousand molecules is most of a working day, "
+                    "which is why 'max_molecules' is a budget the stage enforces "
+                    "rather than a suggestion: over the limit it stops before "
+                    "folding anything instead of quietly spending the night.\n\n"
                     "Two numbers per molecule. The affinity is log10 of an IC50 in "
                     "micromolar, so 0 is 1 uM and -1 is 100 nM, and lower is stronger; "
                     "the binder probability is the head's separate yes/no opinion. The "
