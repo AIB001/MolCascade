@@ -962,3 +962,50 @@ def test_a_null_affinity_is_as_absent_as_a_missing_one(tmp_path: Path) -> None:
         _read_affinity(path)
 
     assert caught.value.code == "BOLTZ2_OUTPUT_UNREADABLE"
+
+
+# ------------------------------------------- the fork hazard, and the two lines that close it
+
+
+def test_the_subprocess_gets_a_one_thread_openmp_team(tmp_path: Path) -> None:
+    """Not a performance setting: this is what stops the pool deadlocking.
+
+    Boltz preprocesses through a fork-based ``multiprocessing.Pool`` started
+    after its parent has imported Torch, built a CUDA context and run
+    OpenMP-parallel code.  ``fork()`` copies only the calling thread, so a child
+    inherits a libgomp that believes it still owns a team of workers -- and a
+    child that enters a parallel region then spins in libgomp's busy-wait
+    barrier for ever.  Nothing recovers from it: ``pool.imap`` yields in order,
+    so the parent blocks on the first stuck index, the manifest that gates
+    inference is never written, and the GPU is never asked for a batch.  A
+    one-thread team has no barrier to spin on.
+    """
+
+    from molcascade.plugins.builtin.boltz2 import _isolated_environment
+
+    environment = _isolated_environment("cuda:0", tmp_path)
+    assert environment["OMP_NUM_THREADS"] == "1"
+    assert environment["MKL_NUM_THREADS"] == "1"
+
+
+def test_the_preprocessing_pool_does_not_scale_with_the_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Boltz's own default is ``cpu_count()``; that is the number to not inherit.
+
+    Every fork is another chance at the hazard above, and preprocessing runs at
+    roughly 0.4 s/molecule, so the cap costs nothing a screen can measure.  A
+    host with fewer cores than the cap keeps its own count -- Boltz clamps to
+    the number of inputs after that, so there is nothing else to decide here.
+    """
+
+    from molcascade.plugins.builtin import boltz2 as module
+
+    monkeypatch.setattr(module.os, "cpu_count", lambda: 32)
+    assert module._preprocessing_threads() == module.MAX_PREPROCESSING_THREADS
+
+    monkeypatch.setattr(module.os, "cpu_count", lambda: 2)
+    assert module._preprocessing_threads() == 2
+
+    monkeypatch.setattr(module.os, "cpu_count", lambda: None)
+    assert module._preprocessing_threads() == 1

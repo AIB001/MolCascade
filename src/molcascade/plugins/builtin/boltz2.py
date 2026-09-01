@@ -580,15 +580,60 @@ def _isolated_environment(device: str | None, cache: Path) -> dict[str, str]:
     ``CUDA_VISIBLE_DEVICES`` is set rather than passed as a flag: ``--devices``
     is a count, not an ordinal, so the only way to say *which* card is to leave
     one visible.
+
+    The OpenMP pin is not a performance setting; it is what keeps Boltz's
+    preprocessing pool from deadlocking.  See the comment on it below.
     """
 
     environment = dict(os.environ)
     for leaked in ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP"):
         environment.pop(leaked, None)
     environment["BOLTZ_CACHE"] = str(cache)
+    # Boltz preprocesses through a fork-based ``multiprocessing.Pool`` *after*
+    # its parent has imported Torch, built a CUDA context and run
+    # OpenMP-parallel code.  ``fork()`` copies only the calling thread, so each
+    # child inherits a libgomp that still believes it owns a team of workers
+    # which no longer exist -- and this interpreter maps two libgomps, its own
+    # plus the copy vendored into a manylinux wheel.  A child that then enters a
+    # parallel region spins in libgomp's busy-wait barrier for ever: pure user
+    # time, one thread, flat RSS, no syscalls.  Nothing recovers from it,
+    # because ``pool.imap`` yields in order -- the parent blocks on the first
+    # stuck index, the manifest that gates inference is never written, and the
+    # GPU is never asked for a single batch.  Seen here on 4 of 32 workers,
+    # 113 minutes into a stage that had already finished 865 of 876 molecules.
+    #
+    # A one-thread team has no barrier to spin on, which closes the hazard for
+    # the preprocessing pool and the dataloader workers alike.  Nothing is
+    # given up: both are already parallel per molecule, so nested OpenMP was
+    # only ever contention.
+    environment["OMP_NUM_THREADS"] = "1"
+    environment["MKL_NUM_THREADS"] = "1"
     if device and device.startswith("cuda:"):
         environment["CUDA_VISIBLE_DEVICES"] = device.split(":", 1)[1]
     return environment
+
+
+MAX_PREPROCESSING_THREADS = 8
+"""How many children Boltz's preprocessing pool may fork, at most.
+
+Boltz defaults ``--preprocessing-threads`` to ``multiprocessing.cpu_count()``,
+which on a 32-core host forks 32 children out of a CUDA-initialised parent --
+see ``_isolated_environment`` for what that has cost.  Preprocessing runs at
+roughly 0.4 s/molecule, so eight threads clear a 900-molecule batch in under a
+minute: the cap buys safety for nothing.  ``--num_workers`` stays at Boltz's
+own default of 2, which is small already and no longer dangerous once OpenMP is
+pinned to one thread.
+"""
+
+
+def _preprocessing_threads() -> int:
+    """The cap, or the core count when the machine has fewer cores than that.
+
+    Boltz clamps this to the number of inputs itself, so the only job here is to
+    stop the default from scaling with the host.
+    """
+
+    return min(MAX_PREPROCESSING_THREADS, os.cpu_count() or 1)
 
 
 def _ligand_atoms(smiles: str) -> int | None:
@@ -937,6 +982,8 @@ class Boltz2AffinityPlugin:
                 str(config.diffusion_samples_affinity),
                 "--seed",
                 str(config.seed),
+                "--preprocessing-threads",
+                str(_preprocessing_threads()),
             ]
             if config.affinity_mw_correction:
                 command.append("--affinity_mw_correction")
