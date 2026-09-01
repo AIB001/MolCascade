@@ -158,6 +158,19 @@ function slotOf(tierId, index) {
 
 const steps = {};
 
+// Editing a threshold has to reach the gate settings, not the producer's.
+function inspectorFields() {
+  const found = new Map();
+  for (const wrapper of inspector.all((node) => node.classList.contains("field"))) {
+    const label = wrapper.childNodes[0];
+    const control = wrapper.childNodes[1];
+    if (!label || !control) continue;
+    if (["INPUT", "SELECT", "TEXTAREA"].indexOf(control.tagName) < 0) continue;
+    found.set(label.textContent, control);
+  }
+  return found;
+}
+
 /* ------------------------------------------------------------------ steps */
 
 steps.boot = {
@@ -168,6 +181,99 @@ steps.boot = {
   machineText: machine.textContent,
   trayBricks: tray.all((node) => node.classList.contains("brick")).length,
   canvasStages: canvasStages(),
+};
+
+/* A pin is the answer to a question only some arrangements ask.
+ *
+ * Two docking engines in one tier both emit `docking_score/v1`, and each stage's
+ * table holds only its own engine's rows, so a block below that reads the score
+ * has to name the one it means -- `lower_cascade` refuses to guess.  The shipped
+ * cascade answers it.  What has to stay true is that the answer tracks the
+ * funnel: switch the named engine off and the question stops being asked, so the
+ * pin must go rather than be exported pointing at a stage that is not there.
+ */
+function pinOf(criterionId) {
+  for (const tier of exported().tiers) {
+    for (const criterion of tier.criteria) {
+      if (criterion.id === criterionId) return criterion.evidence_from || null;
+    }
+  }
+  return null;
+}
+
+const pinnedBoot = (() => {
+  for (const tier of exported().tiers) {
+    for (const criterion of tier.criteria) {
+      const contracts = Object.keys(criterion.evidence_from || {});
+      if (!contracts.length) continue;
+      return {
+        criterion: criterion.id,
+        contract: contracts[0],
+        stage: criterion.evidence_from[contracts[0]],
+      };
+    }
+  }
+  return null;
+})();
+if (!pinnedBoot) throw new Error("the starter cascade pins no evidence source");
+
+// What the inspector offers for it, so the operator can change the choice
+// without editing the exported file.
+blocks().filter((node) => node.dataset.criterion === pinnedBoot.criterion)[0].click();
+const pinField = Array.from(inspectorFields()).filter(
+  (entry) => entry[0] === pinnedBoot.contract
+)[0];
+focusKey("ct:" + pinnedBoot.stage).click();
+const pinWithoutIt = pinOf(pinnedBoot.criterion);
+const statusWithoutIt = status();
+const downloadWithoutIt = document.getElementById("action-download").disabled;
+focusKey("ct:" + pinnedBoot.stage).click();
+
+/* And the case that had none of this: a block the operator adds themselves.
+ * `newCriterion` builds it from the catalogue entry, which cannot know what
+ * sits above it, so it arrives with no pin at all -- and used to be exported
+ * that way, into a cascade lowering refused for an ambiguity the page had
+ * already drawn.  Removed and re-added through the same two controls an
+ * operator would use, so the answer has to be reached rather than remembered.
+ */
+const pinnedTier = shape().filter((tier) =>
+  tier.criteria.some((id) => id === pinnedBoot.criterion)
+)[0];
+const pinnedSpec = (() => {
+  for (const tier of exported().tiers) {
+    for (const criterion of tier.criteria) {
+      if (criterion.id === pinnedBoot.criterion) return criterion.criterion;
+    }
+  }
+  return null;
+})();
+const pinnedLabel = JSON.parse(payloadText).criteria.filter(
+  (spec) => spec.id === pinnedSpec
+)[0].label;
+focusKey("cx:" + pinnedBoot.criterion).click();
+focusKey("add:" + pinnedTier.id).click();
+const readded = document
+  .getElementById("picker-list")
+  .all((node) => node.classList.contains("picker-item"))
+  .filter((item) => item.textContent.indexOf(pinnedLabel) === 0);
+if (readded.length !== 1) throw new Error("the picker no longer offers " + pinnedSpec);
+readded[0].click();
+const reborn = shape().filter((tier) => tier.id === pinnedTier.id)[0];
+
+steps.evidencePin = {
+  readded: {
+    spec: pinnedSpec,
+    criterion: reborn.criteria[reborn.criteria.length - 1],
+    pin: pinOf(reborn.criteria[reborn.criteria.length - 1]),
+    downloadDisabled: document.getElementById("action-download").disabled,
+  },
+  boot: pinnedBoot,
+  offered: pinField ? pinField[1].all((node) => node.tagName === "OPTION").map((o) => o.value) : null,
+  selected: pinField ? pinField[1].value : null,
+  withoutIt: pinWithoutIt,
+  statusWithoutIt: statusWithoutIt,
+  downloadDisabledWithoutIt: downloadWithoutIt,
+  restored: pinOf(pinnedBoot.criterion),
 };
 
 // The complaint the whole redesign answers: moving a module between tiers.
@@ -237,19 +343,6 @@ const wanted = pickerList
 if (wanted.length !== 1) throw new Error("expected one synthesizability entry");
 wanted[0].click();
 steps.added = { shape: shape(), status: status() };
-
-// Editing a threshold has to reach the gate settings, not the producer's.
-function inspectorFields() {
-  const found = new Map();
-  for (const wrapper of inspector.all((node) => node.classList.contains("field"))) {
-    const label = wrapper.childNodes[0];
-    const control = wrapper.childNodes[1];
-    if (!label || !control) continue;
-    if (["INPUT", "SELECT", "TEXTAREA"].indexOf(control.tagName) < 0) continue;
-    found.set(label.textContent, control);
-  }
-  return found;
-}
 
 const fields = inspectorFields();
 steps.thresholdLabels = Array.from(fields.keys());

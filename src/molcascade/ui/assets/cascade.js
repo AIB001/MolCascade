@@ -230,29 +230,80 @@
     return null;
   }
 
-  /** Evidence that enabled blocks above `criterionId` leave for it to read.
+  /** Every enabled block above `criterionId` that produces `contract`, in order.
    *
-   * Walked in funnel order and stopped at the block itself, which is the rule
-   * lowering applies: a producer beside it but earlier in the same tier counts,
-   * one below it does not.
+   * "Above" is the rule `_lower_tier` applies, and it is not simply "earlier in
+   * the funnel".  A serial tier threads its criteria one into the next, so an
+   * earlier sibling counts.  A parallel tier freezes the producer map before its
+   * loop -- every criterion reads the population entering the tier, so that none
+   * of them can hide evidence from another by filtering first -- and there a
+   * sibling never counts, however early it sits.  Getting this wrong in only one
+   * direction is what makes it worth stating: the builder would accept an
+   * arrangement lowering rejects, and the operator would meet the refusal as a
+   * failure of the file the builder had just written for them.
    */
-  function evidenceAbove(criterionId) {
-    const available = new Set();
+  function evidenceProducersAbove(criterionId, contract) {
+    const producers = [];
     for (const tier of state.tiers) {
       if (!tier.enabled) continue;
+      const siblings = tier.mode === "serial";
+      const holds = activeCriteria(tier).some((item) => item.id === criterionId);
       for (const item of activeCriteria(tier)) {
-        if (item.id === criterionId) return available;
-        for (const contract of evidenceProduced(item)) available.add(contract);
+        if (item.id === criterionId) break;
+        if (holds && !siblings) continue;
+        if (evidenceProduced(item).indexOf(contract) >= 0) producers.push(item);
       }
+      if (holds) break;
     }
-    return available;
+    return producers;
   }
 
   function missingEvidence(criterion) {
-    const needs = evidenceNeeds(criterion);
-    if (!needs.length) return [];
-    const available = evidenceAbove(criterion.id);
-    return needs.filter((contract) => !available.has(contract));
+    return evidenceNeeds(criterion).filter(
+      (contract) => !evidenceProducersAbove(criterion.id, contract).length
+    );
+  }
+
+  /* Which producer a criterion reads, when more than one is on.
+   *
+   * Two docking engines both emit `docking_score/v1`, and each stage's table
+   * holds only its own engine's rows, so binding the wrong one hands the reader
+   * a table in which none of the rows it expects exist.  `lower_cascade` refuses
+   * to guess -- CASCADE_CRITERION_EVIDENCE_AMBIGUOUS -- and `evidence_from` is
+   * how a criterion answers, in the exported file where it can be audited.
+   *
+   * The shipped cascade already answers it; what did not, until now, was every
+   * criterion the operator adds from the picker, and every pin left behind after
+   * the engine it named was switched off.  Both exported a file that would not
+   * lower.  So the pin is maintained as a property of the current arrangement
+   * rather than written once: kept while it still names a producer that is on
+   * and above, and re-pointed at the first one that is when it does not.
+   *
+   * First rather than best, because the builder has no way to rank them -- the
+   * consumers do, and refuse a scale they cannot read by name.  The inspector
+   * shows the choice so it can be corrected without editing the file.
+   */
+  function reconcileEvidence() {
+    for (const tier of state.tiers) {
+      for (const criterion of tier.criteria) {
+        const needs = evidenceNeeds(criterion);
+        const pins = criterion.evidence_from || {};
+        const next = {};
+        for (const contract of needs) {
+          const producers = evidenceProducersAbove(criterion.id, contract);
+          if (producers.length < 2) {
+            // One producer needs no pin, and none is an error `collectIssues`
+            // reports on its own.  Either way a pin here could only go stale.
+            continue;
+          }
+          const held = pins[contract];
+          const kept = producers.some((item) => item.id === held);
+          next[contract] = kept ? held : producers[0].id;
+        }
+        if (Object.keys(next).length) criterion.evidence_from = next;
+        else delete criterion.evidence_from;
+      }
+    }
   }
 
   function usedIds() {
@@ -1742,6 +1793,43 @@
       );
     }
 
+    /* Shown only when the answer is not forced.  One producer above is the
+     * ordinary case and naming it would be noise; two is a question the file has
+     * to answer, and the operator is the only one who knows whether the metric
+     * belongs to the engine that docked or the one that predicted. */
+    const sources = evidenceNeeds(criterion)
+      .map((contract) => [contract, evidenceProducersAbove(criterion.id, contract)])
+      .filter((entry) => entry[1].length > 1);
+    if (sources.length) {
+      const rows = sources.map((entry) => {
+        const contract = entry[0];
+        const producers = entry[1];
+        const pinned = (criterion.evidence_from || {})[contract];
+        const select = el("select", {
+          on: {
+            change: (event) => {
+              const pins = Object.assign({}, criterion.evidence_from || {});
+              pins[contract] = event.target.value;
+              criterion.evidence_from = pins;
+              render();
+            },
+          },
+        });
+        producers.forEach((item) => {
+          select.appendChild(el("option", { value: item.id, text: criterionLabel(item) }));
+        });
+        select.value = pinned || producers[0].id;
+        return field(
+          contract,
+          select,
+          producers.length +
+            " enabled blocks above this one produce " + contract + ", and each holds only " +
+            "its own rows. This names the one to read."
+        );
+      });
+      nodes.push(section("Reads evidence from", rows));
+    }
+
     const moveSelect = el("select", {
       on: { change: (event) => moveCriterionToTier(criterion.id, event.target.value) },
     });
@@ -2261,6 +2349,12 @@
   /* ---------------------------------------------------------------- render */
 
   function render() {
+    // Before anything is drawn or exported, because the pin is derived from an
+    // arrangement every action can change: switching an engine off, dragging a
+    // block past a producer, or loading a file written when the funnel looked
+    // different all move it.  Doing it here is what makes "the builder never
+    // writes a file that will not lower" true of the pin as well.
+    reconcileEvidence();
     dom.name.value = state.name || "";
     dom.target.value = state.finalize.target_count;
     renderTray();

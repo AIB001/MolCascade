@@ -1060,3 +1060,82 @@ def test_a_tool_that_reads_evidence_it_does_not_compute_declares_it_and_can_be_f
             allow_missing_library=True,
         )
         assert lowered.origin_of(option["id"]) is not None
+
+
+def test_the_page_keeps_the_evidence_pin_pointing_at_a_block_that_is_still_there(
+    tmp_path: Path,
+) -> None:
+    """Which of two docking engines a post-docking block reads, kept true on screen.
+
+    The shipped funnel runs Uni-Dock and KarmaDock side by side, and both
+    produce ``docking_score/v1``.  A block below them that reads a score is
+    therefore ambiguous, and ``lower_cascade`` refuses it rather than guessing --
+    so the cascade carries a pin naming the engine.  Uni-Dock, because KarmaDock
+    hands back a force-field corrected pose and the strain of a pose that has
+    already been relaxed is not a measurement of anything.
+
+    A pin is a reference to another block, which is the part the browser has to
+    maintain: the operator switches an engine off, drags a block above the one
+    that feeds it, or adds a consumer the catalogue built with no pin at all
+    because a catalogue entry cannot know what will sit above it.  Every one of
+    those used to export a file the compiler rejected -- for an ambiguity, or a
+    stale reference, the page had drawn correctly and then failed to write down.
+    """
+
+    steps = _drive(tmp_path)
+    pinned = steps["evidencePin"]
+
+    payload = build_cascade_builder_payload()
+    shipped = {
+        criterion["id"]: criterion
+        for tier in payload["default_cascade"]["tiers"]
+        for criterion in tier["criteria"]
+    }
+
+    # 1. It boots pinned, and pinned to the raw-pose engine.  Asserted through
+    #    the backend rather than the criterion id, because the id is a label and
+    #    the engine is the reason.
+    boot = pinned["boot"]
+    assert boot["contract"] == "docking_score/v1"
+    assert "unidock" in shipped[boot["stage"]]["backend"]
+
+    # 2. And says so where the choice is made.  Both engines are offered -- the
+    #    operator may well want KarmaDock's number -- with the shipped one
+    #    selected, so the pin is visible without opening the exported file.
+    assert len(pinned["offered"]) == 2
+    assert boot["stage"] in pinned["offered"]
+    assert pinned["selected"] == boot["stage"]
+
+    # 3. Switch that engine off and the pin goes with it.  The remaining engine
+    #    is then the only producer, which binds without a pin, so the export
+    #    stays available: this is a cascade the operator can still run.
+    assert pinned["withoutIt"] is None
+    assert pinned["downloadDisabledWithoutIt"] is False
+    assert pinned["statusWithoutIt"]["className"] != "status-bar error"
+
+    # Left in place instead, the pin names a block that no longer runs, and that
+    # is not a warning -- it is the whole file refused.  Checked here in Python
+    # so the browser's pruning is measured against the real compiler rather than
+    # against a rule restated in JavaScript.
+    stale = json.loads(json.dumps(payload["default_cascade"]))
+    for tier in stale["tiers"]:
+        for criterion in tier["criteria"]:
+            if criterion["id"] == boot["stage"]:
+                criterion["enabled"] = False
+    with pytest.raises(ConfigError) as refused:
+        _compile(stale, allow_missing_target=True)
+    assert refused.value.code == "CASCADE_CRITERION_EVIDENCE_SOURCE_UNKNOWN"
+
+    # 4. Switch it back on and the pin returns to it, rather than staying on the
+    #    engine that happened to be left.  A toggle the operator flicks twice
+    #    should leave the cascade where it found it.
+    assert pinned["restored"] == {boot["contract"]: boot["stage"]}
+
+    # 5. The case the catalogue cannot help with: a block the operator adds.
+    #    It is built from a picker entry that knows nothing about what sits above
+    #    it, so it used to arrive unpinned -- ambiguous from the moment it
+    #    landed, in a funnel that looked complete.
+    readded = pinned["readded"]
+    assert readded["criterion"] in shipped
+    assert readded["pin"] == {boot["contract"]: boot["stage"]}
+    assert readded["downloadDisabled"] is False
