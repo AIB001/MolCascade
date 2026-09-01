@@ -28,6 +28,7 @@ import pytest
 
 from molcascade.cascade import defaults
 from molcascade.cascade.defaults import (
+    _affinity_tier,
     _criterion_if_available,
     _docking_metrics_tier,
     _docking_tier,
@@ -36,6 +37,7 @@ from molcascade.cascade.defaults import (
 from molcascade.cascade.lower import lower_cascade
 from molcascade.cascade.models import CriterionConfig, TierConfig, TierMode
 from molcascade.errors import ConfigError
+from molcascade.plugins.builtin.boltz2 import Boltz2Config
 from molcascade.plugins.builtin.specificity_panel import SpecificityPanelConfig
 from molcascade.plugins.registry import PluginRegistry, create_builtin_registry
 
@@ -336,3 +338,97 @@ def test_a_panel_beside_the_engine_it_reads_cannot_be_lowered(registry: PluginRe
             allow_missing_target=True,
         )
     assert excinfo.value.code == "CASCADE_CRITERION_EVIDENCE_UNAVAILABLE"
+
+
+# ------------------------------------------------- the last tier, which reads no pose
+
+
+_FASTA = "/tmp/target.fasta"
+
+
+def test_the_shipped_cascade_does_not_fold_against_a_sequence_nobody_gave_it(
+    registry: PluginRegistry,
+) -> None:
+    """Unlike the panel this tier has a builder, because a path is enough.
+
+    A decoy panel is a judgement call and so has no builder at all; a target
+    sequence is one file, and the operator either has it or does not.  So
+    ``_affinity_tier`` exists and returns ``None`` until asked, and the starter
+    cascade is what it was before the tier was written.
+    """
+
+    assert _affinity_tier(registry, boltz2_settings=None) is None
+    assert _affinity_tier(registry, boltz2_settings={}) is None
+    order = [tier.id for tier in default_cascade(registry=registry).tiers]
+    assert not any(tier.startswith("t12") for tier in order)
+
+
+def test_a_blank_sequence_path_is_no_sequence_at_all(registry: PluginRegistry) -> None:
+    """The catalogue default for the FASTA is ``""``, which is the trap.
+
+    A builder that emitted its defaults unedited would hand over a blank path,
+    and a blank that survived this far would fail inside the stage as an
+    unreadable file named "" rather than as a target nobody chose.  Whitespace
+    counts as blank for the same reason.
+    """
+
+    for blank in ("", "   ", "\t"):
+        assert _affinity_tier(registry, boltz2_settings={"target_fasta_path": blank}) is None
+
+
+def test_the_sequence_tier_goes_last_and_changes_nothing_above_it(
+    registry: PluginRegistry,
+) -> None:
+    """Appended, not woven in: every other tier must come back identical."""
+
+    plain = default_cascade(registry=registry)
+    folded = default_cascade(registry=registry, boltz2_settings={"target_fasta_path": _FASTA})
+    if len(folded.tiers) == len(plain.tiers):
+        pytest.skip("the Boltz-2 backend is not installed")
+    assert folded.tiers[-1].id == "t12_affinity"
+    assert folded.tiers[:-1] == plain.tiers
+    settings = folded.tiers[-1].criteria[0].settings
+    assert settings["target_fasta_path"] == _FASTA
+    assert settings["max_molecules"] > 0  # a budget, always, never unbounded
+
+
+def test_the_sequence_tier_cannot_be_handed_the_campaign_receptor(
+    registry: PluginRegistry,
+) -> None:
+    """Same one-field switch as the panel, and here it matters more.
+
+    ``_target_settings`` injects the campaign receptor into any stage whose
+    config declares ``receptor_path``.  This stage wants residues, not atoms,
+    and a sequence read off ATOM records closes unresolved gaps in silence --
+    so the field it must not declare is exactly the field that would let that
+    happen without anyone typing a path.
+    """
+
+    fields = set(Boltz2Config.model_fields)
+    assert "receptor_path" not in fields
+    assert "target_fasta_path" in fields
+
+
+def test_the_sequence_tier_does_not_need_a_docking_tier_above_it(
+    registry: PluginRegistry,
+) -> None:
+    """The one post-docking tier that is not one.
+
+    ``t10`` returns ``None`` without an engine above it because it re-expresses
+    a docking score.  This tier folds the complex itself, reads ``parent/v1``
+    and nothing else, and so lowers on a cascade with no docking at all.  It is
+    last because of what it costs, not because of what it reads -- and a test
+    that only ever saw it below Uni-Dock would not distinguish the two.
+    """
+
+    cascade = default_cascade(registry=registry, boltz2_settings={"target_fasta_path": _FASTA})
+    if not any(tier.id == "t12_affinity" for tier in cascade.tiers):
+        pytest.skip("the Boltz-2 backend is not installed")
+    kept = tuple(tier for tier in cascade.tiers if tier.id in {"t1_chemistry", "t12_affinity"})
+    lowered = lower_cascade(
+        cascade.model_copy(update={"tiers": kept}),
+        registry=registry,
+        allow_missing_library=True,
+        allow_missing_target=True,
+    )
+    assert any("boltz2" in stage.plugin for stage in lowered.pipeline.stages)

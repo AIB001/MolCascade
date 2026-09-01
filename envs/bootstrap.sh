@@ -44,7 +44,14 @@ pybin() { echo "$(conda info --base)/envs/$1/bin/python"; }
 
 # The classic solver has been observed to consume >10 GB of RAM and get OOM-killed
 # on these specs. libmamba is not optional here.
-CONDA_CREATE=(conda create --solver=libmamba -y -c conda-forge)
+#
+# --override-channels because otherwise these environments are built from
+# whatever the user's ~/.condarc happens to list, which makes the same script
+# produce different environments on different machines and, on one of them,
+# none at all: a Tsinghua mirror of pkgs/msys2 answers 403 and conda refuses to
+# solve at all. Everything asked for below -- python, rdkit, unidock -- is on
+# conda-forge, so naming it and only it is both reproducible and sufficient.
+CONDA_CREATE=(conda create --solver=libmamba -y --override-channels -c conda-forge)
 
 # =============================================================================
 # prism -- MolCascade itself, plus every backend that can share its interpreter.

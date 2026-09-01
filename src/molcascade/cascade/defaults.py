@@ -90,6 +90,7 @@ References
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 from molcascade.cascade.availability import option_availability
@@ -1013,10 +1014,68 @@ def _docking_metrics_tier(
     )
 
 
+def _affinity_tier(
+    registry: PluginRegistry, *, boltz2_settings: Mapping[str, Any] | None
+) -> TierConfig | None:
+    """Boltz-2 on whatever survived everything above, and nothing else.
+
+    Every other tier in this cascade reads the molecule, or reads what the tier
+    before it measured.  This one reads a *sequence*: it folds the complex from
+    the target's residues and a SMILES, so it consumes none of the poses the
+    docking tiers produced and its opinion is about the molecule rather than
+    about our geometry.  That independence is the reason to have it and the
+    reason it goes last -- a co-folded affinity that disagrees with the docking
+    score is informative precisely because it did not see the docking score.
+
+    Nothing about the compiler forces the position.  The plugin declares only
+    ``parent/v1`` as input, so lowering would happily run it first; only the
+    cost says otherwise, and tens of seconds a molecule is a different quantity
+    at the top of a funnel than at the bottom.  Hence ``max_molecules`` is a
+    budget the stage enforces before folding anything rather than a guard it
+    checks on the way past.
+
+    Off unless asked for, and by a path rather than a flag.  The target FASTA
+    cannot be discovered: not from this installation, and deliberately not from
+    the receptor PDB either, because reading residues off ATOM records closes
+    every unresolved gap without saying so -- the STK17B structure this was
+    developed against is missing nine residues in the activation segment, and a
+    sequence derived from it would be a protein that does not exist.  So the
+    caller supplies ``boltz2_settings`` with at least ``target_fasta_path``,
+    and without it this returns ``None`` and the starter cascade is unchanged.
+    """
+
+    if not boltz2_settings:
+        return None
+    settings = dict(boltz2_settings)
+    if not str(settings.get("target_fasta_path", "")).strip():
+        return None
+    criterion = _criterion_if_available("binding_affinity", registry, settings=settings)
+    if criterion is None:
+        return None
+    return TierConfig(
+        id="t12_affinity",
+        title="Co-folded affinity",
+        mode=TierMode.ALL,
+        criteria=(criterion,),
+        note=(
+            "Boltz-2 folds the complex itself from the target sequence and the SMILES, "
+            "so this is the one tier that never looks at a pose -- it is an independent "
+            "second opinion, not a rescoring of the docking result. The number is log10 "
+            "of an IC50 in micromolar and lower is stronger, so the default gate at 0.0 "
+            "keeps molecules predicted at or below 1 uM. Read it as a ranking: the paper "
+            "presents these values for ordering compounds and nothing here calibrates "
+            "them against an assay. It costs tens of seconds a molecule, which is why it "
+            "is last and why 'max_molecules' stops the stage before folding rather than "
+            "during."
+        ),
+    )
+
+
 def default_cascade(
     *,
     registry: PluginRegistry | None = None,
     target_count: int = DEFAULT_TARGET_COUNT,
+    boltz2_settings: Mapping[str, Any] | None = None,
 ) -> CascadeConfig:
     """Build the starter cascade against the plugins this installation has."""
 
@@ -1036,6 +1095,7 @@ def default_cascade(
             _conformer_tier(active),
             docking,
             _docking_metrics_tier(active, docking),
+            _affinity_tier(active, boltz2_settings=boltz2_settings),
         )
         if tier is not None
     ]
