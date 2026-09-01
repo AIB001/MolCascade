@@ -96,7 +96,11 @@ where = ["src"]
 namespaces = false
 
 [tool.setuptools.package-data]
-"molcascade.ui.assets" = ["*.css", "*.js"]
+# ``*.png`` is the wordmark the three generated pages inline as a data URI.
+# Left out, every page a wheel-installed MolCascade renders raises
+# FileNotFoundError from ``png_data_uri`` -- and only from a wheel, never
+# from the editable checkout the tests run in.
+"molcascade.ui.assets" = ["*.css", "*.js", "*.png"]
 # PEP 561.  Without this marker mypy refuses to check the package at all --
 # including the ``python -m mypy`` in the README -- and an installed wheel
 # silently gives its callers no types despite every public surface being

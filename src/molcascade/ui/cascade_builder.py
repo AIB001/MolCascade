@@ -46,6 +46,7 @@ from molcascade.environment import detect_environment
 from molcascade.environment.models import HostEnvironment
 from molcascade.io.atomic import atomic_write_bytes
 from molcascade.plugins.registry import PluginRegistry, create_builtin_registry
+from molcascade.ui.assets import png_data_uri
 
 # The shape of the payload the embedded script reads.  Bumped when a key it
 # depends on is added or changes meaning: 3 marks installation paths becoming
@@ -418,6 +419,7 @@ def render_cascade_builder(
 
     css = _asset("cascade.css")
     javascript = _asset("cascade.js")
+    mark = png_data_uri("molcascade-mark.png")
     if save_endpoint is not None:
         payload = {**payload, "save_endpoint": save_endpoint}
     payload_text = json.dumps(
@@ -452,7 +454,7 @@ def render_cascade_builder(
   <a class="skip-link" href="#funnel">Skip to the cascade</a>
   <header class="topbar">
     <div class="brand">
-      <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+      <img class="brand-mark" src="{mark}" alt="" width="189" height="120">
       <span class="brand-text">
         <strong>MolCascade</strong>
         <small>Offline screening cascade builder</small>

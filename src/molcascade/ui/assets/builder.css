@@ -45,11 +45,9 @@ h1, h2, h3, h4, p { margin-top: 0; }
   box-shadow: 0 2px 12px rgba(28, 37, 56, .045); backdrop-filter: blur(16px);
 }
 .brand { min-width: 245px; display: flex; align-items: center; gap: 10px; }
-.brand-mark {
-  width: 38px; height: 38px; display: grid; place-items: center; border-radius: 12px;
-  color: white; background: linear-gradient(145deg, #7681f4, #4451d2); box-shadow: 0 7px 16px rgba(68, 81, 210, .25);
-  font-size: 11px; font-weight: 900; letter-spacing: .06em;
-}
+/* Was a rounded "MC" tile; now the real wordmark, inlined as a data URI. Height
+ * only -- the tag carries the intrinsic ratio, so no reflow when it decodes. */
+.brand-mark { width: auto; height: 38px; flex: none; }
 .brand h1 { margin: 0; font-size: 15px; letter-spacing: -.2px; }
 .brand small { display: block; margin-top: 2px; color: var(--muted); font-size: 9.5px; }
 .top-actions { min-width: 0; margin-left: auto; display: flex; align-items: center; gap: 7px; }

@@ -25,6 +25,7 @@ from molcascade.io.atomic import atomic_write_bytes
 from molcascade.plugins.builtin.admet import DEFAULT_MODELS_REFERENCE
 from molcascade.plugins.manifest import PluginKind
 from molcascade.plugins.registry import PluginRegistry, create_builtin_registry
+from molcascade.ui.assets import png_data_uri
 
 _LAYERS = (
     {
@@ -791,6 +792,7 @@ def _csp_hash(content: str) -> str:
 
 def render_config_builder(payload: dict[str, Any]) -> str:
     css = _asset("builder.css")
+    mark = png_data_uri("molcascade-mark.png")
     rules_javascript = _asset("builder_rules.js")
     javascript = _asset("builder.js")
     payload_text = json.dumps(
@@ -821,7 +823,7 @@ def render_config_builder(payload: dict[str, Any]) -> str:
   <a class="skip-link" href="#pipeline-canvas">Skip to pipeline</a>
   <header class="topbar">
     <div class="brand">
-      <div class="brand-mark" aria-hidden="true">MC</div>
+      <img class="brand-mark" src="{mark}" alt="" width="189" height="120">
       <div><h1>MolCascade</h1><small>Offline screening workflow builder</small></div>
     </div>
     <div class="top-actions">

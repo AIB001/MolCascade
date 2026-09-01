@@ -193,37 +193,15 @@ code {
   align-self: center;
 }
 
-/* Three tilted planes stacked into a small impossible column. */
+/* The wordmark, carried inside the document as a data URI -- see
+ * ``molcascade.ui.assets.png_data_uri`` for why it cannot be a file reference.
+ * Only the height is set: the ``width``/``height`` attributes on the tag give
+ * the intrinsic ratio, so the browser reserves the right box before it has
+ * decoded 42 KB of base64 and nothing beside it reflows on load. */
 .brand-mark {
-  position: relative;
-  width: 34px;
-  height: 38px;
+  width: auto;
+  height: 40px;
   flex: none;
-}
-
-.brand-mark i {
-  position: absolute;
-  left: 50%;
-  width: 20px;
-  height: 20px;
-  margin-left: -10px;
-  transform: rotate(45deg);
-  border-radius: 3px;
-}
-
-.brand-mark i:nth-child(1) {
-  top: 0;
-  background: var(--ochre);
-}
-
-.brand-mark i:nth-child(2) {
-  top: 9px;
-  background: var(--coral);
-}
-
-.brand-mark i:nth-child(3) {
-  top: 18px;
-  background: var(--sage);
 }
 
 .brand-text {

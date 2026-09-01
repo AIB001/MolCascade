@@ -12,6 +12,7 @@ from typing import Any
 
 from molcascade.io.atomic import atomic_write_bytes
 from molcascade.runtime import LocalRunner
+from molcascade.ui.assets import png_data_uri
 
 
 def _asset(name: str) -> str:
@@ -85,6 +86,7 @@ def build_run_report_payload(runner: LocalRunner, run_id: str) -> dict[str, Any]
 def render_run_report(payload: dict[str, Any]) -> str:
     css = _asset("report.css")
     javascript = _asset("report.js")
+    mark = png_data_uri("molcascade-mark.png")
     payload_text = json.dumps(
         payload,
         allow_nan=False,
@@ -113,7 +115,7 @@ def render_run_report(payload: dict[str, Any]) -> str:
   <style>{css}</style>
 </head>
 <body>
-  <header class="hero"><div class="hero-row"><div><div class="eyebrow">MolCascade local screening report</div><h1>Run {run_id}</h1><p>revision {revision}</p></div><div class="actions"><button id="copy-command" class="button ghost" type="button">Copy next-run command</button><button id="download-next" class="button" type="button">Download next configuration</button></div></div></header>
+  <header class="hero"><div class="hero-row"><div class="hero-brand"><img class="brand-mark" src="{mark}" alt="" width="189" height="120"><div><div class="eyebrow">MolCascade local screening report</div><h1>Run {run_id}</h1><p>revision {revision}</p></div></div><div class="actions"><button id="copy-command" class="button ghost" type="button">Copy next-run command</button><button id="download-next" class="button" type="button">Download next configuration</button></div></div></header>
   <main class="content">
     <section id="summary" class="summary-grid" aria-label="Run summary"></section>
     <div class="section-head"><div><h2>Stage audit</h2><p>This offline report contains aggregate counts and provenance; molecule rows remain on disk.</p></div></div>

@@ -28,6 +28,11 @@ button, textarea { font: inherit; }
 }
 .hero-row, .content { max-width: 1380px; margin: 0 auto; }
 .hero-row { display: flex; justify-content: space-between; gap: 28px; align-items: center; }
+/* The wordmark and the run title are one cluster, so ``space-between`` keeps
+ * them together on the left and the buttons on the right rather than pushing
+ * three items apart.  The mark is a data URI; see the note in cascade.css. */
+.hero-brand { display: flex; align-items: center; gap: 16px; min-width: 0; }
+.hero-brand .brand-mark { width: auto; height: 58px; flex: none; }
 .eyebrow { opacity: .78; text-transform: uppercase; letter-spacing: .14em; font-size: 12px; }
 h1 { margin: 6px 0; font-size: clamp(28px, 4vw, 44px); }
 .hero p { margin: 0; opacity: .88; }
