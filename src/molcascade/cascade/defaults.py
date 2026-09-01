@@ -300,10 +300,20 @@ def _scscore_criterion(registry: PluginRegistry) -> CriterionConfig | None:
         # SCScore is a *relative* score -- it was trained to rank a reaction's
         # product above its reactants, not to place an absolute line -- so a
         # threshold on it has to be read off the population it will judge.  On
-        # 71 approved oral drugs the distribution is median 3.52, p75 4.19,
-        # p90 4.61.  The 3.5 this shipped with was sitting on the median: it
-        # rejected 51% of marketed drugs, a coin flip dressed as a filter.
-        gate_settings={"expected_direction": "HIGHER_HARDER", "maximum": 4.5},
+        # the 77-drug approved oral panel the distribution is p25 2.81, median
+        # 3.41, p75 4.20, p90 4.65.  The 3.5 the catalogue still offers sits on
+        # the median and rejects 49% of marketed drugs, a coin flip dressed as
+        # a filter; 4.5 sat above p75 and rejected 12%.
+        #
+        # 4.0 is between the two and rejects 24 of 77 (31%), which is the
+        # largest single cost in this funnel and is a deliberate one: it removes
+        # every kinase inhibitor on the panel -- sorafenib 4.18, erlotinib 4.22,
+        # sunitinib 4.20, gefitinib 4.35, palbociclib 4.61, lapatinib 4.82,
+        # ibrutinib 4.93, imatinib 5.00.  Marketed kinase drugs are elaborate,
+        # and a cut here says this project would rather have simpler chemistry
+        # than chemistry shaped like the ones that already exist.  Raise it to
+        # 4.5 to get them back.
+        gate_settings={"expected_direction": "HIGHER_HARDER", "maximum": 4.0},
     )
 
 
@@ -375,31 +385,35 @@ def _property_tier(registry: PluginRegistry) -> TierConfig | None:
                 "ring_topology",
                 registry,
                 settings={
-                    # The catalogue's own defaults, restated here so that reading
-                    # this file tells you what the starter cascade rejects
-                    # without opening another one.  All three are ceilings on
-                    # *shape*, and they exist because a generated library is the
-                    # one input where shape goes wrong in ways every other tier
-                    # in this funnel scores as excellent: a seven-ring flat
-                    # polycyclic with no rotatable bond passes Ro5, QED, the
-                    # alert catalogues and the ADMET panel, and is not a
-                    # molecule anyone would make.
+                    # Ceilings on *shape*.  They exist because a generated
+                    # library is the one input where shape goes wrong in ways
+                    # every other tier in this funnel scores as excellent: a
+                    # seven-ring flat polycyclic with no rotatable bond passes
+                    # Ro5, QED, the alert catalogues and the ADMET panel, and is
+                    # not a molecule anyone would make.
                     #
-                    # Set against the approved oral panel on the same standard
-                    # as the window above, these three reject 2 of 77 --
-                    # artemisinin and camptothecin -- which is the price of
-                    # excluding a failure mode nothing downstream can see.
+                    # These are tighter than any published drug-likeness
+                    # calibration, and deliberately so -- "at most two fused
+                    # rings per system, four across all of them" is a house rule
+                    # about what is worth making, not a claim about what is
+                    # drug-like.  FAF-Drugs4's own values (6 rings, 18 atoms per
+                    # system) pass up to 90% of 916 approved oral drugs; the
+                    # numbers below do not, and the difference is the point.
                     #
-                    # They are ceilings, not a preference, for the same reason
-                    # the size window is: this tier sees every molecule and its
-                    # mistakes are unrecoverable.  A project that wants "at most
-                    # two fused bicyclics" tightens 'max_fused_rings' to 2 and
-                    # sets 'max_fused_ring_total' to 4 -- measured at 10 of 77
-                    # on the same panel, which is a real cost and so is a
-                    # decision, not a default.
-                    "max_rings": 6,  # naphthyridine-fused kinase chemistry still fits
-                    "max_fused_rings": 4,  # one system; steroids are 4, so 4 not 3
-                    "max_ring_system_size": 18,  # atoms in one fused system
+                    # Measured on the approved oral panel, on the same standard
+                    # as the window above: 10 of 77 rejected, up from 2.  Every
+                    # one of the 10 is rejected by 'max_fused_rings' alone --
+                    # amitriptyline, carbamazepine, codeine, dexamethasone,
+                    # levofloxacin, loratadine, morphine, olanzapine,
+                    # prednisolone, quetiapine -- and the other three ceilings
+                    # cost nothing beyond it on this panel.  A project screening
+                    # a purchasable library rather than a generated one should
+                    # raise 'max_fused_rings' back to 4 first: it is the one
+                    # number here that is doing all of the rejecting.
+                    "max_rings": 5,  # free on the panel; a ceiling on total count
+                    "max_fused_rings": 2,  # at most a bicyclic per system
+                    "max_fused_ring_total": 4,  # two bicyclics, not three
+                    "max_ring_system_size": 16,  # atoms in one fused system
                 },
             ),
             _criterion_if_available(
@@ -443,7 +457,9 @@ def _property_tier(registry: PluginRegistry) -> TierConfig | None:
             "Narrow it to a project window once you "
             "know what you are looking for. Measured against the approved oral panel "
             "the size window rejects 4, the aromatic ring cap 1 and the ring topology "
-            "ceilings 2."
+            "ceilings 10 -- the last of those is a house rule about fused systems, not "
+            "a drug-likeness calibration, and is the first thing to loosen on a "
+            "purchasable library."
         ),
     )
 
@@ -458,7 +474,15 @@ def _druglikeness_tier(registry: PluginRegistry) -> TierConfig | None:
                 config_id="druglike_ro5_qed",
                 label="Rule of Five and QED · RDKit",
                 settings={
-                    "maximum_rule_of_five_violations": 1,
+                    # Zero violations, not Lipinski's own "no more than one".
+                    # On the approved oral panel that is 8 of 77 rather than 3:
+                    # it adds levothyroxine, sertraline, sorafenib, tamoxifen and
+                    # verapamil to atorvastatin, lapatinib and montelukast.  The
+                    # argument for it is the same as the ring ceilings above --
+                    # a generated library has no scarcity of molecules that
+                    # violate nothing, so the cheapest thing to spend here is
+                    # slack.  Raise it to 1 to get Lipinski's actual rule back.
+                    "maximum_rule_of_five_violations": 0,
                     # QED's own paper puts approved oral drugs around 0.5; a floor of
                     # 0.3 removes the clearly undesirable without pretending the
                     # score is sharp enough to rank the survivors.
@@ -823,12 +847,26 @@ def _docking_tier(registry: PluginRegistry) -> TierConfig | None:
                 option_id="unidock",
                 config_id="docking_score",
                 label="Docking score · Uni-Dock",
-                # -9.5 kcal/mol is roughly the top few percent of a Vina
-                # distribution on a kinase pocket; it is a shortlist threshold,
-                # not a binding prediction, and Vina's own error bar is wider
-                # than the gap between -9.5 and -9.0.  What it is really doing
-                # is fixing the size of what reaches a human.
-                gate_settings={"maximum": -9.5},
+                # A shortlist threshold, not a binding prediction: Vina's own
+                # error bar is wider than the gap between -9.5 and -8.5, so what
+                # this number really fixes is how many molecules reach a human.
+                #
+                # It was -9.5 while the tiers above admitted three- and
+                # four-ring fused systems.  They no longer do, and a docking
+                # score is not scale-free: replaying the 103,515-molecule
+                # STK17B run through the ceilings above leaves 3,923 of the
+                # 21,873 molecules that used to dock, and they are smaller
+                # (heavy-atom median 22 against 26), so they score worse
+                # (Uni-Dock median -8.77 -> -7.85).  Holding -9.5 against that
+                # population would pass 15 molecules out of the whole library,
+                # which is a filter that has stopped measuring anything.
+                #
+                # -8.5 keeps the tier as selective as it was -- 23.7% of what
+                # arrives, against 21.7% before -- rather than as absolute as it
+                # was.  Post-docking metrics one tier down read the same score
+                # normalized by size, which is the honest way to compare across
+                # a population this much smaller.
+                gate_settings={"maximum": -8.5},
             ),
             _criterion_if_available(
                 "docking_score",
@@ -840,10 +878,16 @@ def _docking_tier(registry: PluginRegistry) -> TierConfig | None:
                 config_id="docking_score_2",
                 label="Docking score · KarmaDock",
                 # KarmaDock's MDN score is not a kcal/mol and does not convert
-                # to one -- higher is better, and 45 is its own scale.  Pairing
+                # to one -- higher is better, and 40 is its own scale.  Pairing
                 # it with the Vina cut is the point: two scales that cannot be
                 # averaged, so agreement means something.
-                gate_settings={"minimum": 45.0},
+                #
+                # Relaxed from 45 for the same reason and by the same measure as
+                # the Uni-Dock cut above: on the smaller molecules the tightened
+                # ceilings admit, the KarmaDock median falls 38.1 -> 32.1, and
+                # 40 passes 13.6% of them against 16.2% at 45 before.  The two
+                # cuts together put 246 molecules through this tier.
+                gate_settings={"minimum": 40.0},
             ),
         )
         if criterion is not None

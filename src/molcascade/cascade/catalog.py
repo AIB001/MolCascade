@@ -1174,11 +1174,14 @@ CRITERIA: tuple[CriterionSpec, ...] = (
                     "molecules around them -- a rigid surface makes many contacts "
                     "and pays no entropy for it. Over one 2,000-molecule run here, "
                     "molecules with four or more fused rings were 71.5% of the "
-                    "input and 83.3% of the final shortlist. The three defaults "
-                    "leave 30 of 33 approved drugs standing, costing only morphine, "
-                    "camptothecin and artemisinin. The rotor floor, ring-atom "
-                    "fraction, sp3 floor, bridgehead cap and all-systems fused "
-                    "total ship empty on purpose: "
+                    "input and 83.3% of the final shortlist. The four defaults "
+                    "leave 67 of 77 approved oral drugs standing; the ten they cost "
+                    "are all fused polycyclics -- amitriptyline, carbamazepine, "
+                    "codeine, dexamethasone, levofloxacin, loratadine, morphine, "
+                    "olanzapine, prednisolone, quetiapine -- and all ten are rejected "
+                    "by the fused-ring cap alone, so that is the number to raise "
+                    "first on a purchasable library. The rotor floor, ring-atom "
+                    "fraction, sp3 floor and bridgehead cap ship empty on purpose: "
                     "each has a defensible use on a generated library and none has "
                     "a threshold the literature will support against approved "
                     "drugs, so a project that wants one sets it deliberately."
@@ -1190,17 +1193,24 @@ CRITERIA: tuple[CriterionSpec, ...] = (
                 recommended=True,
                 defaults={
                     "schema_version": 1,
-                    # FAF-Drugs4's own drug-like values, chosen by its authors so
-                    # that up to 90% of 916 approved oral drugs pass. Taken
-                    # unchanged so the default strictness here is a published
-                    # calibration rather than a preference.
-                    "max_rings": 6,
-                    "max_ring_system_size": 18,
-                    # No filter to inherit from: nothing else counts rings within
-                    # a fused system. Toxtree flags three or more fused aromatic
-                    # rings; four is one step looser, which is what passes the
-                    # steroids.
-                    "max_fused_rings": 4,
+                    # Tighter than the published drug-like values these started
+                    # from -- FAF-Drugs4 ships 6 rings and 18 atoms per system,
+                    # chosen so that up to 90% of 916 approved oral drugs pass,
+                    # and Toxtree flags three or more fused aromatic rings. What
+                    # ships here instead is a house rule for generated
+                    # libraries: at most a bicyclic per fused system, four fused
+                    # rings across all of them. It costs 10 of 77 approved oral
+                    # drugs where the published values cost 2, which is a
+                    # preference and is described as one in the notes above.
+                    #
+                    # These match the starter cascade on purpose. A block the
+                    # operator deletes and re-adds from the picker has to come
+                    # back as strict as the one that was there, or the funnel
+                    # quietly loosens when someone rearranges it.
+                    "max_rings": 5,
+                    "max_ring_system_size": 16,
+                    "max_fused_rings": 2,
+                    "max_fused_ring_total": 4,
                 },
                 thresholds=(
                     ThresholdField(
