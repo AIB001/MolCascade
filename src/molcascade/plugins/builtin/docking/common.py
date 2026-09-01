@@ -19,6 +19,7 @@ guessing at them inside a screening run would be inventing the answer.
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import math
 import os
 import stat
@@ -53,6 +54,17 @@ MAX_LOG_TAIL = 4000
 #: A receptor is one protein structure.  Even a large complex with waters is a
 #: few tens of megabytes; anything past this is a trajectory or a mistake.
 MAX_RECEPTOR_BYTES = 256 * 1024 * 1024
+
+#: Why a missing converter is this environment's problem and not the engine's.
+#: meeko is what turns a conformer into the PDBQT the Vina-family engines read,
+#: so it installs *here* rather than into an engine's own environment -- which
+#: is the one thing that makes its absence fixable with a pip command.
+MEEKO_HINT = (
+    'pip install "molcascade[docking]". meeko is what turns a prepared conformer '
+    "into the PDBQT a Vina-family engine reads, so without it there is nothing "
+    "to hand the engine -- unlike the engine itself, it installs into this "
+    "environment."
+)
 
 _READ_CHUNK = 4 * 1024 * 1024
 
@@ -594,9 +606,87 @@ def require_gpu_lane(device: str, *, engine: str) -> str:
     return device
 
 
+def require_meeko(*, engine: str) -> None:
+    """Ask for the ligand converter before the shard rather than during it.
+
+    The conversion happens once per molecule, deep inside a batch loop, so a
+    plain ``ImportError`` from there surfaces as a traceback out of a worker
+    process after the run has already started -- for the one dependency the
+    ``docking`` extra exists to install.  ``find_spec`` answers the question
+    without importing anything, which matters because this is called from
+    ``execute`` on every stage that will later need it.
+    """
+
+    if importlib.util.find_spec("meeko") is None:
+        raise PluginError(
+            f"{engine} prepares its ligands with meeko, which is not installed",
+            code="DOCKING_LIGAND_PREP_UNAVAILABLE",
+            hint=MEEKO_HINT,
+            context={"engine": engine, "module": "meeko"},
+        )
+
+
+def ligand_pdbqt(molblock: str) -> str | None:
+    """Convert one prepared conformer into the format a Vina-family engine reads.
+
+    ``None`` rather than an exception: meeko refuses molecules it has no atom
+    types for, and one of those in a batch of two thousand is a molecule to
+    count and move past, not a reason to lose the batch.
+    """
+
+    from meeko import MoleculePreparation, PDBQTWriterLegacy
+    from rdkit import Chem
+
+    molecule = Chem.MolFromMolBlock(molblock, removeHs=False)
+    if molecule is None:
+        return None
+    try:
+        setups = MoleculePreparation().prepare(molecule)
+    except (RuntimeError, ValueError, KeyError, TypeError):
+        return None
+    if not setups:
+        return None
+    pdbqt, ok, _message = PDBQTWriterLegacy.write_string(setups[0])
+    if not ok or not pdbqt:
+        return None
+    return str(pdbqt)
+
+
+def parse_vina_poses(text: str) -> list[float]:
+    """Pull one score per ``MODEL`` out of an output PDBQT, in file order.
+
+    Vina writes its result as a ``REMARK`` inside each ``MODEL`` block.  A file
+    with no ``MODEL`` framing at all is read as a single pose, which is what
+    some builds emit when only one mode was requested.
+    """
+
+    scores: list[float] = []
+    score: float | None = None
+    in_model = False
+    for line in text.splitlines():
+        if line.startswith("MODEL"):
+            in_model, score = True, None
+            continue
+        if line.startswith("ENDMDL"):
+            if score is not None:
+                scores.append(score)
+            in_model, score = False, None
+            continue
+        if line.startswith("REMARK VINA RESULT:"):
+            fields = line.removeprefix("REMARK VINA RESULT:").split()
+            try:
+                score = float(fields[0]) if fields else None
+            except ValueError:
+                score = None
+    if not scores and not in_model and score is not None:
+        scores.append(score)
+    return scores
+
+
 __all__ = [
     "MAX_LOG_TAIL",
     "MAX_RECEPTOR_BYTES",
+    "MEEKO_HINT",
     "BoxedDockingEngineConfig",
     "DockingEngineConfig",
     "MachinePath",
@@ -609,11 +699,14 @@ __all__ = [
     "fill_machine_paths",
     "finite_number",
     "isolated_environment",
+    "ligand_pdbqt",
     "log_tail",
+    "parse_vina_poses",
     "path_from_environment",
     "population_size",
     "ranked",
     "require_gpu_lane",
+    "require_meeko",
     "require_pdb_receptor",
     "resolved_executable",
     "run_engine",

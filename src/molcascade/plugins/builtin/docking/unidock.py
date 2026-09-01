@@ -20,7 +20,6 @@ failures are counted and skipped rather than raised.
 
 from __future__ import annotations
 
-import importlib.util
 import math
 import tempfile
 from pathlib import Path
@@ -44,9 +43,12 @@ from molcascade.plugins.builtin.docking.common import (
     backend_root,
     conda_environment,
     enforce_population_cap,
+    ligand_pdbqt,
+    parse_vina_poses,
     population_size,
     ranked,
     require_gpu_lane,
+    require_meeko,
     resolved_executable,
     run_engine,
     shard_geometry,
@@ -91,12 +93,6 @@ _EXECUTABLE_HINT = (
     "Set 'executable' to the absolute path of the 'unidock' binary. MolCascade "
     "does not build or install it; see 'molcascade doctor' for the command that "
     "reports what is missing."
-)
-
-_MEEKO_HINT = (
-    'pip install "molcascade[docking]". meeko is what turns a prepared conformer '
-    "into the PDBQT Uni-Dock reads, so without it there is nothing to hand the "
-    "engine -- unlike the engine itself, it installs into this environment."
 )
 
 
@@ -205,82 +201,6 @@ def _prepared_receptor(config: UniDockConfig) -> tuple[Path, str]:
             "if it was removed, or pass one with '--receptor-pdbqt'."
         ),
     )
-
-
-def _require_meeko() -> None:
-    """Ask for the converter before the shard rather than during it.
-
-    The conversion happens once per molecule, deep inside the batch loop, so a
-    plain ``ImportError`` from there surfaces as a traceback out of a worker
-    process after the run has already started -- for the one dependency the
-    ``docking`` extra exists to install.  ``find_spec`` answers the question
-    without importing anything.
-    """
-
-    if importlib.util.find_spec("meeko") is None:
-        raise PluginError(
-            f"{_ENGINE} prepares its ligands with meeko, which is not installed",
-            code="DOCKING_LIGAND_PREP_UNAVAILABLE",
-            hint=_MEEKO_HINT,
-            context={"engine": _ENGINE, "module": "meeko"},
-        )
-
-
-def _ligand_pdbqt(molblock: str) -> str | None:
-    """Convert one prepared conformer into the format Uni-Dock reads.
-
-    ``None`` rather than an exception: meeko refuses molecules it has no atom
-    types for, and one of those in a batch of two thousand is a molecule to
-    count and move past, not a reason to lose the batch.
-    """
-
-    from meeko import MoleculePreparation, PDBQTWriterLegacy
-    from rdkit import Chem
-
-    molecule = Chem.MolFromMolBlock(molblock, removeHs=False)
-    if molecule is None:
-        return None
-    try:
-        setups = MoleculePreparation().prepare(molecule)
-    except (RuntimeError, ValueError, KeyError, TypeError):
-        return None
-    if not setups:
-        return None
-    pdbqt, ok, _message = PDBQTWriterLegacy.write_string(setups[0])
-    if not ok or not pdbqt:
-        return None
-    return str(pdbqt)
-
-
-def _parse_poses(text: str) -> list[float]:
-    """Pull one score per ``MODEL`` out of an output PDBQT, in file order.
-
-    Vina writes its result as a ``REMARK`` inside each ``MODEL`` block.  A file
-    with no ``MODEL`` framing at all is read as a single pose, which is what
-    some builds emit when only one mode was requested.
-    """
-
-    scores: list[float] = []
-    score: float | None = None
-    in_model = False
-    for line in text.splitlines():
-        if line.startswith("MODEL"):
-            in_model, score = True, None
-            continue
-        if line.startswith("ENDMDL"):
-            if score is not None:
-                scores.append(score)
-            in_model, score = False, None
-            continue
-        if line.startswith("REMARK VINA RESULT:"):
-            fields = line.removeprefix("REMARK VINA RESULT:").split()
-            try:
-                score = float(fields[0]) if fields else None
-            except ValueError:
-                score = None
-    if not scores and not in_model and score is not None:
-        scores.append(score)
-    return scores
 
 
 def _pose_molblocks(text: str, count: int) -> list[str | None]:
@@ -394,7 +314,7 @@ def _dock_batch(
                 unscored += 1
                 continue
             text = output.read_text(encoding="utf-8", errors="replace")
-            scores = _parse_poses(text)
+            scores = parse_vina_poses(text)
             if not scores:
                 unscored += 1
                 continue
@@ -403,9 +323,7 @@ def _dock_batch(
             # the checker wanted it.
             wants_pose = config.keep_poses or config.pose_quality.enabled
             molblocks = _pose_molblocks(text, len(scores)) if wants_pose else [None] * len(scores)
-            for rank, block in enumerate(
-                ranked(scores, limit=config.num_modes, descending=False)
-            ):
+            for rank, block in enumerate(ranked(scores, limit=config.num_modes, descending=False)):
                 rows.append(
                     {
                         "parent_id": parent_id,
@@ -428,7 +346,7 @@ def _run_shard(task: ShardTask) -> ShardOutcome:
 
     config = UniDockConfig.model_validate(dict(task.config))
     require_gpu_lane(task.device, engine=_ENGINE)
-    _require_meeko()
+    require_meeko(engine=_ENGINE)
     executable = resolved_executable(config.executable, engine=_ENGINE, hint=_EXECUTABLE_HINT)
     _receptor, receptor_id = verified_receptor(config)
     prepared, prepared_id = _prepared_receptor(config)
@@ -465,7 +383,7 @@ def _run_shard(task: ShardTask) -> ShardOutcome:
                     # no evidence in the open.
                     missing_geometry += 1
                     continue
-                pdbqt = _ligand_pdbqt(molblock)
+                pdbqt = ligand_pdbqt(molblock)
                 if pdbqt is None:
                     ligand_failed += 1
                     continue
