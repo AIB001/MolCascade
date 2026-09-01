@@ -18,7 +18,7 @@ another. For the conceptual account of licences and isolation, see the main
 
 ## Topology
 
-Four conda environments and one standalone binary:
+Five conda environments and one standalone binary:
 
 | Environment | Python | Holds | Why it is separate |
 | --- | --- | --- | --- |
@@ -26,15 +26,21 @@ Four conda environments and one standalone binary:
 | `karmadock` | 3.10 | KarmaDock's interpreter | pins `rdkit==2022.09.1` |
 | `unidock` | 3.14.7 | the `unidock` binary | conda-forge package, built per Python ABI; would overwrite `prism`'s rdkit/numpy/pandas |
 | `aizynth` | 3.12.13 | `aizynthcli` | pulls rdkit 2023.9.6 + numpy 1.26 |
+| `boltz2` | 3.12 | the `boltz` CLI + its weights | brings its own torch; installing it into `prism` replaces the one ADMET-AI and KarmaDock run on |
 | GNINA 1.3.3 | — | a 1.9 GB release binary | not a package at all; GPL-2.0-or-later |
 
-Only `prism` needs to be activated. The other three are never on `PATH` — a cascade names
+Only `prism` needs to be activated. The other four are never on `PATH` — a cascade names
 their executables by absolute path, which is the whole point.
+
+`boltz2` is the one environment `bootstrap.sh` does not build by default. It is 8 GB with
+the weights, and the tier that uses it ships switched off, so it is opt-in: ask for it by
+name.
 
 ## Provisioning a new machine
 
 Requirements: Linux x86-64, an NVIDIA GPU with a driver new enough for CUDA 12.4+, conda
-(Miniforge preferred), git, curl, and roughly **30 GB** of disk.
+(Miniforge preferred), git, curl, and roughly **30 GB** of disk — **38 GB** with the
+opt-in `boltz2` environment and its weights.
 
 ```bash
 git clone <this repo> && cd MolCascade
@@ -47,6 +53,7 @@ provision just one piece:
 ```bash
 bash envs/bootstrap.sh prism            # only the main environment
 bash envs/bootstrap.sh gnina karmadock  # only the docking engines
+bash envs/bootstrap.sh boltz2           # opt-in: not in the default set
 bash envs/bootstrap.sh verify           # just re-run the checks
 ```
 
@@ -55,7 +62,12 @@ Two paths are configurable by environment variable; both default as shown:
 ```bash
 MOLCASCADE_BACKEND_ROOT=~/molcascade-backends   # GNINA, its cuDNN, the KarmaDock checkout
 MOLCASCADE_AIZYNTH_DATA=~/aizynth-data          # ~750 MB of retrosynthesis models
+BOLTZ_CACHE=~/.boltz                            # ~3 GB of Boltz-2 weights and the CCD
 ```
+
+`BOLTZ_CACHE` is spelled without the `MOLCASCADE_` prefix because it is Boltz's own
+variable, read by the library itself; the bootstrap and the plugin both defer to it rather
+than inventing a second name for the same directory.
 
 **Use `--solver=libmamba`** for anything you install by hand. The classic solver was
 observed taking 10 GB of RSS on these specs and getting OOM-killed on a 24 GB box.
@@ -226,6 +238,43 @@ The data is 754 MB: `uspto_model.onnx` (91 MB), `uspto_ringbreaker_model.onnx`,
 `download_public_data` writes a `config.yml` containing **absolute paths**, so it must be
 re-run on each machine rather than copied — or its paths rewritten by hand.
 
+## `boltz2`
+
+```bash
+conda create -n boltz2 --solver=libmamba -y -c conda-forge python=3.12
+~/anaconda3/envs/boltz2/bin/pip install "boltz[cuda]==2.2.1"
+BOLTZ_CACHE=~/.boltz ~/anaconda3/envs/boltz2/bin/python -c \
+  "from boltz.main import download_boltz2; from pathlib import Path; \
+   download_boltz2(Path.home() / '.boltz')"
+```
+
+| Package | Version |
+| --- | --- |
+| boltz | 2.2.1 |
+| python | 3.12 |
+| torch | its own, pulled by boltz |
+| cuequivariance | the `[cuda]` extra — fused kernels; boltz runs without them, slower |
+
+The interpreter is the same 3.12 as `prism`, which makes the reason for the split easy to
+miss: **it is not about Python, it is about torch.** `pip install boltz` into `prism` would
+resolve to a different torch build and take ADMET-AI and KarmaDock down with it. That is
+also why the plugin passes an absolute path to `boltz` and scrubs `PYTHONPATH`, `PYTHONHOME`
+and `PYTHONSTARTUP` out of the child's environment — a leaked path would not fail, it would
+quietly import the wrong torch.
+
+The weight download is done here rather than on first use, deliberately. Boltz fetches about
+3 GB the first time it predicts anything, inside whichever worker process gets there first —
+a network call in the middle of a screen, on a machine that may not have a route out, where
+the failure looks like a prediction failure. So the plugin refuses to start on an empty cache
+and points at this command instead.
+
+Boltz-2 is **MIT**, code and weights both, so nothing here needs `--allow-copyleft`.
+
+Two things it will not do for you: it never fetches a target sequence, and it never builds an
+alignment. You supply a single-chain FASTA and its a3m. `msa_mode="colabfold_server"` exists
+and uploads your sequence to `api.colabfold.com` — a third party — which is why it has to be
+named explicitly and is never a fallback.
+
 ## GNINA 1.3.3
 
 There is no conda package for GNINA. It is one 1.9 GB asset from the GitHub release:
@@ -279,10 +328,19 @@ Every one of these is an absolute path. Substitute your own `MOLCASCADE_BACKEND_
 | | `pocket_pdb_path` | optional |
 | AiZynthFinder | `executable` | `/home/shizq/anaconda3/envs/aizynth/bin/aizynthcli` |
 | | `config_path` | `/home/shizq/aizynth-data/config.yml` |
+| Boltz-2 | `executable` | `/home/shizq/anaconda3/envs/boltz2/bin/boltz` |
+| | `cache_dir` | `/home/shizq/.boltz` |
+| | `target_fasta_path` | your target's single-chain `.fasta` (required) |
+| | `msa_a3m_path` | its `.a3m` alignment (required, unless `msa_mode` says otherwise) |
 
-All four also take `receptor_path` (the docking three) or the shared engine fields
+All five also take `receptor_path` (the docking three) or the shared engine fields
 `num_modes`, `seed`, `max_molecules`, `timeout_per_molecule_seconds`, `scratch_dir`. Set
 `scratch_dir` when the system temporary directory is a small tmpfs.
+
+Boltz-2 is the exception to `receptor_path`: it takes a sequence rather than a structure, and
+declining that field is what keeps the campaign's receptor from being injected into it. A
+sequence read off a PDB's ATOM records has every unresolved loop silently deleted, and a fold
+against a protein missing a loop is wrong in a way no error would mention.
 
 ## Verifying
 
@@ -385,6 +443,8 @@ machine, which is not enough headroom for a classic-solver conda run. See
 | `karmadock` | ~4 GB |
 | `unidock` | ~2 GB |
 | `aizynth` | ~2 GB |
+| `boltz2` | ~5 GB (opt-in) |
+| Boltz-2 weights | ~3 GB (opt-in) |
 | GNINA binary | 1.9 GB |
 | GNINA's cuDNN | 1.3 GB |
 | AiZynthFinder data | 754 MB |

@@ -5,6 +5,7 @@
 #   bash envs/bootstrap.sh              # everything
 #   bash envs/bootstrap.sh prism        # just the main environment
 #   bash envs/bootstrap.sh gnina karmadock
+#   bash envs/bootstrap.sh boltz2      # opt-in: not in the default set
 #
 # Reads nothing from the network except conda-forge, PyPI, download.pytorch.org,
 # data.pyg.org and the GNINA release asset. Every step is idempotent: re-running
@@ -19,6 +20,9 @@ set -euo pipefail
 BACKEND_ROOT="${MOLCASCADE_BACKEND_ROOT:-${HOME}/molcascade-backends}"
 # AiZynthFinder's ~750 MB of models and stock.
 AIZYNTH_DATA="${MOLCASCADE_AIZYNTH_DATA:-${HOME}/aizynth-data}"
+# Boltz-2's ~3 GB of weights plus the CCD. Boltz reads this variable itself, so
+# it is spelled its way rather than ours.
+BOLTZ_CACHE_DIR="${BOLTZ_CACHE:-${HOME}/.boltz}"
 # The checkout this script is being run from.
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -202,6 +206,58 @@ setup_aizynth() {
 }
 
 # =============================================================================
+# boltz2 -- Boltz-2 co-folding, for the optional last tier. MIT, code and weights.
+#
+# The conflict here is torch, not Python: boltz accepts prism's 3.12, but
+# resolving it into prism re-pins the torch ADMET-AI predicts with in-process
+# and KarmaDock was built against. So it gets an interpreter of its own, and
+# MolCascade calls the `boltz` CLI in it by absolute path like every other
+# ISOLATED backend.
+#
+# Not in the default target list: this is ~3 GB of weights on top of another
+# torch, for a tier that ships switched off. Ask for it by name.
+# =============================================================================
+setup_boltz2() {
+  if env_exists boltz2; then
+    note "env 'boltz2' already exists"
+  else
+    say "creating env 'boltz2' (Python 3.12 + Boltz-2)"
+    "${CONDA_CREATE[@]}" -n boltz2 python=3.12
+    # The [cuda] extra is cuequivariance's fused kernels; boltz runs without
+    # them, slower. It brings its own torch -- that is the entire point of the
+    # separate environment.
+    "$(pybin boltz2)" -m pip install "boltz[cuda]==2.2.1" \
+      || "$(pybin boltz2)" -m pip install "boltz==2.2.1"
+  fi
+
+  # Boltz downloads on first use, inside whatever process got there first. That
+  # is a 3 GB network call in the middle of a screen, so it happens here
+  # instead, and the plugin refuses to start until this directory is populated.
+  if [ -f "${BOLTZ_CACHE_DIR}/boltz2_conf.ckpt" ]; then
+    note "Boltz-2 weights already at ${BOLTZ_CACHE_DIR}"
+  else
+    say "downloading Boltz-2 weights and the CCD (~3 GB) to ${BOLTZ_CACHE_DIR}"
+    mkdir -p "${BOLTZ_CACHE_DIR}"
+    BOLTZ_CACHE="${BOLTZ_CACHE_DIR}" "$(pybin boltz2)" -c "
+import sys
+from pathlib import Path
+cache = Path(sys.argv[1])
+try:
+    from boltz.main import download_boltz2
+except ImportError:
+    sys.exit('boltz.main.download_boltz2 is gone; run one prediction by hand to populate the cache')
+download_boltz2(cache)
+" "${BOLTZ_CACHE_DIR}"
+    [ -f "${BOLTZ_CACHE_DIR}/boltz2_conf.ckpt" ] \
+      || die "the download finished but ${BOLTZ_CACHE_DIR}/boltz2_conf.ckpt is not there"
+  fi
+
+  note "boltz CLI: $(conda info --base)/envs/boltz2/bin/boltz"
+  note "cache:     ${BOLTZ_CACHE_DIR}"
+  note "Boltz-2 needs a target FASTA and an a3m alignment; it never fetches one for you"
+}
+
+# =============================================================================
 # gnina -- a 1.9 GB release binary, not a package. GPL-2.0-or-later.
 # =============================================================================
 setup_gnina() {
@@ -278,6 +334,7 @@ for t in "${targets[@]}"; do
     karmadock) setup_karmadock ;;
     unidock)   setup_unidock ;;
     aizynth)   setup_aizynth ;;
+    boltz2)    setup_boltz2 ;;
     gnina)     setup_gnina ;;
     verify)    verify ;;
     *)         die "unknown target: ${t}" ;;

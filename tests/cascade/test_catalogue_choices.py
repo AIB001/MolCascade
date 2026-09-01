@@ -190,23 +190,23 @@ def test_no_choice_field_offers_a_duplicate_or_empty_value() -> None:
                 assert len(set(labels)) == len(labels), f"{where} repeats a label"
 
 
-def test_only_the_one_known_criterion_has_no_runnable_backend() -> None:
+def test_every_criterion_has_a_runnable_backend() -> None:
     """A criterion with no executable option is a tier the user cannot fill.
 
-    One ships that way on purpose: the affinity head needs a GPU and a trained
-    model that is not ours to distribute.  It is listed so a project can see the
-    option exists.  This locks the single id rather than asserting the set is
-    empty, so a second appearing -- which would mean an adapter regressed, not
-    that a plan was made -- shows up as a failure.
+    There is no longer one.  Route search was the first to be filled, through
+    ``aizynthcli``; predicted affinity was the last, through the ``boltz`` CLI.
+    Both live in environments of the user's own making, which is why "runnable"
+    here means "an adapter is registered for it" and not "it will work on this
+    machine without further setup".
 
-    Route search used to be the other one.  It is runnable now, through
-    ``aizynthcli`` in an environment of the user's own making, which is why
-    "runnable" here means "an adapter is registered for it" and not "it will
-    work on this machine without further setup".
+    An id appearing in this list again would mean an adapter regressed, or that
+    a catalogue entry was written as a signpost -- a description of a tool with
+    nothing behind it.  Neither should reach the builder, where every block that
+    can be dragged in is a block that can be run.
     """
 
     empty = sorted(criterion.id for criterion in CRITERIA if not criterion.executable_options)
-    assert empty == ["binding_affinity"]
+    assert empty == []
 
 
 def test_every_criterion_resolves_to_a_default_backend() -> None:

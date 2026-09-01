@@ -422,6 +422,25 @@ STAGE_GROUPS: tuple[StageGroup, ...] = (
         default_mode="serial",
         accent="#66407c",
     ),
+    StageGroup(
+        id="affinity",
+        title="Predicted affinity",
+        subtitle="A number for the pair, from a model that never saw our pose",
+        purpose=(
+            "Docking scores a pose; this scores the pair. A co-folding model "
+            "rebuilds the complex itself from a sequence and a SMILES, so its "
+            "opinion is independent of the geometry every tier above produced -- "
+            "and costs tens of seconds a molecule, which is the reason it goes "
+            "last rather than anywhere its evidence would allow."
+        ),
+        default_mode="serial",
+        accent="#a4553f",
+        run_time_requirement=(
+            "A target FASTA and its a3m alignment, both local, plus a GPU and the "
+            "weights downloaded once beforehand. Nothing is fetched mid-run and no "
+            "sequence leaves the machine."
+        ),
+    ),
 )
 
 
@@ -3840,11 +3859,11 @@ CRITERIA: tuple[CriterionSpec, ...] = (
         id="binding_affinity",
         label="Predicted binding affinity",
         question="What affinity does a structure-aware model predict for my target?",
-        stage="custom",
+        stage="affinity",
         evidence="prediction",
         filters=True,
         summary=(
-            "Needs a target structure in addition to the ligand. Structure-aware "
+            "Needs the target's sequence in addition to the ligand. Structure-aware "
             "affinity models rank; they do not produce calibrated Ki."
         ),
         options=(
@@ -3856,16 +3875,193 @@ CRITERIA: tuple[CriterionSpec, ...] = (
                     "Open-weight co-folding model with an affinity head; useful for "
                     "ranking, not for absolute Ki."
                 ),
+                plugin_ref="prediction.boltz2@0.1.0",
+                gate_plugin="prediction.numeric_evidence_gate@0.1.0",
                 license_spdx="MIT",
                 citation=(
                     "Passaro S, Corso G, Wohlwend J, et al. Boltz-2: towards accurate and "
                     "efficient binding affinity prediction. bioRxiv (2025). "
-                    "https://github.com/jwohlwend/boltz"
+                    "doi:10.1101/2025.06.14.659707"
                 ),
-                requires=("boltz", "torch"),
+                # Nothing has to be importable here. The model runs behind the
+                # boltz CLI in an environment of its own -- not for the Python,
+                # which it shares, but for the torch, which it would replace.
+                requires=(),
+                # About fifty seconds a complex on one current card, converted
+                # from the timings in the paper rather than measured here; the
+                # tier's own note says so, and this number only decides where the
+                # builder is willing to place the block.
+                throughput_per_second=0.02,
+                defaults={
+                    "schema_version": 1,
+                    "executable": "",
+                    "cache_dir": "",
+                    "target_fasta_path": "",
+                    "msa_mode": "local_a3m",
+                    "msa_a3m_path": "",
+                    "max_molecules": 200,
+                    "max_ligand_atoms": 128,
+                    "diffusion_samples_affinity": 5,
+                    "affinity_mw_correction": False,
+                    "seed": 42,
+                    "timeout_per_molecule_seconds": 600.0,
+                },
+                gate_defaults={
+                    "schema_version": 1,
+                    "endpoint_id": "boltz2_affinity_log10_ic50_um",
+                    "maximum": 0.0,
+                    "semantics_label": (
+                        "Boltz-2 log10(IC50 / uM), lower is stronger; a ranking, "
+                        "not a calibrated Ki."
+                    ),
+                },
                 notes=(
-                    "Reviewed research option. Requires a GPU and a target structure; "
-                    "no MolCascade adapter is registered yet."
+                    "Put this last and nowhere else. It reads no evidence at all -- "
+                    "sequence in, SMILES in, complex folded from scratch -- so the "
+                    "compiler would happily run it first, and only the cost says "
+                    "otherwise. Tens of seconds a molecule means a thousand molecules "
+                    "is most of a day, which is why 'max_molecules' is a budget the "
+                    "stage enforces rather than a suggestion: over the limit it stops "
+                    "before folding anything instead of quietly spending the night.\n\n"
+                    "Two numbers per molecule. The affinity is log10 of an IC50 in "
+                    "micromolar, so 0 is 1 uM and -1 is 100 nM, and lower is stronger; "
+                    "the binder probability is the head's separate yes/no opinion. The "
+                    "default gate keeps predicted IC50 at or below 1 uM. Treat that as "
+                    "a rank cut written in affinity units: the paper presents these "
+                    "numbers for ordering compounds, and nothing here calibrates them "
+                    "against your assay.\n\n"
+                    "You supply the target as a FASTA and its alignment as an a3m. Not "
+                    "the receptor PDB the docking tiers use: reading a sequence off "
+                    "ATOM records closes every unresolved gap without saying so, and a "
+                    "fold against a protein whose missing loops were silently deleted "
+                    "is wrong in a way no error would mention. The alignment is "
+                    "required because accuracy depends on it; Boltz can build one by "
+                    "uploading your sequence to a public server, and that is available "
+                    "as msa_mode='colabfold_server' precisely so that publishing the "
+                    "target is something you ask for rather than something that "
+                    "happens.\n\n"
+                    "A molecule the model cannot be asked about -- over the atom limit, "
+                    "or unreadable as SMILES -- gets no prediction row rather than an "
+                    "invented number, and this gate rejects on missing evidence. The "
+                    "counts are in the stage's metadata."
+                ),
+                thresholds=(
+                    ThresholdField(
+                        name="target_fasta_path",
+                        label="Target sequence (FASTA)",
+                        kind="text",
+                        required=True,
+                        help=(
+                            "Absolute path to a FASTA holding one chain: the receptor "
+                            "this campaign is about. Its bytes are hashed into the "
+                            "recorded model identity, so a different construct is a "
+                            "different prediction rather than a silently different run."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="msa_a3m_path",
+                        label="Target alignment (a3m)",
+                        kind="text",
+                        required=True,
+                        help=(
+                            "Absolute path to the target's alignment, from "
+                            "colabfold_search or MMseqs2. Required by default: the "
+                            "prediction leans on it, and a missing file stops the run "
+                            "before the first molecule rather than quietly costing "
+                            "accuracy. Set msa_mode in the exported JSON to say "
+                            "otherwise."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="max_molecules",
+                        label="Most molecules to fold",
+                        unit="molecules",
+                        minimum=1.0,
+                        maximum=100_000.0,
+                        step=1.0,
+                        help=(
+                            "Refused above this, before anything is folded. At roughly "
+                            "a minute each, 200 is a few hours and 2,000 is a long "
+                            "weekend."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="max_ligand_atoms",
+                        label="Largest ligand to attempt",
+                        unit="atoms",
+                        minimum=1.0,
+                        maximum=1024.0,
+                        step=1.0,
+                        help=(
+                            "Counted with hydrogens. The affinity head is documented up "
+                            "to 128 and discouraged above about 56; anything larger is "
+                            "skipped without a prediction row, which this gate treats "
+                            "as a rejection."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="diffusion_samples_affinity",
+                        label="Affinity samples",
+                        minimum=1.0,
+                        maximum=100.0,
+                        step=1.0,
+                        help=(
+                            "The affinity head is sampled, so this is both the cost "
+                            "multiplier and part of what the recorded model identity "
+                            "means. The ensemble's spread is stored as the prediction "
+                            "interval."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="seed",
+                        label="Seed",
+                        minimum=0.0,
+                        maximum=2_147_483_647.0,
+                        step=1.0,
+                        help=(
+                            "Diffusion sampling is seeded: the same seed is the same "
+                            "measurement, a different one is a different measurement."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="executable",
+                        label="boltz path",
+                        kind="text",
+                        environment_variable="MOLCASCADE_BOLTZ2_EXECUTABLE",
+                        help=(
+                            "Absolute path to the boltz CLI inside the environment you "
+                            "made for it. Not a bare command name: that environment is "
+                            "deliberately not on this one's PATH, because its torch "
+                            "would replace the one ADMET-AI runs on."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="cache_dir",
+                        label="Boltz weight cache",
+                        kind="text",
+                        environment_variable="MOLCASCADE_BOLTZ2_CACHE_DIR",
+                        help=(
+                            "Where the ~3 GB of weights and the CCD already live. The "
+                            "stage refuses to start on an empty one rather than "
+                            "downloading mid-run: 'bash envs/bootstrap.sh boltz2' does "
+                            "it once, deliberately."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="maximum",
+                        label="Weakest affinity to keep",
+                        target="gate",
+                        unit="log10(IC50/uM)",
+                        minimum=-6.0,
+                        maximum=6.0,
+                        step=0.1,
+                        nullable=True,
+                        help=(
+                            "Lower is stronger: 0 is 1 uM, -1 is 100 nM, -2 is 10 nM. "
+                            "A rank cut in affinity units -- the model orders "
+                            "compounds, it does not calibrate against your assay."
+                        ),
+                    ),
                 ),
             ),
             BackendOption(

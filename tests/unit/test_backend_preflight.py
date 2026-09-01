@@ -475,7 +475,7 @@ def test_the_variable_the_preflight_names_is_the_one_the_engine_reads() -> None:
         assert environment_key(spec.id, key) == environment_key(model.engine_id, key)
         assert key in fields, f"{spec.id} names '{key}', which its adapter does not honour"
         checked += 1
-    assert checked == 4, "the three docking engines and AiZynthFinder"
+    assert checked == 5, "the three docking engines, AiZynthFinder and Boltz-2"
 
 
 # ---------------------------------------------- where the engines are installed

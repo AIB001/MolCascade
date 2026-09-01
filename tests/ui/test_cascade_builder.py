@@ -755,13 +755,20 @@ def test_every_advertised_variable_is_one_the_engine_actually_reads() -> None:
     """
 
     from molcascade.plugins.builtin.aizynthfinder import AiZynthFinderConfig
+    from molcascade.plugins.builtin.boltz2 import Boltz2Config
     from molcascade.plugins.builtin.docking.gnina import GninaConfig
     from molcascade.plugins.builtin.docking.karmadock import KarmaDockConfig
     from molcascade.plugins.builtin.docking.unidock import UniDockConfig
 
     honoured = {
         spec.variable(model.engine_id)
-        for model in (KarmaDockConfig, GninaConfig, UniDockConfig, AiZynthFinderConfig)
+        for model in (
+            KarmaDockConfig,
+            GninaConfig,
+            UniDockConfig,
+            AiZynthFinderConfig,
+            Boltz2Config,
+        )
         for spec in model.installed_paths()
     }
     payload = build_cascade_builder_payload()
