@@ -382,6 +382,25 @@ STAGE_GROUPS: tuple[StageGroup, ...] = (
         accent="#3f7d5c",
     ),
     StageGroup(
+        id="specificity",
+        title="Cross-pocket specificity",
+        subtitle="How much of that score was about this pocket",
+        purpose=(
+            "A docking score is one protein's opinion, and a molecule shaped to "
+            "satisfy a scoring function satisfies it everywhere. Re-scoring the "
+            "same pose against pockets it has no reason to bind says how much of "
+            "the number belonged to the target. Needs a docking tier above it, and "
+            "costs that tier again for every pocket you add."
+        ),
+        default_mode="all",
+        accent="#2f6f8f",
+        run_time_requirement=(
+            "Decoy receptors you choose yourself: a structure and a site for each. "
+            "None ship with MolCascade -- a built-in decoy set would make a "
+            "scientific choice on your behalf that you could not see."
+        ),
+    ),
+    StageGroup(
         id="similarity",
         title="Similarity and novelty",
         subtitle="Closeness to leads, or distance from them",
@@ -3364,6 +3383,218 @@ CRITERIA: tuple[CriterionSpec, ...] = (
                         maximum=30.0,
                         step=0.01,
                         help="The other half of the same fit; it shifts the residual only.",
+                    ),
+                ),
+            ),
+        ),
+    ),
+    CriterionSpec(
+        id="specificity_panel",
+        label="Cross-pocket specificity panel",
+        question="Would this molecule have scored just as well against the wrong pocket?",
+        stage="specificity",
+        evidence="derived_metric",
+        summary=(
+            "Re-docks the pose the docking gate accepted against pockets you say "
+            "the molecule has no reason to bind, and reports the target's score "
+            "against that background instead of against zero. Off by default: the "
+            "receptors are yours to choose, and each one costs a full docking run."
+        ),
+        options=(
+            BackendOption(
+                id="unidock_panel",
+                label="Uni-Dock decoy panel",
+                engine="Uni-Dock",
+                summary=(
+                    "One Uni-Dock run per decoy pocket over the accepted poses, "
+                    "reported as the target-minus-panel gap and as a count of "
+                    "pockets that beat the target."
+                ),
+                plugin_ref="derived.specificity_panel@0.1.0",
+                gate_plugin="derived.numeric_evidence_gate@0.1.0",
+                license_spdx="Apache-2.0",
+                citation=(
+                    "Cieplinski T, Danel T, Podlewska S, Jastrzebski S. Generative "
+                    "models should at least be able to design molecules that dock "
+                    "well: a new benchmark. J Chem Inf Model. 2023;63(11):3238-3247. "
+                    "doi:10.1021/acs.jcim.2c01355"
+                ),
+                # Same as Uni-Dock's own option: the engine is a path resolved at
+                # run start, and meeko is the only piece that has to be importable
+                # in this environment.
+                requires=("meeko",),
+                # Per decoy pocket, so the tier's real cost is this divided by the
+                # panel size. Taken from the same Uni-Dock measurement the docking
+                # tier reports rather than re-derived.
+                throughput_per_second=9.0,
+                defaults={
+                    "schema_version": 1,
+                    "executable": "",
+                    "scoring": "vina",
+                    "search_mode": "balance",
+                    "num_modes": 1,
+                    "prepare_receptors": True,
+                    "keep_waters": False,
+                    "keep_heterogens": False,
+                    "seed": 20_260_823,
+                    "max_molecules": 20_000,
+                    "timeout_per_molecule_seconds": 5.0,
+                },
+                gate_defaults={
+                    "schema_version": 1,
+                    "metric_id": "panel_win_count",
+                    "expected_units": "COUNT",
+                    "expected_direction": "LOWER_BETTER",
+                    "maximum": 0.0,
+                    "on_unscorable": "reject",
+                },
+                notes=(
+                    "No decoy set ships with MolCascade, on purpose. DUD-E and DEKOIS "
+                    "carry their own licences and their own known biases, and bundling "
+                    "one would make a scientific choice on your behalf that you could "
+                    "not see in the config. Name your own off-targets: paralogs of the "
+                    "target, the anti-targets your project already worries about, or "
+                    "unrelated pockets of a similar volume.\n\n"
+                    "Two numbers come out of one set of runs. The gap in kcal/mol is "
+                    "the target's score minus the panel mean, and the win count is how "
+                    "many pockets scored the molecule at least as strongly as the "
+                    "target did. The default gate reads the count and requires zero, "
+                    "because 'no decoy beat the target' is a claim a mean cannot make: "
+                    "one pocket winning outright is a specific fact that averaging "
+                    "hides.\n\n"
+                    "Give the decoy boxes roughly the target's volume. A pocket handed "
+                    "a box twice the size is being blind-docked against -- it will find "
+                    "something, and the gap will read as the molecule being "
+                    "unselective. The sizes are recorded in the artifact so this can be "
+                    "checked after the fact.\n\n"
+                    "This reads the poses the docking tier stored, so that tier must "
+                    "keep them, and it re-docks with Uni-Dock because a Vina-scale "
+                    "number is what the subtraction is defined on. Cost is the docking "
+                    "tier again for every pocket you add, over the population that "
+                    "survived the docking threshold rather than the whole library."
+                ),
+                thresholds=(
+                    ThresholdField(
+                        name="structure_path",
+                        label="Decoy receptor structure",
+                        kind="text",
+                        nullable=True,
+                        required=True,
+                        help=(
+                            "Local PDB of one pocket the molecule should not bind, "
+                            "repaired here the same way the target is. This form writes "
+                            "one receptor; edit 'panel' in the exported JSON to add "
+                            "more, which is what makes the gap a background."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="receptor_name",
+                        label="Decoy label",
+                        kind="text",
+                        nullable=True,
+                        help=(
+                            "Short name carried into the artifact, so a gap can be "
+                            "traced back to the pocket that produced it."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="reference_ligand_path",
+                        label="Decoy site from a ligand",
+                        kind="text",
+                        nullable=True,
+                        required=True,
+                        help=(
+                            "A bound ligand whose atoms locate the decoy's site, "
+                            "measured into a box the same way the docking tier measures "
+                            "the target's. Six explicit box numbers work too, but this "
+                            "form does not offer them -- set them in the exported "
+                            "JSON if the pocket has no bound ligand to point at."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="maximum",
+                        label="Decoy pockets allowed to win",
+                        target="gate",
+                        unit="pockets",
+                        minimum=0.0,
+                        maximum=16.0,
+                        step=1.0,
+                        nullable=True,
+                        help=(
+                            "How many panel receptors may score the molecule at least "
+                            "as strongly as the target does. 0 keeps only molecules the "
+                            "target scored best."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="on_unscorable",
+                        label="Molecules the panel could not score",
+                        kind="choice",
+                        target="gate",
+                        choices=(
+                            ("reject", "Reject them"),
+                            ("accept", "Keep them"),
+                        ),
+                        help=(
+                            "A molecule whose accepted pose meeko could not convert, or "
+                            "that every decoy run failed on, has no gap. Keeping those "
+                            "makes a backend failure the one unchecked path through "
+                            "this tier."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="scoring",
+                        label="Scoring function",
+                        kind="choice",
+                        choices=(
+                            ("vina", "Vina"),
+                            ("vinardo", "Vinardo"),
+                            ("ad4", "AutoDock4"),
+                        ),
+                        help=(
+                            "Must match the function the docking tier above used: the "
+                            "gap subtracts one score from another, which is only "
+                            "defined on one scale. A mismatch stops the run."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="search_mode",
+                        label="Search effort",
+                        kind="choice",
+                        choices=(
+                            ("fast", "Fast"),
+                            ("balance", "Balanced"),
+                            ("detail", "Detailed"),
+                        ),
+                        help=(
+                            "Worth matching to the docking tier too, though a "
+                            "difference changes precision rather than units, so it is "
+                            "recorded rather than refused."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="max_molecules",
+                        label="Population cap",
+                        kind="integer",
+                        minimum=1,
+                        maximum=1_000_000,
+                        step=100,
+                        help=(
+                            "Refuses to start rather than running for a day unnoticed. "
+                            "The work is this many molecules times the panel size."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="executable",
+                        label="Uni-Dock binary",
+                        kind="text",
+                        nullable=True,
+                        environment_variable="MOLCASCADE_UNIDOCK_EXECUTABLE",
+                        help=(
+                            "Leave empty unless this host keeps Uni-Dock somewhere "
+                            "unusual; the run resolves it the same way the docking "
+                            "tier does."
+                        ),
                     ),
                 ),
             ),

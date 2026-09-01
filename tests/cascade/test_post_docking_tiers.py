@@ -22,12 +22,21 @@ assert the binding itself rather than the shape of the output.
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
-from molcascade.cascade.defaults import _docking_metrics_tier, _docking_tier, default_cascade
+from molcascade.cascade import defaults
+from molcascade.cascade.defaults import (
+    _criterion_if_available,
+    _docking_metrics_tier,
+    _docking_tier,
+    default_cascade,
+)
 from molcascade.cascade.lower import lower_cascade
-from molcascade.cascade.models import CriterionConfig, TierConfig
+from molcascade.cascade.models import CriterionConfig, TierConfig, TierMode
 from molcascade.errors import ConfigError
+from molcascade.plugins.builtin.specificity_panel import SpecificityPanelConfig
 from molcascade.plugins.registry import PluginRegistry, create_builtin_registry
 
 _METRIC_CRITERIA = ("pose_strain", "size_normalized_docking_score")
@@ -37,6 +46,36 @@ _SCORE = "docking_score/v1"
 @pytest.fixture(scope="module")
 def registry() -> PluginRegistry:
     return create_builtin_registry()
+
+
+def _panel_criterion(registry: PluginRegistry) -> CriterionConfig:
+    """One decoy pocket, given the way the builder gives it: flat keys."""
+
+    criterion = _criterion_if_available(
+        "specificity_panel",
+        registry,
+        settings={
+            "structure_path": "/tmp/decoy.pdb",
+            "reference_ligand_path": "/tmp/decoy-ligand.sdf",
+        },
+        evidence_from={_SCORE: "docking_score"},
+    )
+    if criterion is None:
+        pytest.skip("the specificity panel backend is not installed")
+    return criterion
+
+
+def _with_panel(registry: PluginRegistry, criterion: CriterionConfig) -> Any:
+    """Append the panel as its own tier below whatever the defaults produced."""
+
+    cascade = default_cascade(registry=registry)
+    tier = TierConfig(
+        id="t11_specificity",
+        title="Cross-pocket specificity",
+        mode=TierMode.ALL,
+        criteria=(criterion,),
+    )
+    return cascade.model_copy(update={"tiers": (*cascade.tiers, tier)})
 
 
 @pytest.fixture(scope="module")
@@ -203,6 +242,91 @@ def test_a_metric_moved_up_beside_the_engine_it_reads_cannot_be_lowered(
         else tier
         for tier in cascade.tiers
         if tier.id != "t10_docking_metrics"
+    )
+    with pytest.raises(ConfigError) as excinfo:
+        lower_cascade(
+            cascade.model_copy(update={"tiers": merged}),
+            registry=registry,
+            allow_missing_library=True,
+            allow_missing_target=True,
+        )
+    assert excinfo.value.code == "CASCADE_CRITERION_EVIDENCE_UNAVAILABLE"
+
+
+# ------------------------------------------------- the panel, and why it is not here
+
+
+def test_the_shipped_cascade_does_not_build_a_panel_nobody_supplied_receptors_for(
+    registry: PluginRegistry,
+) -> None:
+    """There is no ``_specificity_tier``, and its absence is the design.
+
+    A panel is a list of decoy pockets the operator chose; ``default_cascade``
+    has no source for one and no defensible default -- picking pockets for
+    someone would decide what "specific" means on their behalf.  A builder that
+    could only ever return ``None`` would be dead code, so the placement rule
+    lives in the catalogue entry instead, where the builder reads it.
+    """
+
+    assert not hasattr(defaults, "_specificity_tier")
+    order = [tier.id for tier in default_cascade(registry=registry).tiers]
+    assert not any(tier.startswith("t11") for tier in order)
+    assert all("specificity" not in tier for tier in order)
+
+
+def test_the_panel_cannot_be_handed_the_campaign_target(registry: PluginRegistry) -> None:
+    """One field name is the whole switch, so the test names the field.
+
+    ``_target_settings`` injects the campaign's receptor into any stage whose
+    config model declares ``receptor_path``, and ``docking_requirements`` skips
+    a stage on the same test.  A panel that declared it would silently gain the
+    target as a decoy -- scoring it against itself, delta zero, every molecule
+    perfectly unspecific.  The shorthand keys go through a ``before``
+    validator, so they never become declared fields either.
+    """
+
+    fields = set(SpecificityPanelConfig.model_fields)
+    assert "receptor_path" not in fields
+    assert "structure_path" not in fields
+    assert "reference_ligand_path" not in fields
+    assert "panel" in fields
+
+
+def test_a_panel_below_docking_binds_to_the_engine_it_names(registry: PluginRegistry) -> None:
+    """Hand-built, because the shipped cascade cannot build this tier.
+
+    The panel consumes the same contract with the same two producers as the
+    metrics above it, so it needs the same pin -- and this is the assertion
+    that the pin works for a stage that arrives from the builder rather than
+    from ``defaults.py``.
+    """
+
+    criterion = _panel_criterion(registry)
+    cascade = _with_panel(registry, criterion)
+    plan = lower_cascade(
+        cascade, registry=registry, allow_missing_library=True, allow_missing_target=True
+    )
+    stages = {stage.id: stage for stage in plan.pipeline.stages}
+    bindings = {binding.request_port: binding for binding in stages["specificity_panel"].inputs}
+    score = bindings["docking_score"]
+    assert (score.stage, score.port) == ("docking_score", "scores")
+
+
+def test_a_panel_beside_the_engine_it_reads_cannot_be_lowered(registry: PluginRegistry) -> None:
+    """The panel is a third tier for the same reason the metrics are a second.
+
+    It re-docks the pose Uni-Dock stored, so it is downstream of Uni-Dock; a
+    parallel tier freezes its producer map before lowering its criteria, and
+    "below" is the only way to express that.
+    """
+
+    criterion = _panel_criterion(registry)
+    cascade = default_cascade(registry=registry)
+    merged = tuple(
+        tier.model_copy(update={"criteria": (*tier.criteria, criterion)})
+        if tier.id == "t9_docking"
+        else tier
+        for tier in cascade.tiers
     )
     with pytest.raises(ConfigError) as excinfo:
         lower_cascade(

@@ -57,6 +57,7 @@ from molcascade.plugins.builtin.sources import (
     SDFSourcePlugin,
     XlsxSourcePlugin,
 )
+from molcascade.plugins.builtin.specificity_panel import SpecificityPanelPlugin
 from molcascade.plugins.builtin.standardize import RDKitStandardizePlugin
 from molcascade.plugins.builtin.structural_alerts import RDKitStructuralAlertPlugin
 from molcascade.plugins.builtin.synthesis import RDKitSAScorePlugin
@@ -94,6 +95,7 @@ BUILTIN_STAGE_PLUGINS: tuple[StagePlugin, ...] = (
     NativeDockingScoreEvidenceGatePlugin(),
     NormalizedDockingScorePlugin(),
     PoseStrainPlugin(),
+    SpecificityPanelPlugin(),
     NativeDerivedMetricEvidenceGatePlugin(),
     ADMETAIV2PredictorPlugin(),
     ChempropCheckpointPlugin(),
