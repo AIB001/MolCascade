@@ -313,7 +313,14 @@ STAGE_GROUPS: tuple[StageGroup, ...] = (
             "Model predictions with explicit endpoints and thresholds. Every model "
             "runs locally and every threshold is visible."
         ),
-        default_mode="all",
+        # "any", where the other model-free groups are "all", because the models in
+        # this group predict overlapping endpoints from unrelated labels and none of
+        # them is accurate enough to delete on alone.  Two of them agreeing that a
+        # molecule is a liability is a claim worth acting on; one of them saying so
+        # is a reason to look at it.  The default cascade's t6 tier is built this
+        # way, and a group whose default mode contradicted it would have the builder
+        # quietly generate a stricter cascade than the one shipped.
+        default_mode="any",
         accent="#48418c",
     ),
     StageGroup(
@@ -1831,9 +1838,10 @@ CRITERIA: tuple[CriterionSpec, ...] = (
                     # the GPU node. ADMET-AI v2 ships its checkpoints inside the
                     # distribution, so there is nothing to download.
                     "models_dir": "package:admet_ai/resources/models",
-                    # Pinned to admet-ai 2.0.1. A different release fails closed
-                    # with a digest mismatch; 'molcascade pins admet-ai' prints
-                    # the replacements.
+                    # Measured from the release named by
+                    # plugins.builtin.admet.PINNED_ADMET_AI_VERSION. A different
+                    # release fails closed with a digest mismatch;
+                    # 'molcascade pins admet-ai' prints the replacements.
                     "expected_package_code_sha256": (
                         "42ea2147b497042fa36b767a6535bafc90830ac08cc89aad8a16d6de7d33fb24"
                     ),
@@ -1863,19 +1871,36 @@ CRITERIA: tuple[CriterionSpec, ...] = (
                     # and their exposure is acceptable, which is a comparison
                     # this stage has no access to.
                     #
-                    # So the cut is chosen where sensitivity stops paying for
-                    # itself.  Against astemizole (0.995), cisapride (0.977),
-                    # terfenadine (0.970) and dofetilide (0.956) -- withdrawn or
-                    # restricted for QT -- every threshold from 0.80 to 0.95
-                    # catches the same four, while the cost to approved drugs
-                    # falls from 18/77 to 6/77.  0.80 is strictly dominated:
-                    # identical detection, three times the collateral.  Above
-                    # 0.95 detection starts to go (0.97 loses terfenadine and
-                    # dofetilide), so 0.95 is the knee.
+                    # So the cut is chosen against the four drugs withdrawn or
+                    # restricted for QT -- astemizole 0.995, cisapride 0.977,
+                    # terfenadine 0.970, dofetilide 0.919:
+                    #
+                    #     cut     approved deleted   withdrawn caught
+                    #     0.80        18/77               4/4
+                    #     0.90        13/77               4/4
+                    #     0.95         6/77               3/4
+                    #     0.97         3/77               2/4
+                    #
+                    # 0.80 is strictly dominated -- 0.90 catches the same four
+                    # and deletes five fewer approved drugs.  0.95 is *not*
+                    # dominance, and this comment used to claim it was: it
+                    # trades dofetilide, at 0.919, for seven approved drugs.
+                    # It is chosen anyway, because 13/77 is one approved drug in
+                    # six and that is too much collateral to hand a single
+                    # AUROC-0.84 model acting as a lone gate.  A cut that
+                    # deletes a sixth of the positive control is not a filter,
+                    # it is a tax.
+                    #
+                    # Where the same model is one arm of the default tier's
+                    # 'any' join it cuts at 0.90 instead, and the reason is
+                    # measured in cascade/defaults.py: a join deletes only what
+                    # both arms object to, which bounds the collateral at 3/77
+                    # and makes the fourth detection nearly free.  Same model,
+                    # different question, different number.
                     #
                     # It is still a filter that deletes imatinib, lapatinib,
                     # gefitinib, donepezil, verapamil and olanzapine, and it
-                    # misses grepafloxacin (0.165) which was withdrawn for QT.
+                    # misses grepafloxacin (0.299) which was withdrawn for QT.
                     # A predicted probability is a triage signal; it is not a
                     # cardiac safety assessment, and this default is not one
                     # either.
@@ -1922,7 +1947,8 @@ CRITERIA: tuple[CriterionSpec, ...] = (
                 notes=(
                     "Deserializing a Torch checkpoint executes code. The adapter "
                     "requires package and model digests plus an explicit trust flag, "
-                    "and the pins ship set to admet-ai 2.0.1 as installed. Upgrade the "
+                    "and the pins ship set to the admet-ai release named by "
+                    "PINNED_ADMET_AI_VERSION as installed. Upgrade the "
                     "package deliberately, then run 'molcascade pins admet-ai' and "
                     "paste the two digests back in.\n\n"
                     "Cost: about 7 molecules/s on CPU, roughly 40 hours per million. "
@@ -1933,12 +1959,24 @@ CRITERIA: tuple[CriterionSpec, ...] = (
                     "so the numbers are in the artifact, but they are deliberately "
                     "absent from the endpoint list: nothing should be deleted on their "
                     "say-so.\n\n"
-                    "The hERG cut ships at 0.8, not 0.5. Across 608 published kinase "
-                    "binders the predicted median is 0.70, so 0.5 removes about 69% of "
-                    "them -- that is the chemotype being cut, not the liability. 0.8 "
-                    "still rejects astemizole, cisapride, terfenadine and dofetilide. "
-                    "Tighten it if your series can afford it, but check what a change "
-                    "costs on your own molecules first."
+                    "The hERG cut ships at 0.95, not the 0.5 an unexamined "
+                    '"it\'s a probability" reading suggests. On the approved-oral-drug '
+                    "panel the predicted values sit at p25 0.157 / median 0.518 / p75 "
+                    "0.778, so 0.5 deletes half the drugs already on the market: the "
+                    "model predicts hERG *binding*, and verapamil, diltiazem and "
+                    "imatinib genuinely bind hERG. Measured against the four drugs "
+                    "withdrawn or restricted for QT (astemizole 0.995, cisapride 0.977, "
+                    "terfenadine 0.970, dofetilide 0.919), 0.80 deletes 18/77 approved "
+                    "and catches 4/4, 0.90 deletes 13/77 and catches 4/4, 0.95 deletes "
+                    "6/77 and catches 3/4, and 0.97 deletes 3/77 and catches 2/4. So "
+                    "0.80 is strictly dominated by 0.90, and 0.95 is a deliberate "
+                    "trade rather than a free lunch: it gives up dofetilide to avoid "
+                    "deleting one approved drug in six. It deletes imatinib, lapatinib, "
+                    "gefitinib, donepezil, verapamil and olanzapine, and it misses "
+                    "grepafloxacin (0.299), withdrawn for QT. The default hERG tier "
+                    "runs this model at 0.90 instead, because joining it with a second "
+                    "model bounds the collateral. Tighten it if your series can afford "
+                    "it, but check what a change costs on your own molecules first."
                 ),
             ),
             BackendOption(
@@ -2037,19 +2075,195 @@ CRITERIA: tuple[CriterionSpec, ...] = (
             ),
             BackendOption(
                 id="openadmet",
-                label="OpenADMET models",
+                label="OpenADMET released model",
                 engine="OpenADMET",
                 summary=(
                     "Open ADMET model collection with per-prediction uncertainty when "
                     "run as an ensemble."
                 ),
-                license_spdx="MIT",
+                license_spdx="Apache-2.0",
                 citation=(
                     "OpenADMET. https://openadmet.org — an open data and model consortium; "
                     "cite the specific released model actually used, not the project."
                 ),
-                requires=("openadmet_models",),
-                notes="Reviewed research option; no MolCascade adapter is registered yet.",
+                plugin_ref="prediction.openadmet@0.1.0",
+                gate_plugin="prediction.numeric_evidence_gate@0.1.0",
+                # Empty on purpose, exactly as for the other isolated engines. Its
+                # dependencies are installed in an environment this interpreter
+                # cannot see, so asking whether they import here would always say
+                # no. What actually has to be true is that two paths resolve, and
+                # that is checked by the preflight on the host that will do the
+                # work.
+                requires=(),
+                # Measured here rather than quoted, on one RTX 4090 -- the card
+                # lane this field counts for an isolated GPU engine -- over the
+                # hERG baseline and molecules from a real screening library.
+                # Timed at n=100 (4.3 s, 4.1 s on a repeat), n=1000 (4.5 s) and
+                # n=5000 (5.9 s), which fits a fixed 4.2 s per invocation and
+                # ~3000 molecules/s after it; the fit predicts n=1000 at 4.5 s
+                # and measures 4.5 s.
+                #
+                # The fixed cost is the part worth knowing, because it inverts
+                # the usual warning. This tool is nearly free on a whole library
+                # -- 100k molecules is under a minute -- and comparatively
+                # expensive on a handful, where 4.2 s of interpreter, torch
+                # import and model construction is the entire bill: 50 molecules
+                # cost the same 4.2 s as 5000. Placing it low to save time saves
+                # none.
+                #
+                # Not comparable with the 7/s recorded for ADMET-AI two options
+                # up. That figure was measured on CPU and says so; this one is a
+                # card. The two arms of the default hERG tier are far closer in
+                # cost than the ratio of these numbers suggests.
+                throughput_per_second=3000,
+                defaults={
+                    "schema_version": 1,
+                    "executable": "",
+                    "model_dir": "",
+                    "endpoints": [
+                        {
+                            # The released hERG baseline's own column names. They
+                            # belong to the model rather than to this catalogue, so
+                            # a different release means editing them -- run the CLI
+                            # once on two molecules and copy its header.
+                            "output_column": ("OADMET_PRED_chemprop-chembl_pchembl_value_mean"),
+                            "std_column": ("OADMET_STD_chemprop-chembl_pchembl_value_mean"),
+                            "endpoint_id": "herg_pic50",
+                        }
+                    ],
+                },
+                gate_defaults={
+                    "schema_version": 1,
+                    "endpoint_id": "herg_pic50",
+                    # Measured on the approved-oral panel like every other number
+                    # in this file, and it had to be: the literature anchor for
+                    # hERG -- IC50 above 10 uM, pIC50 below 5 -- is wrong for this
+                    # model by a log and a half. A 5.0 cut deletes 30 of the 77
+                    # approved drugs. That anchor describes a *measured* IC50,
+                    # while this model regresses pchembl values out of ChEMBL,
+                    # where hERG is assayed mostly on compounds somebody already
+                    # suspected; its output sits high, so a threshold borrowed
+                    # from the literature scale lands mid-panel instead of at its
+                    # edge.
+                    #
+                    #     cut    approved deleted    withdrawn caught
+                    #     5.0        30/77                4/4
+                    #     6.0         7/77                4/4
+                    #     6.5         3/77                4/4
+                    #     7.0         1/77                3/4
+                    #
+                    # 6.5 by the same argument that picks 0.95 on the other arm:
+                    # every lower cut is strictly dominated, and 7.0 buys two
+                    # false positives by dropping terfenadine -- withdrawn for
+                    # torsades, and so exactly the detection this arm is for. The
+                    # three approved drugs it does delete (haloperidol 7.23,
+                    # verapamil 6.77, risperidone 6.54) are all real hERG binders
+                    # with QT labelling.
+                    #
+                    # None of this makes the release validated. It is still
+                    # trained on its full dataset with no held-out split and its
+                    # own card says to proceed with caution, which is why it is
+                    # one arm of an 'any' join rather than a gate of its own.
+                    "maximum": 6.5,
+                    "semantics_label": (
+                        "Predicted pIC50 against hERG; higher means tighter binding and is worse."
+                    ),
+                },
+                thresholds=(
+                    ThresholdField(
+                        name="executable",
+                        label="openadmet path",
+                        kind="text",
+                        environment_variable="MOLCASCADE_OPENADMET_EXECUTABLE",
+                        help=(
+                            "Absolute path to the openadmet CLI inside the environment "
+                            "you made for it -- 'bash envs/bootstrap.sh openadmet' "
+                            "creates one. Not a bare command name: that environment is "
+                            "deliberately not on this one's PATH, because its torch "
+                            "would replace the one ADMET-AI runs on."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="model_dir",
+                        label="Released model directory",
+                        kind="text",
+                        environment_variable="MOLCASCADE_OPENADMET_MODEL_DIR",
+                        help=(
+                            "The 'anvil_training' directory inside a released model "
+                            "clone -- the level the model card's own script passes, not "
+                            "the clone's root. 'bash envs/bootstrap.sh openadmet' fetches "
+                            "the hERG baseline over a pinned revision and verifies the "
+                            "49 MB checkpoint against a recorded sha256. One "
+                            "directory predicts fine and leaves the uncertainty column "
+                            "empty; for an ensemble, edit this key in the saved cascade "
+                            "into a list of directories."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="accelerator",
+                        label="Accelerator",
+                        kind="choice",
+                        choices=(
+                            ("auto", "auto - the device this stage was granted"),
+                            ("gpu", "gpu - require a card"),
+                            ("cpu", "cpu - force the CPU path"),
+                        ),
+                        help=(
+                            "'auto' means the device the runner assigned, not "
+                            "Lightning's own auto, which would let the child claim a "
+                            "card another lane is already using."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="endpoint_id",
+                        label="Endpoint to gate on",
+                        kind="text",
+                        target="gate",
+                        help=(
+                            "One of the endpoint ids declared above. The released hERG "
+                            "baseline offers one: herg_pic50."
+                        ),
+                    ),
+                    *_window(
+                        lower=-1e9,
+                        upper=1e9,
+                        step=0.1,
+                        help_text=(
+                            "Inclusive window on the predicted value, in whatever unit "
+                            "the released model regresses. The hERG baseline emits "
+                            "pIC50, where higher is tighter binding and therefore worse."
+                        ),
+                    ),
+                    _BATCH,
+                ),
+                notes=(
+                    "A second opinion on an ADMET endpoint, trained by somebody other "
+                    "than whoever trained the first one -- which is the only reason to "
+                    "pay for two. The default cascade runs it beside ADMET-AI and joins "
+                    "the two with 'any', so a molecule is deleted only when both models "
+                    "object, and the two objections rest on different evidence: ADMET-AI "
+                    "predicts the TDC binary label, so its number is a probability of "
+                    "blocking, while this regresses pIC50 from ChEMBL. Neither is a "
+                    "rescaling of the other, and they are recorded as two endpoints.\n\n"
+                    "Read the model card before trusting a number. The hERG model "
+                    "OpenADMET publishes as a baseline is a no-split release: trained on "
+                    "its full dataset, no held-out validation, no accuracy figure of any "
+                    "kind published, and its own card says to proceed with caution. That "
+                    "is why the threshold above is a literature anchor rather than a "
+                    "measured cut, and why the default cascade will not let this arm "
+                    "reject on its own.\n\n"
+                    "Unlike the two in-process predictors above it, this one needs no "
+                    "trust flag: the checkpoint is deserialized inside OpenADMET's own "
+                    "interpreter in its own environment, and MolCascade never calls "
+                    "torch.load on it. What that does not buy is provenance, so the "
+                    "model directory is digested into model_id -- a swapped checkpoint "
+                    "becomes a different measurement rather than a silent one.\n\n"
+                    "The uncertainty in the summary is real only for an ensemble. "
+                    "Upstream's --model-dir may be given more than once and the standard "
+                    "deviation it writes is the spread across what was given; with a "
+                    "single directory the column comes back empty, which is recorded as "
+                    "a null rather than as a zero."
+                ),
             ),
         ),
     ),

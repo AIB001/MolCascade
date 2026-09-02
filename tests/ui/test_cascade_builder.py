@@ -759,6 +759,7 @@ def test_every_advertised_variable_is_one_the_engine_actually_reads() -> None:
     from molcascade.plugins.builtin.docking.gnina import GninaConfig
     from molcascade.plugins.builtin.docking.karmadock import KarmaDockConfig
     from molcascade.plugins.builtin.docking.unidock import UniDockConfig
+    from molcascade.plugins.builtin.openadmet import OpenADMETConfig
 
     honoured = {
         spec.variable(model.engine_id)
@@ -768,6 +769,7 @@ def test_every_advertised_variable_is_one_the_engine_actually_reads() -> None:
             UniDockConfig,
             AiZynthFinderConfig,
             Boltz2Config,
+            OpenADMETConfig,
         )
         for spec in model.installed_paths()
     }

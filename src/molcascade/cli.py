@@ -1473,6 +1473,7 @@ def _pins(backend: str, *, models_dir: str | None, as_json: bool) -> int:
 
     from molcascade.plugins.builtin.admet import (
         DEFAULT_MODELS_REFERENCE,
+        PINNED_ADMET_AI_VERSION,
         inspect_admet_ai_installation,
         inspect_admet_ai_model_assets,
     )
@@ -1489,6 +1490,7 @@ def _pins(backend: str, *, models_dir: str | None, as_json: bool) -> int:
         "resolved_models_dir": assets["models_dir"],
         "expected_package_code_sha256": installation["package_code_sha256"],
         "expected_model_manifest_sha256": assets["model_manifest_sha256"],
+        "pinned_version": PINNED_ADMET_AI_VERSION,
         "checkpoint_count": assets["checkpoint_count"],
         "model_size_bytes": assets["model_size_bytes"],
         "dependency_versions": installation["dependency_versions"],
@@ -1497,6 +1499,16 @@ def _pins(backend: str, *, models_dir: str | None, as_json: bool) -> int:
         _json_dump(report, sys.stdout)
         return 0
     print(f"ADMET-AI {report['version']}")
+    if report["version"] != PINNED_ADMET_AI_VERSION:
+        # Not an error: the digests below are correct for whatever is installed.
+        # But the shipped defaults were measured from one release, and the
+        # default cascade only offers this backend for that one, so say so here
+        # rather than letting a tier quietly go missing later.
+        print(
+            f"  note        : the shipped pins were measured from "
+            f"{PINNED_ADMET_AI_VERSION}; the default cascade offers ADMET-AI "
+            f"only on that release"
+        )
     print(f"  package     : {report['package_root']}")
     print(f"  models_dir  : {report['models_dir']}")
     print(f"  resolved to : {report['resolved_models_dir']}")

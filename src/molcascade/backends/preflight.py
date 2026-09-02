@@ -470,6 +470,18 @@ def _path_gap(spec: Any, configured: object) -> str | None:
     """
 
     searched = ", ".join(str(candidate) for candidate in spec.candidates)
+    if not isinstance(configured, str) and isinstance(configured, Sequence):
+        # A path a field may hold more than once -- one model directory per
+        # ensemble member -- is checked entry by entry, and every complaint is
+        # reported together for the same reason the whole preflight is: fixing
+        # one path only to be told about the next is the loop this exists to
+        # remove.  An empty list falls through to the blank case below, which is
+        # the correct reading of "the builder could not answer this".
+        entries = [str(entry) for entry in configured if str(entry).strip()]
+        if entries:
+            found = [gap for gap in (_path_gap(spec, entry) for entry in entries) if gap]
+            return "; ".join(found) if found else None
+        configured = ""
     if not isinstance(configured, str) or not configured.strip():
         looked = f" Looked in: {searched}." if searched else ""
         return (

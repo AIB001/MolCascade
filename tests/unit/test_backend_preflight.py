@@ -475,7 +475,7 @@ def test_the_variable_the_preflight_names_is_the_one_the_engine_reads() -> None:
         assert environment_key(spec.id, key) == environment_key(model.engine_id, key)
         assert key in fields, f"{spec.id} names '{key}', which its adapter does not honour"
         checked += 1
-    assert checked == 5, "the three docking engines, AiZynthFinder and Boltz-2"
+    assert checked == 6, "the three docking engines, AiZynthFinder, Boltz-2 and OpenADMET"
 
 
 # ---------------------------------------------- where the engines are installed
@@ -497,10 +497,15 @@ def test_the_variable_the_preflight_names_is_the_one_the_engine_reads() -> None:
 
 _KARMADOCK = "docking.karmadock@0.3.0"
 _UNIDOCK = "docking.unidock@0.2.0"
+_OPENADMET = "prediction.openadmet@0.1.0"
 
 
 def _karmadock_stage(config: dict[str, object]) -> CompiledStage:
     return _stage("t9_docking", _KARMADOCK, config)
+
+
+def _openadmet_stage(config: dict[str, object]) -> CompiledStage:
+    return _stage("t6_admet", _OPENADMET, config)
 
 
 def test_a_blank_engine_path_stops_the_run_and_names_the_variable() -> None:
@@ -618,6 +623,75 @@ def test_a_checkout_missing_its_committed_checkpoint_is_not_a_checkout(
     message = str(raised.value)
     assert "trained_models/karmadock_screening.pkl" in message
     assert "not a complete" in message
+
+
+def test_a_predictor_with_no_engine_is_refused_like_a_docking_one(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The ADMET tier calls out of this interpreter too, so it is checked too.
+
+    A cascade authored in the builder carries neither path -- that is the point
+    of a policy file being portable -- so both blanks have to be answerable in
+    one refusal rather than one per restart.
+    """
+
+    from molcascade.backends.preflight import preflight_engine_paths
+
+    monkeypatch.setenv("MOLCASCADE_CONDA_ENVS", str(tmp_path / "nothing-installed"))
+    stages = (_openadmet_stage({"executable": "", "model_dir": []}),)
+    with pytest.raises(ConfigError) as raised:
+        preflight_engine_paths(stages, registry=create_builtin_registry())
+    error = raised.value
+    assert error.code == "ENGINE_PATH_UNRESOLVED"
+    message = str(error)
+    assert "MOLCASCADE_OPENADMET_EXECUTABLE" in message
+    assert "MOLCASCADE_OPENADMET_MODEL_DIR" in message
+    assert "t6_admet" in message
+    assert error.hint is not None
+    assert "envs/bootstrap.sh openadmet" in error.hint
+
+
+def test_every_member_of_an_ensemble_is_checked_and_reported_together(
+    tmp_path: Path,
+) -> None:
+    """One model directory per member means one chance to be wrong per member.
+
+    Repeating ``--model-dir`` is how OpenADMET produces the spread this tier
+    records as ``prediction_std``, so the field holds several paths -- and
+    checking only the first would let a run start and then predict with a
+    smaller ensemble than the cascade asked for.
+    """
+
+    from molcascade.backends.preflight import preflight_engine_paths
+
+    executable = tmp_path / "openadmet"
+    executable.write_text("", encoding="utf-8")
+    executable.chmod(0o755)
+    complete = tmp_path / "fold-1"
+    complete.mkdir()
+    (complete / "model.pth").write_text("weights", encoding="utf-8")
+    (complete / "model.json").write_text("{}", encoding="utf-8")
+    hollow = tmp_path / "fold-2"
+    hollow.mkdir()
+    absent = tmp_path / "fold-3"
+
+    stages = (
+        _openadmet_stage(
+            {
+                "executable": str(executable),
+                "model_dir": [str(complete), str(hollow), str(absent)],
+            }
+        ),
+    )
+    with pytest.raises(ConfigError) as raised:
+        preflight_engine_paths(stages, registry=create_builtin_registry())
+    message = str(raised.value)
+    assert "model.pth" in message
+    assert str(hollow) in message
+    assert str(absent) in message
+    # The one that is really there is not complained about.
+    assert str(complete) not in message
 
 
 def test_a_configured_path_that_is_not_there_is_reported_as_that(tmp_path: Path) -> None:

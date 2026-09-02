@@ -113,6 +113,14 @@ _PARENTS = (_BENZENE, _ACETIC, _PHENYLALANINE, _ETHANOL, _ASPIRIN, _TRIETHYLAMIN
 #: order the model emitted its rows in.
 _ENDPOINTS = ("herg_blocking", "ames_mutagenicity", "aqueous_solubility")
 
+# The default cascade's ADMET tier asks two models the same question in two
+# units, so these two travel together through one stage and must not merge.
+_HERG_ENDPOINTS = ("herg_blocking", "herg_pic50")
+
+# Appended rather than inserted, so every value the three original endpoints
+# produce is the number it was before.
+_KNOWN_ENDPOINTS = (*_ENDPOINTS, "herg_pic50")
+
 _MODEL_ID = "test-predictor:sha256:" + "a" * 64
 
 _PARENT_PATH = "datasets/parents/part-00000.parquet"
@@ -129,7 +137,7 @@ def _prediction(smiles: str, endpoint: str) -> float:
     exact in binary so a CSV round trip compares equal rather than close.
     """
 
-    return _PARENTS.index(smiles) + _ENDPOINTS.index(endpoint) / 8
+    return _PARENTS.index(smiles) + _KNOWN_ENDPOINTS.index(endpoint) / 8
 
 
 def _aligned(batch: pa.RecordBatch, schema: pa.Schema) -> pa.RecordBatch:
@@ -783,6 +791,39 @@ def test_every_endpoint_reaches_the_csv_as_its_own_column(tmp_path: Path) -> Non
     for row in rows:
         for endpoint in _ENDPOINTS:
             assert float(row[endpoint]) == pytest.approx(_prediction(row["smiles"], endpoint))
+
+
+def test_the_two_herg_endpoints_stay_two_columns(tmp_path: Path) -> None:
+    """The default ADMET tier's two arms, and the merge that would go unnoticed.
+
+    ``t6_admet`` runs ADMET-AI and OpenADMET on the same liability: the first
+    answers with a blocking probability in 0-1, the second with a pIC50 around
+    4-8.  Both are hERG, and naming both endpoints ``herg`` would have been the
+    obvious thing to do -- which is why this is worth an explicit test.  One
+    column holding both would not raise anywhere; it would hold whichever value
+    the writer reached last, and the tier's own thresholds (0.95 for one arm,
+    a pIC50 for the other) would then be applied to numbers from the wrong
+    scale, silently.
+
+    This also settles that the trace needed no change to carry the new tier:
+    the fan-out is keyed on ``endpoint_id``, so two endpoints are two columns
+    without anything being taught about hERG.
+    """
+
+    result = _predict_traced(tmp_path, endpoints=_HERG_ENDPOINTS)
+
+    stage = next(item for item in result.stages if item.stage_id == "admet")
+    assert stage.csv_name is not None
+    rows = _rows(result.path / stage.csv_name)
+
+    header = list(rows[0])
+    assert [name for name in header if name in _HERG_ENDPOINTS] == sorted(_HERG_ENDPOINTS)
+    for row in rows:
+        blocking = float(row["herg_blocking"])
+        pic50 = float(row["herg_pic50"])
+        assert blocking != pic50
+        assert blocking == pytest.approx(_prediction(row["smiles"], "herg_blocking"))
+        assert pic50 == pytest.approx(_prediction(row["smiles"], "herg_pic50"))
 
 
 def test_a_key_that_takes_one_value_stays_an_ordinary_column(tmp_path: Path) -> None:

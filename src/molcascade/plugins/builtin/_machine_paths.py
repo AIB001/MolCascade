@@ -223,9 +223,7 @@ def fill_machine_paths(
     filled: dict[str, Any] | None = None
     for spec in paths:
         current = data.get(spec.field)
-        if current is not None and not isinstance(current, str):
-            continue  # let Pydantic report the type error on the real value
-        if isinstance(current, str) and current.strip():
+        if not _unanswered(current):
             continue
         replacement = path_from_environment(engine_id, spec.field)
         if replacement is None:
@@ -236,6 +234,28 @@ def fill_machine_paths(
             filled = dict(data)
         filled[spec.field] = replacement
     return data if filled is None else filled
+
+
+def _unanswered(current: Any) -> bool:
+    """Is this config value still an open question a host can answer?
+
+    A blank string is the ordinary case: the builder ran on a laptop and left
+    the box empty.  A field that may be given more than once -- one model
+    directory per ensemble member -- is blank when the list is empty, and an
+    empty list has to count, because a builder that always writes the key would
+    otherwise suppress discovery for ever on every machine.  Anything of the
+    wrong type is left exactly as it is, so that Pydantic reports the type error
+    against the value the operator actually wrote rather than against a
+    discovered path that replaced it.
+    """
+
+    if current is None:
+        return True
+    if isinstance(current, str):
+        return not current.strip()
+    if isinstance(current, Sequence):
+        return not any(str(entry).strip() for entry in current)
+    return False
 
 
 def engine_path(value: str, *, field: str, engine_id: str) -> str:

@@ -51,8 +51,11 @@ from molcascade.ui.assets import png_data_uri
 # The shape of the payload the embedded script reads.  Bumped when a key it
 # depends on is added or changes meaning: 3 marks installation paths becoming
 # deferrable (``installed_path``, no baked-in per-machine verdict) and options
-# declaring the evidence they read but do not compute.
-BUILDER_SCHEMA_VERSION = 3
+# declaring the evidence they read but do not compute; 4 marks the ADMET group
+# defaulting to "any" and carrying two hERG options whose thresholds are in
+# different units, so a saved cascade from 3 that assumed one shared scale for
+# that group is no longer describing what the group does.
+BUILDER_SCHEMA_VERSION = 4
 DEFAULT_CONFIG_FILENAME = "cascade.json"
 
 # Distributions whose presence in a backend's ``requires`` means the tool will

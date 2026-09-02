@@ -41,9 +41,11 @@ from molcascade.plugins.builtin._machine_paths import (
     fill_machine_paths,
 )
 from molcascade.plugins.builtin.aizynthfinder import AiZynthFinderConfig
+from molcascade.plugins.builtin.boltz2 import Boltz2Config
 from molcascade.plugins.builtin.docking.gnina import GninaConfig
 from molcascade.plugins.builtin.docking.karmadock import KarmaDockConfig
 from molcascade.plugins.builtin.docking.unidock import UniDockConfig
+from molcascade.plugins.builtin.openadmet import OpenADMETConfig
 
 _KARMADOCK_SITE = {
     "receptor_path": "/campaign/receptor.pdb",
@@ -226,6 +228,31 @@ def test_a_field_with_a_non_string_value_is_left_for_pydantic_to_report() -> Non
     assert fill_machine_paths(data, engine_id="unidock", paths=[spec]) == data
 
 
+def test_an_empty_list_is_an_unanswered_question_like_an_empty_string(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A path that may be given more than once is blank when it is given none.
+
+    OpenADMET takes one model directory per ensemble member, so its field holds
+    a list rather than a string -- and a builder that always writes the key
+    writes ``[]``.  Reading that as "already answered" would switch discovery
+    off for ever, on every machine, for the one field whose default the operator
+    is least likely to have typed.
+    """
+
+    found = _install(tmp_path / "envs" / "openadmet" / "models" / "herg" / "anvil_training" / "w")
+    spec = next(spec for spec in OpenADMETConfig.installed_paths() if spec.field == "model_dir")
+    monkeypatch.setenv("MOLCASCADE_OPENADMET_MODEL_DIR", str(found.parent))
+
+    filled = fill_machine_paths({"model_dir": []}, engine_id="openadmet", paths=[spec])
+    assert filled["model_dir"] == str(found.parent)
+
+    # And a list that says something is still the operator's to keep.
+    named = {"model_dir": ["/campaign/fold-1", "/campaign/fold-2"]}
+    assert fill_machine_paths(named, engine_id="openadmet", paths=[spec]) == named
+
+
 def test_filling_does_not_mutate_the_config_it_was_given(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -275,6 +302,10 @@ def test_every_engine_looks_where_the_bootstrap_script_installs_it(
     gnina = _install(backends / "bin" / "gnina", executable=True)
     aizynthcli = _install(envs / "aizynth" / "bin" / "aizynthcli", executable=True)
     config_yml = _install(data / "config.yml")
+    openadmet = _install(envs / "openadmet" / "bin" / "openadmet", executable=True)
+    released = backends / "openadmet-models" / "herg-chemeleon-baseline" / "anvil_training"
+    _install(released / "model.pth")
+    _install(released / "model.json")
 
     karmadock = KarmaDockConfig(**_KARMADOCK_SITE)
     assert karmadock.executable == str(karmadock_python)
@@ -292,6 +323,11 @@ def test_every_engine_looks_where_the_bootstrap_script_installs_it(
     aizynth = AiZynthFinderConfig()
     assert aizynth.executable == str(aizynthcli)
     assert aizynth.config_path == str(config_yml)
+    predictor = OpenADMETConfig(
+        endpoints=[{"output_column": "OADMET_PRED_x", "endpoint_id": "herg_pic50"}]
+    )
+    assert predictor.executable == str(openadmet)
+    assert predictor.model_dir == (str(released),)
 
 
 def test_every_declared_path_names_its_variable_and_a_way_to_get_it(
@@ -304,7 +340,14 @@ def test_every_declared_path_names_its_variable_and_a_way_to_get_it(
     mechanism replaced.
     """
 
-    for model in (KarmaDockConfig, GninaConfig, UniDockConfig, AiZynthFinderConfig):
+    for model in (
+        KarmaDockConfig,
+        GninaConfig,
+        UniDockConfig,
+        AiZynthFinderConfig,
+        Boltz2Config,
+        OpenADMETConfig,
+    ):
         specs = model.installed_paths()
         assert specs, f"{model.__name__} calls out to another process and declares no paths"
         for spec in specs:

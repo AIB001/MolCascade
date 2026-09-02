@@ -57,6 +57,15 @@ _CHECKPOINT_SUFFIXES = {".pt"}
 _PACKAGE_REFERENCE_PREFIX = "package:"
 _PACKAGE_REFERENCE_NAME = "admet_ai"
 DEFAULT_MODELS_REFERENCE = "package:admet_ai/resources/models"
+#: The release the digests in ``cascade/catalog.py`` were measured from.
+#:
+#: Those digests are what makes the trust flag meaningful: the parent rehashes
+#: the installed package tree and model tree and refuses to hand a shard any
+#: path whose bytes differ.  That refusal is only informative while the pins
+#: belong to the release actually installed, so the release number is written
+#: once, here, and read by the catalogue's pins, ``molcascade pins admet-ai``
+#: and the default cascade's version gate rather than being retyped in each.
+PINNED_ADMET_AI_VERSION = "2.0.1"
 _PACKAGE_CODE_SUFFIXES = {".dll", ".pyd", ".py", ".pyi", ".so"}
 _SCIENTIFIC_DISTRIBUTIONS = (
     "chemprop",
@@ -765,6 +774,23 @@ def _package_provenance(config: ADMETAIConfig) -> dict[str, object]:
         maximum_files=config.max_package_code_files,
         maximum_bytes=config.max_package_code_bytes,
     )
+
+
+def installed_admet_ai_version() -> str | None:
+    """Return the installed admet-ai version, or ``None`` when it is absent.
+
+    Deliberately the cheapest possible question about this backend: it reads
+    distribution metadata and nothing else.  :func:`inspect_admet_ai_installation`
+    answers a stronger one but hashes the whole package tree to do it, and
+    :func:`inspect_admet_ai_model_assets` hashes gigabytes of checkpoints, which
+    is far too much work for a caller that only wants to decide whether to
+    offer the backend at all.
+    """
+
+    try:
+        return str(importlib.metadata.version("admet-ai"))
+    except importlib.metadata.PackageNotFoundError:
+        return None
 
 
 def inspect_admet_ai_installation(

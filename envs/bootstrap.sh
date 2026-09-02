@@ -6,9 +6,13 @@
 #   bash envs/bootstrap.sh prism        # just the main environment
 #   bash envs/bootstrap.sh gnina karmadock
 #   bash envs/bootstrap.sh boltz2      # opt-in: not in the default set
+#   bash envs/bootstrap.sh openadmet   # opt-in: not in the default set
 #
 # Reads nothing from the network except conda-forge, PyPI, download.pytorch.org,
-# data.pyg.org and the GNINA release asset. Every step is idempotent: re-running
+# data.pyg.org and the GNINA release asset -- plus, for the opt-in openadmet
+# target, Hugging Face for the model, Zenodo for its featurizer's weights, and
+# the four git repositories upstream's own environment file installs from.
+# Every step is idempotent: re-running
 # skips what is already in place, so an interrupted bootstrap can simply be re-run.
 #
 # See envs/README.md for what each environment is for and why they are separate.
@@ -29,6 +33,23 @@ REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 GNINA_VERSION="1.3.3"
 GNINA_ASSET="gnina.cuda12.8.static"
 GNINA_SHA256="3340c1f49cd3c7c84d8699182a1c6af13c7fa2a22448d1204640446106f72172"
+
+# OpenADMET is pinned twice over, because the code and the model move apart:
+# a commit for the CLI contract this adapter was written against, and an
+# immutable Hugging Face revision plus a digest for the 49 MB checkpoint.
+OPENADMET_COMMIT="55dd001549885f8d8095af14733d61f36fc046c0"
+OPENADMET_MODEL_REV="5c4fb081dfec62a5108423d0f86ec99023551bd8"
+OPENADMET_HERG_SHA256="93f6527a4766d6c5373eaccf229a0aaf24961a51553f7af87825bbdfca146945"
+# The featurizer the hERG model is built on. procedure.yaml sets
+# from_chemeleon: true, so this file is not optional -- without it the model
+# cannot be constructed at all.
+CHEMELEON_URL="https://zenodo.org/records/15460715/files/chemeleon_mp.pt"
+CHEMELEON_BYTES="34859448"
+# Cross-checked, not merely self-computed: Zenodo publishes an md5 per file in
+# its record API, and this digest was taken from a download whose md5 matched
+# that published value (6a80b54fdb7de37ef0374d302f01e8ce). A sha256 read off
+# whatever bytes happened to arrive would pin the corruption instead.
+CHEMELEON_SHA256="c376624d3407204e780a0ed13a9ac097cc9bb1c13ef89cdbc633c1715c183651"
 
 # --- plumbing ----------------------------------------------------------------
 say() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
@@ -53,6 +74,66 @@ pybin() { echo "$(conda info --base)/envs/$1/bin/python"; }
 # conda-forge, so naming it and only it is both reproducible and sufficient.
 CONDA_CREATE=(conda create --solver=libmamba -y --override-channels -c conda-forge)
 
+# One dropped transfer should not cost a whole solve. conda's own
+# remote_max_retries does not cover the case that actually happens on a large
+# package: the transfer completes short, and "Downloaded bytes did not match
+# Content-Length" is raised *after* the download, as a validation failure rather
+# than an HTTP error, so nothing inside conda retries it. Observed here on
+# libtorch's 817 MB artifact, which arrived 91% complete and took the
+# openadmet environment down with it.
+#
+# Retrying from out here works because the package cache is the unit of
+# progress: every artifact that did land stays in the cache, so attempt two
+# re-downloads only what is still missing. The short file has to go first --
+# conda writes the final name while downloading, so it would revalidate the
+# same truncated bytes and fail the same way -- but *only* the short file, which
+# is why this is not `conda clean --tarballs`. That would throw away the
+# completed downloads as well and turn a resumable retry into a restart.
+#
+# Truncation is detected structurally rather than by size: a .conda artifact is
+# a zip, and a zip whose end-of-central-directory record cannot be read is
+# incomplete. That check reads the tail of the file, not the gigabyte in front
+# of it. Bounded at three attempts, because a fourth identical failure is a
+# broken mirror or a full disk, and both want a human rather than a loop.
+drop_truncated_packages() {
+  "$(conda info --base)/bin/python" - <<'PARTIALS'
+import zipfile
+from pathlib import Path
+
+from conda.base.context import context
+
+removed = 0
+for directory in context.pkgs_dirs:
+    for artifact in Path(directory).glob("*.conda"):
+        try:
+            intact = zipfile.is_zipfile(artifact)
+        except OSError:
+            intact = False
+        if intact:
+            continue
+        try:
+            artifact.unlink()
+        except OSError:
+            continue
+        removed += 1
+        print(f"    discarded truncated {artifact.name}")
+print(f"    {removed} truncated artifact(s) removed; completed downloads kept")
+PARTIALS
+}
+
+conda_create() {
+  local attempt
+  for attempt in 1 2 3; do
+    if "${CONDA_CREATE[@]}" "$@"; then
+      return 0
+    fi
+    [ "${attempt}" -eq 3 ] && die "conda create failed three times: $*"
+    note "conda create failed (attempt ${attempt}/3); dropping truncated artifacts and retrying"
+    drop_truncated_packages || true
+    sleep 5
+  done
+}
+
 # =============================================================================
 # prism -- MolCascade itself, plus every backend that can share its interpreter.
 # =============================================================================
@@ -61,7 +142,7 @@ setup_prism() {
     note "env 'prism' already exists; installing/refreshing packages into it"
   else
     say "creating env 'prism' (Python 3.12)"
-    "${CONDA_CREATE[@]}" -n prism python=3.12
+    conda_create -n prism python=3.12
   fi
   local py; py="$(pybin prism)"
 
@@ -112,7 +193,7 @@ setup_karmadock() {
     # sends libmamba into a multi-GB search; the PyG wheel index below is both
     # faster and exactly version-matched.
     say "creating env 'karmadock' (Python 3.10 + rdkit 2022.09.1)"
-    "${CONDA_CREATE[@]}" -n karmadock python=3.10 "rdkit=2022.09.1"
+    conda_create -n karmadock python=3.10 "rdkit=2022.09.1"
   fi
   local py; py="$(pybin karmadock)"
 
@@ -182,7 +263,7 @@ setup_unidock() {
     # prism's pip-installed rdkit and numpy. MolCascade only ever runs the
     # binary as a subprocess, so there is no benefit to co-locating it.
     say "creating env 'unidock' (Uni-Dock 1.2.0, CUDA build)"
-    "${CONDA_CREATE[@]}" -n unidock unidock
+    conda_create -n unidock unidock
   fi
   note "unidock binary: $(conda info --base)/envs/unidock/bin/unidock"
 }
@@ -195,7 +276,7 @@ setup_aizynth() {
     note "env 'aizynth' already exists"
   else
     say "creating env 'aizynth' (Python 3.12 + AiZynthFinder 4.4.1)"
-    "${CONDA_CREATE[@]}" -n aizynth python=3.12
+    conda_create -n aizynth python=3.12
     # No extra needed: 4.4.1's base dependencies already include onnxruntime,
     # rdkit, tables and everything aizynthcli uses.
     "$(pybin aizynth)" -m pip install "aizynthfinder==4.4.1"
@@ -229,7 +310,7 @@ setup_boltz2() {
     note "env 'boltz2' already exists"
   else
     say "creating env 'boltz2' (Python 3.12 + Boltz-2)"
-    "${CONDA_CREATE[@]}" -n boltz2 python=3.12
+    conda_create -n boltz2 python=3.12
     # The [cuda] extra is cuequivariance's fused kernels; boltz runs without
     # them, slower. It brings its own torch -- that is the entire point of the
     # separate environment.
@@ -316,6 +397,224 @@ WRAPPER
   note "GNINA is GPL-2.0-or-later: runs need --allow-copyleft"
 }
 
+# =============================================================================
+# openadmet -- OpenADMET's released hERG model, one arm of the default ADMET
+# tier. Apache-2.0 by its LICENSE file; upstream's pyproject.toml still carries
+# a cookiecutter MIT string, and the licence text is the one that governs.
+#
+# The conflict is torch again, and less negotiable than boltz2's: upstream's
+# environment file resolves conda's pytorch-gpu together with chemprop,
+# lightning and TabPFN, and any one of those re-pins the torch ADMET-AI
+# predicts with in-process. So this gets an interpreter of its own and
+# MolCascade runs the `openadmet` CLI in it by absolute path.
+#
+# That environment file is used verbatim rather than trimmed to an inference
+# subset, because the trim is not safe: loading any model calls `to_class()`,
+# which goes through `load_group("models")` and imports all nine architecture
+# modules -- nepare and tabpfn included -- so a missing training dependency
+# fails at model construction, well after the environment looks finished. The
+# cost is worth stating plainly: ~10 GB, and four of its pip dependencies are
+# git repositories, two of them at `@main`, which is a reproducibility hole
+# nothing this script can do will close.
+#
+# Not in the default target list, for the same reason as boltz2. Ask by name.
+# =============================================================================
+# Fetch the CheMeleon featurizer, resuming across dropped connections.
+fetch_chemeleon() {
+  local dst="${HOME}/.chemprop/chemeleon_mp.pt"
+  local part="${dst}.part"
+  mkdir -p "${HOME}/.chemprop"
+
+  if [ -f "${dst}" ] && [ "$(stat -c%s "${dst}")" = "${CHEMELEON_BYTES}" ]; then
+    note "CheMeleon featurizer already present"
+    return 0
+  fi
+
+  say "openadmet: CheMeleon featurizer (${CHEMELEON_BYTES} bytes)"
+  local attempt have
+  for attempt in $(seq 1 40); do
+    have="$(stat -c%s "${part}" 2>/dev/null || echo 0)"
+    [ "${have}" -ge "${CHEMELEON_BYTES}" ] && break
+    [ "${attempt}" -gt 1 ] && note "resuming from ${have}/${CHEMELEON_BYTES}"
+    # Each attempt is its own process, so -C - re-reads what is already there.
+    curl -sfL -C - --connect-timeout 20 --max-time 600 -o "${part}" "${CHEMELEON_URL}" || true
+    sleep 3
+  done
+
+  have="$(stat -c%s "${part}" 2>/dev/null || echo 0)"
+  [ "${have}" = "${CHEMELEON_BYTES}" ] \
+    || die "CheMeleon fetch stalled at ${have}/${CHEMELEON_BYTES} bytes; rerun to resume"
+  echo "${CHEMELEON_SHA256}  ${part}" | sha256sum -c >/dev/null \
+    || die "CheMeleon digest mismatch; delete ${part} and rerun"
+  mv "${part}" "${dst}"
+  note "CheMeleon featurizer verified"
+}
+
+setup_openadmet() {
+  local src="${BACKEND_ROOT}/openadmet-src"
+  local model="${BACKEND_ROOT}/openadmet-models/herg-chemeleon-baseline/anvil_training"
+
+  command -v git >/dev/null 2>&1 \
+    || die "git not found; openadmet's own environment file installs four dependencies straight from git"
+
+  if [ -d "${src}/.git" ] \
+     && [ "$(git -C "${src}" rev-parse HEAD 2>/dev/null)" = "${OPENADMET_COMMIT}" ]; then
+    note "openadmet checkout already at ${OPENADMET_COMMIT:0:12} in ${src}"
+  else
+    say "fetching openadmet-models at ${OPENADMET_COMMIT:0:12}"
+    mkdir -p "${src}"
+    [ -d "${src}/.git" ] || git -C "${src}" init --quiet
+    git -C "${src}" remote add origin https://github.com/OpenADMET/openadmet-models.git 2>/dev/null || true
+    # A commit rather than a branch: `main` is where the environment file and
+    # the CLI contract this adapter was written against keep moving. versioningit
+    # declares default-version = "1+unknown", so a shallow fetch that carries no
+    # tags reports that instead of failing the build.
+    git -C "${src}" fetch --depth 1 origin "${OPENADMET_COMMIT}"
+    git -C "${src}" checkout --quiet FETCH_HEAD
+  fi
+
+  if env_exists openadmet; then
+    note "env 'openadmet' already exists"
+  else
+    local yaml="${src}/devtools/conda-envs/openadmet-models-gpu.yaml"
+    [ -f "${yaml}" ] || die "upstream's environment file is not at ${yaml}"
+    say "creating env 'openadmet' from upstream's own GPU environment file (~10 GB)"
+    # Upstream's list is read rather than restated, so this cannot drift from the
+    # file the commit above pins -- but it is installed with `conda create` and
+    # --override-channels rather than handed to `conda env create`, which on
+    # conda 23.7.x accepts neither -c nor --override-channels. Setting
+    # CONDA_CHANNELS for that call does not substitute: channels is a sequence
+    # parameter, so an environment variable *prepends* to ~/.condarc's list
+    # instead of replacing it, and one observed run resolved against
+    # conda-forge followed by four Tsinghua mirrors and `defaults` anyway. A
+    # mirror of pkgs/msys2 answering 403 is enough to end the solve, which is
+    # the same reason CONDA_CREATE carries the flag for every other environment.
+    local plan; plan="$(mktemp -d)"
+    "$(pybin prism)" - "${yaml}" "${plan}" <<'DEPS'
+import sys
+from pathlib import Path
+
+import yaml
+
+spec = yaml.safe_load(Path(sys.argv[1]).read_text(encoding="utf-8"))
+out = Path(sys.argv[2])
+conda: list[str] = []
+pip: list[str] = []
+for entry in spec["dependencies"]:
+    # The pip section is the one mapping in an otherwise flat list.
+    if isinstance(entry, dict):
+        pip += [str(item) for item in (entry.get("pip") or [])]
+    else:
+        conda.append(str(entry))
+if not conda or not pip:
+    sys.exit(f"FAIL: {sys.argv[1]} did not parse into conda and pip dependencies")
+out.joinpath("conda.txt").write_text("\n".join(conda) + "\n", encoding="utf-8")
+out.joinpath("pip.txt").write_text("\n".join(pip) + "\n", encoding="utf-8")
+print(f"    {len(conda)} conda dependencies, {len(pip)} from pip")
+DEPS
+    local conda_deps=()
+    mapfile -t conda_deps < "${plan}/conda.txt"
+    conda_create -n openadmet "${conda_deps[@]}"
+    # This environment's own pip, so the wheels land beside the conda solve
+    # rather than in prism. Two of these are git URLs at @main, which is why
+    # nothing downstream can call this environment reproducible.
+    "$(pybin openadmet)" -m pip install -r "${plan}/pip.txt"
+    rm -rf "${plan}"
+  fi
+
+  # --no-deps: conda has just solved this environment, and letting pip re-resolve
+  # from PyPI is how a conda-installed torch gets replaced by a wheel.
+  say "openadmet: the package itself, editable, without re-resolving the solve"
+  "$(pybin openadmet)" -m pip install --no-deps -e "${src}"
+
+  # Fetched with curl over an immutable revision rather than cloned: the one
+  # large file is LFS-tracked, git-lfs is not installed on every host, and a
+  # clone without the filter leaves a 130-byte pointer of exactly the right name
+  # in exactly the right place. A pinned digest settles it either way, and is
+  # the same thing the GNINA asset above gets.
+  if [ -f "${model}/model.pth" ] \
+     && echo "${OPENADMET_HERG_SHA256}  ${model}/model.pth" | sha256sum -c --status 2>/dev/null; then
+    note "hERG checkpoint already present and its digest matches"
+  else
+    say "downloading the OpenADMET hERG baseline (~50 MB) to ${model}"
+    mkdir -p "${model}/recipe_components"
+    for f in model.json model.pth \
+             recipe_components/procedure.yaml \
+             recipe_components/metadata.yaml \
+             recipe_components/data.yaml; do
+      curl -fL --retry 5 --retry-delay 3 -o "${model}/${f}" \
+        "https://huggingface.co/openadmet/herg-chemeleon-baseline/resolve/${OPENADMET_MODEL_REV}/anvil_training/${f}"
+    done
+    echo "${OPENADMET_HERG_SHA256}  ${model}/model.pth" | sha256sum -c \
+      || die "OpenADMET hERG checkpoint digest mismatch"
+  fi
+
+  # CheMeleon's featurizer weights, fetched here rather than left to the model
+  # to fetch for itself. Upstream reaches for them with a bare urlretrieve on
+  # first deserialize, which has no retry of any kind, and Zenodo has twice on
+  # this machine answered 504 and twice dropped the connection around 8 MB.
+  # Either one raises out of chemprop's build(), so without this the whole
+  # install fails at the last step -- after the environment, the editable
+  # package and the verified checkpoint have all succeeded -- or, worse, the
+  # same call happens inside somebody's first screen.
+  #
+  # The retry loop is out here for a reason worth stating, because the obvious
+  # spelling does not work: curl's own --retry re-opens the transfer but does
+  # not re-read the partial file, so -C - resolves once at process start and an
+  # internal retry silently restarts from byte zero. Only a fresh curl process
+  # re-evaluates the resume offset, so each attempt has to be its own process
+  # for the bytes already on disk to count.
+  fetch_chemeleon
+
+  # This prediction is not a formality. It is the only thing that proves the
+  # environment resolved into something that can construct a model, and the
+  # only place the featurizer fetched just above is proven loadable rather than
+  # merely present. Left to the first screen, both failures land mid-run, which
+  # is exactly what the boltz2 comment above exists to prevent.
+  local accel="cpu"
+  if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+    accel="gpu"
+  fi
+  local scratch; scratch="$(mktemp -d)"
+  printf 'SMILES\nCC(=O)Oc1ccccc1C(=O)O\nCN(C)CCCN1c2ccccc2CCc2ccccc21\n' > "${scratch}/in.csv"
+  say "openadmet: one real prediction on the ${accel}, which also warms ~/.chemprop"
+  "$(conda info --base)/envs/openadmet/bin/openadmet" predict \
+    --input-path "${scratch}/in.csv" \
+    --input-col SMILES \
+    --model-dir "${model}" \
+    --output-csv "${scratch}/out.csv" \
+    --accelerator "${accel}" \
+    || die "openadmet predict failed; the environment is installed but cannot run (inputs kept in ${scratch})"
+  "$(pybin openadmet)" - "${scratch}/out.csv" <<'SMOKE'
+import sys
+
+import pandas as pd
+
+# The column name is the model's own metadata tag joined to its target column,
+# and it is what the adapter's endpoint mapping expects to find. Asserting it
+# here means a re-tagged release is caught at install time rather than as an
+# empty ADMET tier halfway through a screen.
+column = "OADMET_PRED_chemprop-chembl_pchembl_value_mean"
+frame = pd.read_csv(sys.argv[1])
+if column not in frame.columns:
+    sys.exit(f"FAIL: expected a {column!r} column, got {list(frame.columns)}")
+values = frame[column].dropna()
+if values.empty:
+    sys.exit(f"FAIL: {column} is empty for every molecule")
+print(f"    OK: {len(values)}/{len(frame)} predicted, pIC50 "
+      f"{values.min():.2f}..{values.max():.2f}")
+SMOKE
+  rm -rf "${scratch}"
+
+  note "openadmet CLI: $(conda info --base)/envs/openadmet/bin/openadmet"
+  note "hERG model:    ${model}"
+  note "Those are the two paths a cascade needs; export them once as"
+  note "MOLCASCADE_OPENADMET_EXECUTABLE and MOLCASCADE_OPENADMET_MODEL_DIR and"
+  note "every cascade on this machine finds them without naming either."
+  note "The release is a no-split model: trained on everything, no held-out set,"
+  note "no published metrics. It is one arm of an 'any' join for that reason."
+}
+
 # --- verification ------------------------------------------------------------
 verify() {
   say "verifying"
@@ -342,6 +641,7 @@ for t in "${targets[@]}"; do
     unidock)   setup_unidock ;;
     aizynth)   setup_aizynth ;;
     boltz2)    setup_boltz2 ;;
+    openadmet) setup_openadmet ;;
     gnina)     setup_gnina ;;
     verify)    verify ;;
     *)         die "unknown target: ${t}" ;;

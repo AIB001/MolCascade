@@ -43,6 +43,7 @@ from molcascade.plugins.builtin.mordred_gate import MordredDescriptorGatePlugin
 from molcascade.plugins.builtin.normalized_docking_score import (
     NormalizedDockingScorePlugin,
 )
+from molcascade.plugins.builtin.openadmet import OpenADMETPredictorPlugin
 from molcascade.plugins.builtin.policy import NativeDecisionJoinPlugin
 from molcascade.plugins.builtin.pose_strain import PoseStrainPlugin
 from molcascade.plugins.builtin.property_gate import RDKitPropertyRangeGatePlugin
@@ -101,6 +102,7 @@ BUILTIN_STAGE_PLUGINS: tuple[StagePlugin, ...] = (
     ADMETAIV2PredictorPlugin(),
     ChempropCheckpointPlugin(),
     CustomModelPredictorPlugin(),
+    OpenADMETPredictorPlugin(),
     Boltz2AffinityPlugin(),
     NativePredictionEvidenceGatePlugin(),
     NativeSynthesisScoreEvidenceGatePlugin(),

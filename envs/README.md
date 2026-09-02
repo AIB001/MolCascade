@@ -18,7 +18,7 @@ another. For the conceptual account of licences and isolation, see the main
 
 ## Topology
 
-Five conda environments and one standalone binary:
+Six conda environments and one standalone binary:
 
 | Environment | Python | Holds | Why it is separate |
 | --- | --- | --- | --- |
@@ -27,20 +27,27 @@ Five conda environments and one standalone binary:
 | `unidock` | 3.14.7 | the `unidock` binary | conda-forge package, built per Python ABI; would overwrite `prism`'s rdkit/numpy/pandas |
 | `aizynth` | 3.12.13 | `aizynthcli` | pulls rdkit 2023.9.6 + numpy 1.26 |
 | `boltz2` | 3.12 | the `boltz` CLI + its weights | brings its own torch; installing it into `prism` replaces the one ADMET-AI and KarmaDock run on |
+| `openadmet` | 3.12 | the `openadmet` CLI + the released hERG model | same torch conflict, via conda's `pytorch-gpu`, chemprop, lightning and TabPFN |
 | GNINA 1.3.3 | — | a 1.9 GB release binary | not a package at all; GPL-2.0-or-later |
 
-Only `prism` needs to be activated. The other four are never on `PATH` — a cascade names
+Only `prism` needs to be activated. The other five are never on `PATH` — a cascade names
 their executables by absolute path, which is the whole point.
 
-`boltz2` is the one environment `bootstrap.sh` does not build by default. It is 8 GB with
-the weights, and the tier that uses it ships switched off, so it is opt-in: ask for it by
-name.
+`boltz2` and `openadmet` are the two environments `bootstrap.sh` does not build by
+default. `boltz2` is 8 GB with the weights and the tier that uses it ships switched off;
+`openadmet` is another ~10 GB, because upstream's environment file is a research
+environment rather than an inference one and trimming it is not safe (see below). Both
+are opt-in: ask for them by name.
+
+Leaving `openadmet` out does not disable the default ADMET tier -- it makes that tier one
+arm narrower. The tier joins ADMET-AI and OpenADMET with `any`, and an arm whose paths do
+not resolve on this machine simply does not appear.
 
 ## Provisioning a new machine
 
 Requirements: Linux x86-64, an NVIDIA GPU with a driver new enough for CUDA 12.4+, conda
 (Miniforge preferred), git, curl, and roughly **30 GB** of disk — **38 GB** with the
-opt-in `boltz2` environment and its weights.
+opt-in `boltz2` environment and its weights, **48 GB** with `openadmet` as well.
 
 ```bash
 git clone <this repo> && cd MolCascade
@@ -54,13 +61,25 @@ provision just one piece:
 bash envs/bootstrap.sh prism            # only the main environment
 bash envs/bootstrap.sh gnina karmadock  # only the docking engines
 bash envs/bootstrap.sh boltz2           # opt-in: not in the default set
+bash envs/bootstrap.sh openadmet        # opt-in: not in the default set
 bash envs/bootstrap.sh verify           # just re-run the checks
 ```
+
+Each environment is created with up to three attempts, which is a concession to one specific
+failure rather than general nervousness. A large package that arrives short — `libtorch`'s
+817 MB artifact stopped at 91% here — raises `Downloaded bytes did not match Content-Length`
+*after* the transfer, as a validation failure rather than an HTTP one, so nothing inside conda
+retries it and the whole solve ends. Between attempts the script removes only the truncated
+artifact, identified by its zip central directory being unreadable, and keeps every download
+that did complete; the package cache is what makes the second attempt a resumption instead of
+a restart. Three failures in a row are reported rather than retried, because by then the
+answer is a broken mirror or a full disk.
 
 Two paths are configurable by environment variable; both default as shown:
 
 ```bash
-MOLCASCADE_BACKEND_ROOT=~/molcascade-backends   # GNINA, its cuDNN, the KarmaDock checkout
+MOLCASCADE_BACKEND_ROOT=~/molcascade-backends   # GNINA, its cuDNN, the KarmaDock and
+                                                # OpenADMET checkouts, the hERG model
 MOLCASCADE_AIZYNTH_DATA=~/aizynth-data          # ~750 MB of retrosynthesis models
 BOLTZ_CACHE=~/.boltz                            # ~3 GB of Boltz-2 weights and the CCD
 ```
@@ -275,6 +294,73 @@ alignment. You supply a single-chain FASTA and its a3m. `msa_mode="colabfold_ser
 and uploads your sequence to `api.colabfold.com` — a third party — which is why it has to be
 named explicitly and is never a fallback.
 
+## `openadmet`
+
+```bash
+bash envs/bootstrap.sh openadmet
+```
+
+Everything about this one is upstream's: the dependency list is read out of the
+repository's own `devtools/conda-envs/openadmet-models-gpu.yaml` at the pinned commit, and
+the package is installed editable from that same checkout with `--no-deps` so pip does not
+re-resolve what conda has just solved.
+
+The list is *read* rather than handed to `conda env create`, because that subcommand takes
+neither `-c` nor `--override-channels` on conda 23.7.x, and `CONDA_CHANNELS` is no
+substitute: `channels` is a sequence parameter, so an environment variable prepends to
+`~/.condarc` instead of replacing it. On this machine that produced a solve against
+conda-forge *followed by* four Tsinghua mirrors and `defaults` — exactly the channel set
+`--override-channels` exists to exclude. So the deps come from upstream's file and the
+channel comes from the flag.
+
+| Component | Pinned to |
+| --- | --- |
+| code | `OpenADMET/openadmet-models` @ `55dd0015` |
+| model | `openadmet/herg-chemeleon-baseline` @ `5c4fb081` on Hugging Face |
+| `anvil_training/model.pth` | 51,657,071 bytes, sha256 `93f6527a…dfca146945` |
+
+The split from `prism` is the same story as `boltz2` — **torch, not Python.** Upstream asks
+conda for `pytorch-gpu` alongside chemprop, `pytorch-lightning<=2.6.1` and TabPFN, and any
+one of those re-pins the torch ADMET-AI predicts with in-process and KarmaDock was built
+against. So the CLI is called by absolute path from an interpreter of its own.
+
+**The environment is not trimmed to an inference subset, and that is deliberate.** Loading
+any model goes through `to_class()` → `load_group("models")`, which imports all nine
+architecture modules — `nepare` and `tabpfn` among them. A dependency dropped because
+inference "does not need it" therefore fails at model construction, which is after the
+environment looks finished and after the weights have been downloaded. The honest cost of
+keeping upstream's list is ~10 GB, plus four pip dependencies installed from git, two of
+them at `@main` — a reproducibility hole this script cannot close and does not pretend to.
+
+The model is fetched with `curl` over an immutable revision rather than cloned. Its one
+large file is LFS-tracked, git-lfs is not installed everywhere, and a plain `git clone`
+without the filter leaves a 130-byte pointer of exactly the right name in exactly the right
+place — which existence checks cannot tell from a checkpoint, and which surfaces later as a
+deserializer complaining about a corrupt archive. A pinned digest settles it, the same way
+the GNINA asset's does. (The adapter also detects a pointer and says so, in case a clone got
+there another way.)
+
+The step ends with one real two-molecule prediction. That is not a formality:
+`procedure.yaml` sets `from_chemeleon: true`, so the first deserialize downloads a 33 MB
+CheMeleon checkpoint from Zenodo record 15460715 into `~/.chemprop` — a network call in the
+middle of a screen otherwise, for the same reason `boltz2` pre-fetches its weights. It is
+also the only check that the environment resolved into something that can construct a model
+at all, and it asserts the exact output column the adapter's endpoint mapping expects, so a
+re-tagged release is caught at install time rather than as a silently empty ADMET tier.
+
+The code and the model are both **Apache-2.0**, so nothing here needs `--allow-copyleft`.
+Upstream's `pyproject.toml` still carries a cookiecutter `MIT` string in its `license`
+field while `LICENSE` is the full Apache-2.0 text and GitHub reports Apache-2.0; the licence
+file governs, and MolCascade's backend catalogue says Apache-2.0 for that reason. Please do
+not "correct" it back.
+
+One caveat belongs in any methods section that uses this arm: the released hERG model is a
+**no-split model**. Its own recipe records `test_size: 0`, `train_size: 1.0`, `val_size: 0`
+and an empty evaluation report, so it was trained on everything and upstream publishes no
+metrics for it and says to proceed with caution. That is precisely why the default ADMET
+tier joins it to ADMET-AI with `any` — a molecule is dropped only when both models, built on
+different evidence, agree it is a hERG risk.
+
 ## GNINA 1.3.3
 
 There is no conda package for GNINA. It is one 1.9 GB asset from the GitHub release:
@@ -332,12 +418,16 @@ Every one of these is an absolute path. Substitute your own `MOLCASCADE_BACKEND_
 | | `cache_dir` | `/home/shizq/.boltz` |
 | | `target_fasta_path` | your target's single-chain `.fasta` (required) |
 | | `msa_a3m_path` | its `.a3m` alignment (required, unless `msa_mode` says otherwise) |
+| OpenADMET | `executable` | `/home/shizq/anaconda3/envs/openadmet/bin/openadmet` |
+| | `model_dir` | `/home/shizq/molcascade-backends/openadmet-models/herg-chemeleon-baseline/anvil_training` |
 
-All five also take `receptor_path` (the docking three) or the shared engine fields
+All of them also take `receptor_path` (the docking three) or the shared engine fields
 `num_modes`, `seed`, `max_molecules`, `timeout_per_molecule_seconds`, `scratch_dir`. Set
 `scratch_dir` when the system temporary directory is a small tmpfs.
 
-Boltz-2 is the exception to `receptor_path`: it takes a sequence rather than a structure, and
+Boltz-2 and OpenADMET are the exceptions to `receptor_path`. OpenADMET is a ligand-only
+property model and has no use for a receptor at all. Boltz-2 takes a sequence rather than a
+structure, and
 declining that field is what keeps the campaign's receptor from being injected into it. A
 sequence read off a PDB's ATOM records has every unresolved loop silently deleted, and a fold
 against a protein missing a loop is wrong in a way no error would mention.
@@ -445,6 +535,8 @@ machine, which is not enough headroom for a classic-solver conda run. See
 | `aizynth` | ~2 GB |
 | `boltz2` | ~5 GB (opt-in) |
 | Boltz-2 weights | ~3 GB (opt-in) |
+| `openadmet` | ~10 GB (opt-in) |
+| OpenADMET hERG model | 50 MB (opt-in) |
 | GNINA binary | 1.9 GB |
 | GNINA's cuDNN | 1.3 GB |
 | AiZynthFinder data | 754 MB |

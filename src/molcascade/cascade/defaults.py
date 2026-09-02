@@ -54,13 +54,27 @@ one of them as a hard cut.  The synthesizability tier here is therefore a
 reaction-trained score (SCScore) calls it tractable, and is dropped only when
 two methods that disagree by construction both say it is hard.
 
+**Predicted liabilities are joined, not trusted individually.**  One ADMET
+endpoint is a default: hERG, asked of two models trained by different people on
+different labels, and acted on only where they agree.  ADMET-AI predicts the
+TDC binary blocker label and answers with a probability; OpenADMET regresses
+pIC50 from ChEMBL and answers with a potency.  Neither is strong enough to
+delete on by itself -- 0.84 AUROC for the first, no published metric at all for
+the second -- so the tier is a union for the same reason the synthesizability
+tier above it is, and its arms appear only when the machine can really answer
+them.  A tier with no arms is no tier, which is what keeps this a bonus on a
+host that has the models rather than a failure on a host that does not.
+
 **What is deliberately absent.**  Similarity to reference leads needs a lead
-file only the project has, so it cannot ship as a default; ADMET endpoints wait
-for their weights to be fetched; and AiZynthFinder route search waits for an
-environment of its own, because installing it beside this one would silently
-re-score every tier above it.  All three are one click away in the builder, and
-belong at the bottom of the funnel where the population is small enough to
-afford them -- route search most of all, at seconds to minutes per molecule.
+file only the project has, so it cannot ship as a default; the remaining ADMET
+endpoints -- absorption, DILI, AMES, the CYP panel -- are computed and recorded
+but gate nothing, because a predicted liability is not a measured one and this
+funnel has no exposure model to weigh it against; and AiZynthFinder route
+search waits for an environment of its own, because installing it beside this
+one would silently re-score every tier above it.  All three are one click away
+in the builder, and belong at the bottom of the funnel where the population is
+small enough to afford them -- route search most of all, at seconds to minutes
+per molecule.
 
 References
 
@@ -108,6 +122,8 @@ from molcascade.cascade.models import (
     TierMode,
 )
 from molcascade.contracts.schemas import DOCKING_SCORE_V1
+from molcascade.errors import PluginError
+from molcascade.plugins.builtin._machine_paths import fill_machine_paths
 from molcascade.plugins.registry import PluginRegistry, create_builtin_registry
 
 DEFAULT_SEED = 20_260_823
@@ -115,6 +131,78 @@ DEFAULT_SEED = 20_260_823
 #: Which SCScore variant the default uses when the asset has been provisioned.
 #: The 1024-bit binary model is the one the paper's figures were produced with.
 SCSCORE_ASSET_MEMBER = "models/full_reaxys_model_1024bool/model.ckpt-10654.as_numpy.json.gz"
+
+#: Where the ADMET-AI arm of the hERG tier cuts, in the blocking probability
+#: its head reports -- and deliberately not the 0.95 the same option carries as
+#: a standalone gate in ``catalog.py``.  Two numbers because the arm is asked a
+#: different question here, and the panel says the answer differs.
+#:
+#: Measured on the 77 approved oral drugs plus the four drugs withdrawn or
+#: restricted for QT prolongation, with the OpenADMET arm at its own cut:
+#:
+#:     ADMET-AI cut    this arm alone      inside the 'any' join
+#:                     appr'd  withdrawn   appr'd  withdrawn   missed
+#:         0.90        13/77      4/4       3/77      4/4      --
+#:         0.92        13/77      3/4       3/77      3/4      dofetilide
+#:         0.95         6/77      3/4       1/77      3/4      dofetilide
+#:         0.96         5/77      3/4       1/77      3/4      dofetilide
+#:
+#: 0.90 is wrong for a filter standing alone -- 13/77 is one approved drug in
+#: six -- and that is why the catalogue default stays 0.95.  Inside the join it
+#: cannot cost that, because ``any`` deletes only what *both* arms object to and
+#: the other arm objects to three drugs in the whole panel.  3/77 is therefore
+#: the ceiling on this arm's collateral however far it loosens, which is what
+#: makes the fourth detection nearly free: the two extra deletions are
+#: haloperidol (p 0.946, pIC50 7.23) and risperidone (p 0.928, pIC50 6.54),
+#: both antipsychotics carrying QT labelling and both flagged independently by
+#: the other model.
+#:
+#: What it buys back is dofetilide, at p 0.919 the one withdrawn drug a 0.95 cut
+#: misses.  Dofetilide is a class III antiarrhythmic whose mechanism *is* hERG
+#: blockade and whose label requires in-hospital initiation under continuous
+#: ECG; of everything on this panel it is the least defensible thing for a hERG
+#: screen to pass.  Trading two antipsychotics that both models call blockers
+#: for the one detection this arm most obviously owes is the trade this cut
+#: makes.
+ADMET_AI_HERG_JOIN_MAX = 0.90
+
+#: Where the OpenADMET arm of the hERG tier cuts, in the pIC50 the released
+#: baseline regresses.  Measured on the same 77 approved oral drugs every other
+#: default in this file answers to, plus the same four withdrawn QT drugs.
+#:
+#: The literature anchor is 5.0 -- IC50 above 10 uM, the conventional line -- and
+#: it is wrong here by a log and a half, which is the whole reason this number
+#: was measured instead of quoted.  A 5.0 cut deletes **30 of the 77 approved
+#: drugs**.  The anchor is about a *measured* IC50; this model regresses pchembl
+#: values out of ChEMBL, where hERG is assayed mostly on compounds somebody
+#: already suspected, so its output sits high and a threshold read off the
+#: literature scale lands in the middle of the panel rather than at its edge.
+#:
+#: Measured (77 approved: min 3.77, p25 4.55, median 4.88, p75 5.29, max 7.23;
+#: withdrawn: astemizole 8.19, dofetilide 7.25, cisapride 7.23, terfenadine
+#: 6.85):
+#:
+#:     cut    approved deleted    withdrawn caught
+#:     5.0        30/77                4/4
+#:     6.0         7/77                4/4
+#:     6.5         3/77                4/4
+#:     7.0         1/77                3/4
+#:
+#: 6.5 is the knee: every lower cut is strictly dominated -- 6.0 catches the
+#: same four and deletes four more approved drugs for it -- and 7.0 buys two
+#: false positives by dropping terfenadine, which is a drug withdrawn for
+#: torsades and so exactly the detection this arm exists to make.
+#:
+#: The three it does delete are haloperidol 7.23, verapamil 6.77 and risperidone
+#: 6.54, all three genuine hERG binders carrying QT labelling.  Verapamil is the
+#: classic case of a strong hERG blocker that is not torsadogenic, because it
+#: blocks calcium channels too -- so a hERG model is right about it and a
+#: cardiac safety conclusion drawn from that alone would be wrong.  That is the
+#: distinction the tier note refuses to blur, standing here as a measurement.
+#:
+#: These three are also, by the ``any`` join, the only approved drugs the tier
+#: can ever delete: see :data:`ADMET_AI_HERG_JOIN_MAX`.
+OPENADMET_HERG_PIC50_MAX = 6.5
 
 
 def _set_path(target: dict[str, Any], path: str, value: Any) -> None:
@@ -143,9 +231,7 @@ def criterion_defaults(
     settings = with_schema_version(option.plugin_ref, option.defaults, registry=registry)
     if option.gate_plugin is None:
         return settings, dict(option.gate_defaults)
-    gate_settings = with_schema_version(
-        option.gate_plugin, option.gate_defaults, registry=registry
-    )
+    gate_settings = with_schema_version(option.gate_plugin, option.gate_defaults, registry=registry)
     return settings, gate_settings
 
 
@@ -719,11 +805,235 @@ def _synthesis_tier(registry: PluginRegistry) -> TierConfig | None:
 # Veber 6/77 and Lipinski 10/77, and the rest run from Ghose at 28/77 to
 # druglike_soft at 51/77.  Absorption is asked once, as a quorum, one tier up.
 #
-# A predictive ADMET tier is a different thing and remains available in the
-# builder -- ADMET-AI or a Chemprop bundle, with an explicit numeric gate.  It
-# is not a default because both require provisioning and a trust acknowledgement
-# first, and a starter cascade that fails closed on a fresh install is worse
-# than one that does not claim the tier.
+# A predictive ADMET tier is a different thing, and it is now the default one:
+# :func:`_admet_tier` below fills the t6 slot with hERG liability, asked of two
+# models that were trained by different people on different labels.  It deletes
+# only where they agree, which is the same construction and the same sentence as
+# the synthesizability tier above it.
+#
+# What changed is not the trust argument but where the argument is settled.  A
+# tier that needs a checkpoint fetched, or a licence accepted, must not be a
+# default that fails closed on a fresh install -- so neither arm asserts
+# anything it cannot check first, and a tier with no arms is no tier at all.
+
+
+def _installed_version(distribution: str) -> str | None:
+    """The installed release of one distribution, or ``None`` if it is absent.
+
+    Reads ``dist-info`` metadata and nothing else.  That matters because this
+    runs inside :func:`default_cascade`, which the tests, the builder and every
+    ``molcascade`` invocation call: importing the package to ask its version
+    would drag torch in to answer a question about a text file.
+    """
+
+    import importlib.metadata
+
+    try:
+        return importlib.metadata.version(distribution)
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def _admet_ai_arm(registry: PluginRegistry) -> CriterionConfig | None:
+    """ADMET-AI's hERG head, but only on the release the digests were taken from.
+
+    This arm is the one that needs a trust acknowledgement, and the default
+    supplies it rather than asking -- which is only defensible because of what
+    the flag actually governs.  It does not mean "load whatever bytes are
+    there".  ``catalog.py`` pins two digests measured from admet-ai
+    ``PINNED_ADMET_AI_VERSION``, and the stage rehashes the installed package
+    tree and model tree in the *parent* and refuses to hand a shard any path
+    whose bytes differ, before a child calls ``torch.load``.  So the assertion
+    being made here is narrow and checkable: this is that release, and the
+    digests still match.
+
+    The version is checked here because the digests are only informative while
+    they belong to the release installed; a different release means the pins
+    describe something else, and then the honest default is no arm at all rather
+    than a trusted one.  What is deliberately *not* checked here is the digests
+    themselves -- that means hashing gigabytes of weights, and this function
+    runs on every ``default_cascade()`` call.  Tampering is still caught, one
+    layer down, when the stage starts and reports a digest mismatch: the right
+    diagnosis, rather than a missing tier that says nothing.
+
+    The catalogue default stays ``False``, so the builder goes on asking the
+    operator the question this answers for the starter cascade.
+    """
+
+    from molcascade.plugins.builtin.admet import PINNED_ADMET_AI_VERSION
+
+    if _installed_version("admet-ai") != PINNED_ADMET_AI_VERSION:
+        return None
+    return _criterion_if_available(
+        "admet_endpoint",
+        registry,
+        option_id="admet_ai_v2",
+        config_id="admet_herg_ai",
+        label="hERG liability · ADMET-AI (blocking probability)",
+        settings={"allow_unsafe_model_deserialization": True},
+        # Well above the 0.5 an unexamined "it's a probability" reading
+        # suggests, because on this panel half the approved drugs score above
+        # 0.5 -- the model predicts hERG *binding*, and verapamil, diltiazem and
+        # imatinib genuinely bind it.  Why this arm cuts lower than the same
+        # option's standalone gate is measured in ADMET_AI_HERG_JOIN_MAX: the
+        # join bounds what a looser cut can cost.
+        gate_settings={"endpoint_id": "herg_blocking", "maximum": ADMET_AI_HERG_JOIN_MAX},
+    )
+
+
+def _openadmet_paths_resolve(registry: PluginRegistry) -> bool:
+    """Would this machine answer both of OpenADMET's installation paths?
+
+    Asked through the plugin's own config model, so there is one resolution
+    order rather than two that can disagree: ``fill_machine_paths`` is handed an
+    empty mapping and reports what it can supply from the environment and from
+    the layout the bootstrap script writes.  A field it cannot answer comes back
+    absent, and absent means no arm.
+    """
+
+    reference = "prediction.openadmet@0.1.0"
+    if reference not in registry:
+        return False
+    try:
+        # Trust is part of the question, and the membership test above
+        # deliberately does not ask it: ``entry`` looks up registry metadata
+        # "without making a trust decision", so ``in`` is true of a registration
+        # this project has not vouched for.  Such a registration is not one to
+        # build a default arm on, so resolve it properly and let the refusal
+        # answer here.
+        registry.get(reference)
+        # Named as a class rather than read off the resolved plugin, because the
+        # ``StagePlugin`` boundary declares ``descriptor`` and ``execute`` and
+        # nothing else -- a config model is not part of it, and reaching for one
+        # there would be an attribute that happens to exist on the concrete
+        # class.  The import is a module-cache hit: registering the plugin above
+        # is what imported the module in the first place.
+        from molcascade.plugins.builtin.openadmet import OpenADMETConfig
+
+        specs = OpenADMETConfig.installed_paths()
+        filled = fill_machine_paths({}, engine_id=OpenADMETConfig.engine_id, paths=specs)
+    except (ImportError, OSError, PluginError, TypeError):
+        # A plugin that does not declare machine paths is not this plugin, and an
+        # untrusted registration is not one to build a default on.  Anything
+        # unexpected means "cannot confirm", which is not the same as "installed".
+        return False
+    if not isinstance(filled, Mapping):  # pragma: no cover - defensive
+        return False
+    return all(str(filled.get(spec.field, "")).strip() for spec in specs)
+
+
+def _openadmet_arm(registry: PluginRegistry) -> CriterionConfig | None:
+    """OpenADMET's released hERG baseline, when its two paths resolve.
+
+    No trust flag, and none is needed: this is an isolated CLI, so the
+    checkpoint is deserialized inside OpenADMET's own interpreter and
+    MolCascade never calls ``torch.load`` on it.  What decides whether the arm
+    appears is whether the executable and the model directory are really on
+    this machine.
+
+    That question has to be asked *here*, which is a departure from every other
+    isolated engine in this file.  :func:`option_availability` deliberately
+    does not look at the filesystem -- it answers about an installation, not a
+    host -- so an uninstalled engine still produces a runnable option, and the
+    preflight refuses the run on the machine that was going to do the work.
+    For the docking engines that is correct: a host with no docking engine
+    cannot screen, and saying so before the first molecule is the useful
+    behaviour.  For an optional ADMET arm it would be exactly wrong.  The tier
+    is a bonus, and a bonus that turns a fresh install's starter cascade into a
+    preflight failure is worse than no tier -- so this arm is only offered
+    where it can actually run.
+
+    The check reuses the plugin's own resolution rather than reimplementing it,
+    so the arm appears if and only if the config validator would have filled
+    the same two fields in: a value from the environment first
+    (``MOLCASCADE_OPENADMET_EXECUTABLE`` and ``..._MODEL_DIR``), then the layout
+    ``envs/bootstrap.sh`` writes.  Both are existence-only tests.  Whether the
+    executable really is OpenADMET, and whether the directory holds a
+    checkpoint rather than an unpulled pointer, stays where it belongs -- in
+    the preflight, on the host, where a wrong answer can be reported.
+    """
+
+    if not _openadmet_paths_resolve(registry):
+        return None
+    return _criterion_if_available(
+        "admet_endpoint",
+        registry,
+        option_id="openadmet",
+        config_id="admet_herg_openadmet",
+        label="hERG liability · OpenADMET (predicted pIC50)",
+        gate_settings={"endpoint_id": "herg_pic50", "maximum": OPENADMET_HERG_PIC50_MAX},
+    )
+
+
+def _admet_tier(registry: PluginRegistry) -> TierConfig | None:
+    """hERG liability, asked of two models and acted on only when both agree.
+
+    Placed at t6 -- after synthesizability, before structure QC -- because that
+    is the last point at which a molecule is still cheap.  On the 103,515-molecule
+    reference run 8,782 molecules reached this position, and conformer generation
+    plus two docking engines then cost 3,020 s of the 4,607 s spent getting to
+    the affinity tier: 65.6% of the work, 60.3% of it docking alone.  Every
+    molecule deleted here is one that does not pay that.
+
+    ``any`` is the deliberate choice and it is the permissive one: a molecule
+    survives unless *both* models object.  Neither is strong enough to be given
+    the verdict alone -- ADMET-AI's hERG head reports AUROC 0.84, and
+    OpenADMET's released baseline is trained on its full dataset with no
+    held-out split and publishes no metric at all.  Two independent objections
+    is a claim worth deleting on; one is a reason to look.
+
+    What that costs and buys is measured, on the 77 approved oral drugs and the
+    four withdrawn or restricted QT drugs, with both arms at the cuts above:
+    the tier deletes **3 of 77 approved** and catches **4 of 4 withdrawn**.
+    The three are haloperidol, verapamil and risperidone -- every one a real
+    hERG binder carrying QT labelling, and every one flagged independently by
+    both models, which is the join working rather than failing.  Each arm alone
+    is worse in one direction or the other: ADMET-AI at its own cut deletes
+    13/77, OpenADMET catches the same four but on a model with no held-out
+    split at all.
+
+    So this tier is not where a hERG problem gets caught.  It is where the
+    molecules that two unrelated models both call cardiotoxic stop consuming
+    docking time.  A programme that cares about QT owes the endpoint a
+    measurement, not a screen -- and verapamil is the standing reminder of why:
+    it is a strong hERG blocker that is not torsadogenic, because it blocks
+    calcium channels too.  Both models are right about its affinity and a
+    cardiac safety conclusion drawn from that alone would be wrong.
+    """
+
+    criteria = [
+        criterion
+        for criterion in (_admet_ai_arm(registry), _openadmet_arm(registry))
+        if criterion is not None
+    ]
+    if not criteria:
+        return None
+    union = len(criteria) > 1
+    return TierConfig(
+        id="t6_admet",
+        title="hERG liability",
+        # The enum rather than the bare strings its neighbours use, because a
+        # conditional is the one place the literal loses its type: mypy widens
+        # ``"any" if union else "all"`` to ``str``.  ``TierMode`` is a StrEnum,
+        # so this is the same value in memory and the same token in JSON.
+        mode=TierMode.ANY if union else TierMode.ALL,
+        criteria=tuple(criteria),
+        note=(
+            "Two models on the same endpoint and different labels -- ADMET-AI "
+            "predicts the TDC binary blocker label, so its number is a probability; "
+            "OpenADMET regresses pIC50 from ChEMBL -- joined so that a molecule is "
+            "deleted only when both object. They are recorded as two endpoints "
+            "because one is a probability and the other a potency, and neither is a "
+            "rescaling of the other. Predicted hERG affinity is not a cardiac "
+            "safety assessment: approved drugs bind hERG and are approved anyway, "
+            "on an affinity-to-exposure margin this stage cannot see."
+            if union
+            else "One model's opinion on hERG, used to stop the clearest liabilities "
+            "before conformers and docking rather than to assess cardiac safety. "
+            "Install the second arm -- 'bash envs/bootstrap.sh openadmet' -- and a "
+            "molecule then needs two independent objections before it is deleted."
+        ),
+    )
 
 
 def _structure_qc_tier(registry: PluginRegistry) -> TierConfig | None:
@@ -1091,6 +1401,7 @@ def default_cascade(
             _druglikeness_tier(active),
             _alerts_tier(active),
             _synthesis_tier(active),
+            _admet_tier(active),
             _structure_qc_tier(active),
             _conformer_tier(active),
             docking,
@@ -1110,9 +1421,7 @@ def default_cascade(
                 settings={"include_sa_score": True},
             ),
             _step_if_available("scaffolds", "scaffold.rdkit_murcko@0.1.0", active),
-            _step_if_available(
-                "diversity_groups", "cluster.rdkit_scaffold_groups@0.1.0", active
-            ),
+            _step_if_available("diversity_groups", "cluster.rdkit_scaffold_groups@0.1.0", active),
             _step_if_available(
                 "shortlist_select",
                 "select.native_scaffold_round_robin@0.1.0",
