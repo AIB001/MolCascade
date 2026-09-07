@@ -383,7 +383,9 @@ LIGAND_CONFORMER_V1 = DataContract(
     },
     invariants={
         "shared_geometry": (
-            "every docking engine reads the same conformers, so their scores stay comparable"
+            "engines that declare this contract read the same conformers, so their "
+            "scores are comparable to each other; an engine that embeds its own "
+            "geometry does not declare it and is not covered by that guarantee"
         ),
         "failure_recorded": (
             "a molecule that could not be embedded keeps a row with a null molblock "

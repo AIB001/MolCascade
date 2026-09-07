@@ -293,8 +293,14 @@ hatch for a structure the automatic meeko preparation cannot cope with.
 
 A run whose cascade holds a docking tier and whose command line holds no receptor stops
 before the first molecule is read, naming the flags that would fix it. The receptor is read,
-hashed and validated — never edited: protonation, tautomers, cofactors, metals and missing
-loops decide the science, so MolCascade refuses to guess them.
+repaired, and hashed — and every repair is named in the run's target notes. Missing
+side-chain atoms are rebuilt from rotamer templates, waters and co-crystallised matter are
+dropped, and modified residues such as selenomethionine are converted back; metals are kept.
+What it will not do is guess. A residue absent from the model entirely — an unresolved loop —
+is reported and left absent rather than built from a template, and protonation states and
+tautomers are never assigned, because those decide the science and a screening run has no
+business inventing them. `--no-receptor-prepare`, `--receptor-keep-waters` and
+`--receptor-keep-heterogens` turn the individual decisions off.
 
 `molcascade validate` is the other side of that: a docking cascade with no receptor in it is
 *valid*, because that is the shape it is supposed to have, and validating it says so in one

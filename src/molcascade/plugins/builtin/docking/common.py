@@ -11,9 +11,16 @@ The receptor digest is the load-bearing one.  ``docking_score/v1`` makes
 ``receptor_id`` part of the primary key precisely so a score can never be
 silently compared against a pose computed on different bytes, and that
 identifier is this file's ``sha256`` of the structure as it sits on disk.
-MolCascade reads and hashes the receptor; it never edits one.  Protonation
-states, tautomers, cofactors, metals and missing loops decide the science, and
-guessing at them inside a screening run would be inventing the answer.
+
+These adapters read and hash the receptor; they never edit one.  That is a
+statement about *this* module rather than about the pipeline: repair happens
+once upstream in :mod:`molcascade.cascade.receptor`, before any engine forms an
+opinion, and what arrives here is the prepared file whose bytes the digest is
+taken from -- so two engines cannot be handed two preparations of one protein.
+What nobody in the pipeline does is guess.  Protonation states and tautomers
+are never assigned, an unresolved loop is reported rather than rebuilt from a
+template, and every change that *is* made is counted and named in the run's
+target notes.
 """
 
 from __future__ import annotations

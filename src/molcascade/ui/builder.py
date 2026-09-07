@@ -49,8 +49,10 @@ _LAYERS = (
         "default_id": "standardize",
         "color": "#8b5cf6",
         "description": (
-            "Register parent structures, normalize salts and charge, and remove exact "
-            "duplicates."
+            "Register parent structures under a fixed identity policy — largest "
+            "organic fragment kept, charges reionised, metals disconnected — and "
+            "remove exact duplicates. Only the batch size is editable here; the "
+            "policy itself is not reachable from this card."
         ),
         "policy_hint": (
             "Standardization establishes the identity boundary for every downstream metric."

@@ -1086,12 +1086,24 @@ def _structure_qc_tier(registry: PluginRegistry) -> TierConfig | None:
 def _conformer_tier(registry: PluginRegistry) -> TierConfig | None:
     """One embedded, minimised conformer per survivor, for the docking tier below.
 
-    It is a tier of its own rather than a step inside each engine because two
-    engines follow it and they must dock *the same* geometry.  Embedding once
-    and handing both the identical conformer is what makes their two scores
-    comparable; embedding inside each would give Uni-Dock and KarmaDock
-    different starting coordinates and turn every disagreement between them
-    into a question about which conformer, not which scoring function.
+    It is a tier of its own rather than a step inside each engine because the
+    engines that *search* a box -- Uni-Dock and GNINA -- must search the same
+    starting geometry, or a disagreement between them is a question about which
+    conformer rather than about which scoring function.  Embedding once also
+    pays ETKDG plus the MMFF minimisation once instead of once per engine, and
+    that is most of this level's CPU.
+
+    KarmaDock is not one of those engines, and since the shipped docking tier
+    pairs it with Uni-Dock this has to be said plainly rather than left to be
+    discovered: it takes SMILES on its command line and embeds its own geometry
+    internally, which is why its adapter binds ``parent/v1`` rather than this
+    table (see ``docking/ligand_prep.py``).  So the consensus one tier down is
+    between two engines that agreed about a *molecule*, not about a geometry.
+    For a molecule whose stereocentres its SMILES leaves undefined -- which in
+    a generated library is most of them, as ``_structure_qc_tier`` says -- the
+    two embeddings can settle those centres differently, and then the two
+    engines are scoring different stereoisomers.  ``molcascade stereo`` reports
+    which molecules had a configuration chosen for them this way.
     """
 
     criterion = _criterion_if_available(
