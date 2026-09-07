@@ -21,6 +21,7 @@ from molcascade.cascade.lower import lower_cascade
 from molcascade.cascade.models import (
     CascadeConfig,
     CriterionConfig,
+    FinalizeConfig,
     LibraryConfig,
     StepConfig,
     TierConfig,
@@ -160,6 +161,10 @@ def test_an_unreadable_tier_makes_the_product_unknown_not_perfect(
     assert rings.unavailable is not None
     assert rings.retention is None
     assert damaged.end_to_end is None
+    # render() points at the notes whenever it withholds the figure, so a run
+    # that withheld it must have one. Without this the JSON reads complete=true
+    # with an empty notes list, which a consumer takes for "nothing to report".
+    assert any("could not be read" in note for note in damaged.notes)
     # The tier above it is still measured: one broken artifact costs its own
     # tier and the product, not the whole report.
     assert _tier(damaged, "t1_mass").retention is not None
@@ -227,3 +232,78 @@ def test_the_tier_structure_comes_from_the_run_not_from_a_config(
 
     assert [tier.tier_id for tier in report.tiers] == ["t1_mass", "t2_rings"]
     assert [tier.title for tier in report.tiers] == ["Mass floor", "Ring ceiling"]
+
+
+def test_a_selector_that_cuts_a_congeneric_panel_is_not_hidden(tmp_path: Path) -> None:
+    """The loss that happens after the last tier, which is not a tier.
+
+    A panel of measured molecules is a congeneric series -- that is what a
+    project's own actives look like -- so RDKit finds one or two Murcko
+    scaffolds across the whole panel, and the shipped shortlist selector caps
+    each scaffold at 25.  Molecules leave that no gate rejected.
+
+    Reporting only the tiers here is not a small approximation.  On the panel
+    below the tiers keep everything and the file somebody opens holds three
+    fifths of it, so the tier-only figure is 100% for a run that delivered 60%.
+    """
+
+    panel = "id,smiles\n" + "".join(
+        f"AN-{index:03d},O=C(Nc1ccc({tail})cc1)c1ccccc1\n"
+        for index, tail in enumerate(
+            ("C", "CC", "CCC", "CCCC", "F", "Cl", "Br", "I", "O", "OC")
+        )
+    )
+    source = tmp_path / "panel.csv"
+    source.write_text(panel, encoding="utf-8")
+
+    cascade = CascadeConfig(
+        name="congeneric",
+        library=LibraryConfig(smiles_column="smiles", id_column="id"),
+        tiers=(
+            TierConfig(
+                id="t1_mass",
+                title="Mass",
+                criteria=(
+                    CriterionConfig(
+                        id="mass_gate",
+                        criterion="physchem_window",
+                        backend="chemistry.rdkit_property_range_gate@0.1.0",
+                        settings={"mw_min": _MW_FLOOR},
+                    ),
+                ),
+            ),
+        ),
+        ingest=StepConfig(id="library", backend="source.delimited_smiles@0.1.0"),
+        standardize=StepConfig(
+            id="standardize", backend="chemistry.rdkit_standardize@0.1.0"
+        ),
+        finalize=FinalizeConfig(
+            target_count=45_000,
+            seed=7,
+            steps=(
+                StepConfig(id="scaffolds", backend="scaffold.rdkit_murcko@0.1.0"),
+                StepConfig(
+                    id="shortlist_select",
+                    backend="select.native_scaffold_round_robin@0.1.0",
+                    settings={"max_per_scaffold": 6},
+                ),
+            ),
+        ),
+    )
+    registry = create_builtin_registry()
+    lowered = lower_cascade(
+        cascade, registry=registry, library_path=str(source), allow_missing_target=True
+    )
+    runner = LocalRunner(tmp_path / "workspace", plugins=registry)
+    run_id = runner.run(lowered.pipeline, run_id="congeneric").run_id
+
+    report = measure_recall(runner, run_id)
+    assert _tier(report, "t1_mass").retention == 1.0
+    # The cap, not a gate, is what removed them.
+    cut = next(row for row in report.finalize if row.tier_id == "shortlist_select")
+    assert cut.surviving == 6
+    assert len(cut.lost) == 4
+    assert report.survivors == 6
+    assert report.end_to_end == 0.6
+    assert any("after the last tier" in note for note in report.notes)
+    assert "not screening criteria" in report.render()

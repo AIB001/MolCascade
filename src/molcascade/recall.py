@@ -15,7 +15,7 @@ A per-tier number cannot show that; only the product can.
 
 So this reads a finished run whose library *was* a panel of known molecules, and
 reports what each tier kept, which molecules each tier lost by name, and the
-product.  Three rules about the numbers, each of which is a way this measurement
+product.  Four rules about the numbers, each of which is a way this measurement
 can lie:
 
 **An unreadable tier makes the whole product unknown, not optimistic.**  If a
@@ -27,6 +27,15 @@ and the headline number would be *higher* the more broken the run was.
 **A run that did not finish gets no headline at all.**  A partial run's tiers
 are individually honest and their product is meaningless, so the report says
 which stage stopped instead.
+
+**What runs after the last tier counts too.**  The shortlist selector is not a
+tier and nobody authored it as a screening criterion, but it stands between the
+funnel and the file somebody opens, and it caps each Murcko scaffold.  A panel
+of measured molecules is a congeneric series -- that is what a project's own
+actives look like -- so on a real panel the cap can remove more molecules than
+every gate combined while each tier truthfully reports having kept everything.
+Measuring only the tiers there is not a small approximation of the delivered
+number; it is a different and reliably higher one.
 
 **No names is an error, not a result of zero.**  A panel whose identifiers never
 reached the run -- because the library was read without an id column -- would
@@ -119,6 +128,14 @@ class RecallReport:
     panel_size: int
     registered: int
     tiers: tuple[TierRecall, ...]
+    #: Stages that ran *after* the last tier and still removed molecules -- the
+    #: shortlist selector above all.  They are not tiers and are not reported as
+    #: such, but they are between the funnel and the file somebody opens, so
+    #: leaving them out makes this measure something other than end to end.
+    #: The shipped selector caps each Murcko scaffold at 25, and a panel of
+    #: measured molecules is by definition a congeneric series, so this is the
+    #: ordinary case for a recall panel rather than a corner of it.
+    finalize: tuple[TierRecall, ...] = ()
     #: Names that registered but that no tier is accountable for, because the
     #: run stopped before the funnel finished.
     unaccounted: tuple[str, ...] = ()
@@ -140,7 +157,7 @@ class RecallReport:
         if not self.complete or not self.tiers:
             return None
         product = 1.0
-        for tier in self.tiers:
+        for tier in self.tiers + self.finalize:
             retention = tier.retention
             if retention is None:
                 return None
@@ -149,9 +166,16 @@ class RecallReport:
 
     @property
     def survivors(self) -> int | None:
-        if not self.tiers:
+        """Molecules still present when the run ended -- after the selector.
+
+        This is what ``molcascade export`` writes out, which is the number a
+        reader will compare against, so it is the number reported.
+        """
+
+        stages = self.tiers + self.finalize
+        if not stages:
             return self.registered
-        return self.tiers[-1].surviving
+        return stages[-1].surviving
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -163,6 +187,7 @@ class RecallReport:
             "survivors": self.survivors,
             "end_to_end_recall": self.end_to_end,
             "tiers": [tier.as_dict() for tier in self.tiers],
+            "finalize": [stage.as_dict() for stage in self.finalize],
             "unaccounted": list(self.unaccounted),
             "notes": list(self.notes),
         }
@@ -228,6 +253,7 @@ def measure_recall(
     order = [stage.stage_id for stage in state.stages]
     position = {stage_id: index for index, stage_id in enumerate(order)}
     rows: list[TierRecall] = []
+    tier_exits: list[str] = []
     entering_set = set(registered)
     for tier in tiers:
         exit_stage = _tier_exit(tier, position)
@@ -244,6 +270,7 @@ def measure_recall(
                 )
             )
             continue
+        tier_exits.append(exit_stage)
         survivors, failure = _survivors(
             runner, manifests.get(exit_stage), entering_set
         )
@@ -262,6 +289,16 @@ def measure_recall(
             # The population below an unreadable tier is unknown, so every tier
             # after it is unknown too rather than measured against a guess.
             entering_set = set()
+            # render() promises "see the notes below" whenever the end-to-end
+            # figure is withheld, and a tier failing to read is one of the two
+            # ways that happens.  Without this the JSON reports complete=true
+            # with an empty notes list and a null recall, which reads to a
+            # consumer as "nothing to report" rather than "this did not read".
+            notes.append(
+                f"Tier {tier['id']} could not be read ({failure}), so no end-to-end "
+                "figure is reported and every tier below it is measured against an "
+                "unknown population."
+            )
             continue
         lost = tuple(sorted(names[p] for p in entering_set - survivors if p in names))
         rows.append(
@@ -276,6 +313,38 @@ def measure_recall(
         )
         entering_set = survivors
 
+    finalize_rows: list[TierRecall] = []
+    last_tier = max(
+        (position[stage_id] for stage_id in tier_exits if stage_id in position),
+        default=-1,
+    )
+    for stage in state.stages:
+        if position.get(stage.stage_id, -1) <= last_tier:
+            continue
+        remaining, failure = _survivors(runner, manifests.get(stage.stage_id), entering_set)
+        if failure is not None or remaining == entering_set:
+            # A stage that published no population of its own, or kept every
+            # molecule, is not attrition and does not earn a row.
+            continue
+        finalize_rows.append(
+            TierRecall(
+                tier_id=stage.stage_id,
+                title=stage.stage_id,
+                mode="finalize",
+                entering=len(entering_set),
+                surviving=len(remaining),
+                lost=tuple(sorted(names[p] for p in entering_set - remaining if p in names)),
+            )
+        )
+        entering_set = remaining
+    if finalize_rows:
+        notes.append(
+            "Molecules were removed after the last tier, by "
+            + ", ".join(row.tier_id for row in finalize_rows)
+            + ". The shipped shortlist selector caps each Murcko scaffold, so a "
+            "congeneric panel loses molecules here that no tier rejected."
+        )
+
     unaccounted: tuple[str, ...] = ()
     if state.status != "SUCCEEDED":
         notes.append(
@@ -289,6 +358,7 @@ def measure_recall(
         panel_size=len(registered) if panel_size is None else panel_size,
         registered=len(registered),
         tiers=tuple(rows),
+        finalize=tuple(finalize_rows),
         unaccounted=unaccounted,
         notes=tuple(notes),
     )
@@ -470,17 +540,28 @@ def _render_lines(report: RecallReport) -> list[str]:
         lines.append("  end to end: not available — see the notes below")
     lines.append("")
     lines.append(f"  {'tier':<26}{'in':>6}{'out':>6}{'kept':>9}   lost")
-    for tier in report.tiers:
-        if tier.unavailable is not None:
-            lines.append(f"  {tier.tier_id:<26}{'':>6}{'':>6}{'?':>9}   {tier.unavailable}")
-            continue
-        lost = ", ".join(tier.lost[:6])
-        if len(tier.lost) > 6:
-            lost = f"{lost}, … (+{len(tier.lost) - 6})"
-        lines.append(
-            f"  {tier.tier_id:<26}{tier.entering:>6}{tier.surviving:>6}"
-            f"{_percent(tier.retention):>9}   {lost}"
+
+    def _row(entry: TierRecall) -> str:
+        if entry.unavailable is not None:
+            return f"  {entry.tier_id:<26}{'':>6}{'':>6}{'?':>9}   {entry.unavailable}"
+        lost = ", ".join(entry.lost[:6])
+        if len(entry.lost) > 6:
+            lost = f"{lost}, … (+{len(entry.lost) - 6})"
+        return (
+            f"  {entry.tier_id:<26}{entry.entering:>6}{entry.surviving:>6}"
+            f"{_percent(entry.retention):>9}   {lost}"
         )
+
+    for tier in report.tiers:
+        lines.append(_row(tier))
+    if report.finalize:
+        # Separated rather than appended to the tier block: these are not tiers,
+        # nobody authored them as screening criteria, and a reader who sees them
+        # in the same list will report them as gates that rejected molecules.
+        lines.append("")
+        lines.append("  after the last tier — not screening criteria:")
+        for entry in report.finalize:
+            lines.append(_row(entry))
     if report.unaccounted:
         lines.append("")
         lines.append(
