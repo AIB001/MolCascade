@@ -10,9 +10,20 @@ from importlib.resources import files
 from pathlib import Path
 from typing import Any
 
+from molcascade.decisions import DecisionDigest, build_decision_digest
 from molcascade.io.atomic import atomic_write_bytes
 from molcascade.runtime import LocalRunner
 from molcascade.ui.assets import png_data_uri
+
+#: Reason codes carried per stage into the document.  Deliberately far below
+#: :mod:`molcascade.decisions`'s own default: ``rd_filters_alerts`` mixes a rule
+#: hash into its ``reason_code`` and the medchem adapters hash rule
+#: *combinations*, so the number of distinct codes is a property of the library
+#: being screened.  The CLI can afford that because ``--json`` is its escape
+#: hatch; a single file somebody emails cannot, so the document fixes its own
+#: size instead of inheriting one.  Overflow is not hidden -- it lands in
+#: ``untracked_rows`` and the page says so.
+_REPORT_BUCKETS = 24
 
 
 def _asset(name: str) -> str:
@@ -22,6 +33,63 @@ def _asset(name: str) -> str:
 def _csp_hash(content: str) -> str:
     digest = hashlib.sha256(content.encode("utf-8")).digest()
     return "sha256-" + base64.b64encode(digest).decode("ascii")
+
+
+def _decision_summary(digest: DecisionDigest) -> dict[str, Any]:
+    """Project a decision digest down to what this document is allowed to carry.
+
+    Written as an explicit allow-list rather than ``as_dict()`` minus a key, so
+    that a field added to :class:`~molcascade.decisions.DecisionBucket` later
+    cannot arrive here by default.  Two things are withheld and each has its own
+    reason.
+
+    ``sample_entity_ids`` is dropped, and the digest is built with
+    ``sample_size=0`` so it is never materialised in the first place.  A parent
+    id is a one-way digest and leaks no structure, so this is not about secrecy:
+    it is that ``molecule_rows_embedded`` is 0 and the page says every number
+    here is an aggregate.  A list of sample ids is a per-molecule row projection
+    -- and, worse, a join key, whose whole value is that it can be exchanged for
+    a whole molecule through ``molcascade explain``.  The reader at a terminal
+    has the store; the reader of an emailed file may have neither.
+
+    ``unavailable`` is reduced to the exception's type name.  The digest's own
+    message quotes the underlying error, which for a filesystem failure contains
+    an absolute path from the machine that generated the report.
+    """
+
+    stages = []
+    for stage in digest.stages_with_decisions:
+        stages.append(
+            {
+                "stage_id": stage.stage_id,
+                "rows_total": stage.rows_total,
+                "untracked_rows": stage.untracked_rows,
+                "unavailable": (
+                    None
+                    if stage.unavailable is None
+                    else stage.unavailable.split(":", 1)[0]
+                ),
+                "outcome_totals": [
+                    {"entity_kind": kind, "outcome": outcome, "rows": rows}
+                    for kind, outcome, rows in stage.outcome_totals
+                ],
+                "buckets": [
+                    {
+                        "entity_kind": bucket.entity_kind,
+                        "outcome": bucket.outcome,
+                        "reason_code": bucket.reason_code,
+                        "rows": bucket.rows,
+                    }
+                    for bucket in stage.buckets
+                ],
+            }
+        )
+    return {
+        "rejected_rows": digest.rejected_rows,
+        "warned_rows": digest.warned_rows,
+        "reason_codes_per_stage": _REPORT_BUCKETS,
+        "stages": stages,
+    }
 
 
 def build_run_report_payload(runner: LocalRunner, run_id: str) -> dict[str, Any]:
@@ -74,10 +142,23 @@ def build_run_report_payload(runner: LocalRunner, run_id: str) -> dict[str, Any]
             }
         )
     return {
-        "report_schema_version": 1,
+        # Bumped for the "decisions" key below.  The payload is a published
+        # artifact -- it is serialised into the document's textarea, saved and
+        # diffed -- so a consumer needs to be able to tell the shapes apart
+        # without probing for keys.
+        "report_schema_version": 2,
         "run": state.model_dump(mode="json"),
         "pipeline": revision.config.model_dump(mode="json"),
         "stages": stage_rows,
+        # ``sample_size=0`` is where ``molecule_rows_embedded`` below is
+        # enforced rather than merely asserted: the digest never materialises an
+        # entity id, so the projection has nothing to drop.  See
+        # :func:`_decision_summary`.
+        "decisions": _decision_summary(
+            build_decision_digest(
+                runner, run_id, sample_size=0, max_buckets=_REPORT_BUCKETS
+            )
+        ),
         "next_config_filename": f"{state.run_id}-next-config.json",
         "molecule_rows_embedded": 0,
     }
@@ -120,6 +201,8 @@ def render_run_report(payload: dict[str, Any]) -> str:
     <section id="summary" class="summary-grid" aria-label="Run summary"></section>
     <div class="section-head"><div><h2>Stage audit</h2><p>This offline report contains aggregate counts and provenance; molecule rows remain on disk.</p></div></div>
     <section id="timeline" class="timeline"></section>
+    <div class="section-head"><div><h2>Why molecules left</h2><p>Read back from the reason code each gate recorded while the run executed. These are decision <em>rows</em>, not molecules: one molecule can fail two rules in one stage and is counted twice, so the per-stage counts above stay the ones to quote. Entity ids stay on disk &mdash; run <code>molcascade decisions &lt;run&gt;</code> for samples, and <code>molcascade explain</code> to follow one molecule.</p></div></div>
+    <section id="decisions" class="timeline"></section>
     <div class="section-head"><div><h2>Continue screening</h2><p>Adjust stage parameters and download JSON; the CLI will validate it strictly and create a new revision.</p></div></div>
     <section class="panel config-grid"><div><textarea id="next-config" spellcheck="false" aria-label="Next-run configuration"></textarea><div id="config-notice" class="notice" aria-live="polite"></div></div><aside class="guide"><strong>Safety boundary</strong><p>This page is fully offline. It cannot publish artifacts or execute commands, and it cannot restore a terminal hard rejection.</p><p>Run <code>molcascade validate &lt;config&gt;</code> first, followed by <code>molcascade run</code> or the compatible <code>molcascade --vs</code> command.</p><button id="restore-config" class="button" type="button">Restore this run's pipeline</button></aside></section>
   </main>

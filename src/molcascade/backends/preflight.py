@@ -42,6 +42,7 @@ from __future__ import annotations
 import os
 import stat
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
@@ -692,9 +693,9 @@ def preflight_docking_target(
             receptor,
             engine=stage.plugin,
             hint=(
-                "Convert the structure to PDB before screening. MolCascade reads "
-                "and hashes the receptor but never edits it, so the conversion is "
-                "yours to check."
+                "Convert the structure to PDB before screening. MolCascade repairs a "
+                "PDB and names every change it makes, but it does not convert between "
+                "formats, so this conversion is yours to check."
             ),
         )
         _, digest = structure_digest(
@@ -726,11 +727,181 @@ def preflight_docking_target(
     return tuple(checked)
 
 
+@dataclass(frozen=True, slots=True)
+class PreflightAdvisory:
+    """Something worth saying at run start that is not a reason to refuse.
+
+    Deliberately not carrying a severity.  Both advisories below describe the
+    *ordinary* state of an ordinary input, and inventing a rank for two things
+    that share one would only make the next reader argue about which rank a
+    third belongs in.
+    """
+
+    code: str
+    stage_id: str
+    message: str
+    detail: str
+    evidence: dict[str, JsonValue]
+
+    def as_dict(self) -> dict[str, JsonValue]:
+        return {
+            "code": self.code,
+            "stage_id": self.stage_id,
+            "message": self.message,
+            "detail": self.detail,
+            "evidence": dict(self.evidence),
+        }
+
+
+#: Bytes of a receptor scanned when counting hydrogens.  A PDB records one atom
+#: per line and element in columns 77-78, so this is a line scan, not a parse --
+#: bringing a structure toolkit into preflight to answer "are there any H rows"
+#: would cost more than the check is worth.
+_HYDROGEN_SCAN_LIMIT = 256 * 1024 * 1024
+
+
+def _counts_hydrogens(path: Path) -> bool | None:
+    """Whether a PDB carries any explicit hydrogen atom, or ``None`` if unknown.
+
+    ``None`` on any read failure: the blocking checks above have already read
+    and hashed this file, so a failure here is a race rather than a diagnosis,
+    and an advisory has no business turning one into a verdict.
+    """
+
+    try:
+        if path.stat().st_size > _HYDROGEN_SCAN_LIMIT:
+            return None
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                if not line.startswith(("ATOM  ", "HETATM")):
+                    continue
+                element = line[76:78].strip().upper()
+                if element == "H":
+                    return True
+                if not element and len(line) > 12:
+                    # Pre-element-column files: fall back to the atom name, whose
+                    # first non-digit is the element for hydrogens named 1HB, HA
+                    # and so on.
+                    name = line[12:16].strip().lstrip("0123456789").upper()
+                    if name.startswith("H"):
+                        return True
+    except OSError:
+        return None
+    return False
+
+
+def preflight_docking_advisories(
+    stages: Sequence[StageConfig],
+    *,
+    registry: PluginRegistry,
+) -> tuple[PreflightAdvisory, ...]:
+    """Say two things about a docking run that nothing else says, and never refuse.
+
+    **A receptor with no hydrogens.**  ``cascade/receptor.py`` repairs a
+    structure -- it rebuilds missing side-chain atoms, drops waters and
+    heterogens, converts modified residues -- and its ``_repair`` path never
+    calls ``addMissingHydrogens``.  Meanwhile ``docking/gnina.py`` states that
+    GNINA wants "a protein PDB with hydrogens", and ``require_pdb_receptor``
+    checks only the suffix.  So each engine applies its own protonation, by its
+    own undocumented rule, and two engines in one tier need not agree.
+
+    This is the normal state of a structure downloaded from the PDB, not a
+    defect in the operator's input, and the advisory says so: it exists to make
+    an invisible decision visible, not to imply a mistake.  It can never block,
+    because a warning that fires on nearly every run and can stop one is a
+    warning people learn to pass a flag to silence.
+
+    **Two engines, two geometries.**  A tier that runs an engine declaring
+    ``ligand_conformer/v1`` beside one that does not is running two independent
+    embeddings.  KarmaDock declares ``inputs=(PARENT_V1.id,)`` and builds its own
+    geometry from ``parent_smiles``, so for a molecule whose stereocentres its
+    SMILES leaves undefined the two engines can be scoring different
+    stereoisomers -- and a consensus whose purpose is to make disagreement
+    visible would then be hiding one.  Judged by declared contract rather than by
+    engine name, because the contract is what lowering binds.
+    """
+
+    from molcascade.contracts import LIGAND_CONFORMER_V1
+
+    advisories: list[PreflightAdvisory] = []
+    conformer_readers: list[str] = []
+    own_geometry: list[str] = []
+    for stage in stages:
+        # A disabled stage is dropped at compile time.  An audit record
+        # describing something that will not happen is worse than none.
+        if not stage.enabled:
+            continue
+        try:
+            entry = registry.entry(stage.plugin)
+        except Exception:
+            continue
+        plugin = entry.plugin
+        if _docking_config_model(plugin) is None:
+            continue
+        descriptor = getattr(plugin, "descriptor", None)
+        inputs = () if descriptor is None else tuple(descriptor.inputs)
+        (conformer_readers if LIGAND_CONFORMER_V1.id in inputs else own_geometry).append(
+            stage.id
+        )
+
+        configured = stage.config.get("receptor_path")
+        if not configured:
+            continue
+        carries = _counts_hydrogens(Path(str(configured)))
+        if carries is False:
+            advisories.append(
+                PreflightAdvisory(
+                    code="DOCKING_RECEPTOR_WITHOUT_HYDROGENS",
+                    stage_id=stage.id,
+                    message=(
+                        f"{stage.id}: the receptor carries no explicit hydrogens, so "
+                        f"{stage.plugin} will add them by its own rule"
+                    ),
+                    detail=(
+                        "This is the ordinary state of a structure as deposited, not a "
+                        "problem with the file. MolCascade repairs a receptor but never "
+                        "assigns protonation, so each engine decides for itself and two "
+                        "engines in one tier need not decide alike. Protonate the "
+                        "structure yourself and pass it with '--receptor' if the "
+                        "decision matters to this target."
+                    ),
+                    evidence={"receptor_path": str(configured), "plugin": stage.plugin},
+                )
+            )
+
+    if conformer_readers and own_geometry:
+        advisories.append(
+            PreflightAdvisory(
+                code="DOCKING_MIXED_GEOMETRY_SOURCES",
+                stage_id=own_geometry[0],
+                message=(
+                    "this run docks the same molecules from two independent geometries: "
+                    f"{', '.join(conformer_readers)} read the shared conformers, "
+                    f"{', '.join(own_geometry)} build their own"
+                ),
+                detail=(
+                    "A disagreement between them may therefore be about which conformer "
+                    "or which enantiomer rather than about which scoring function. "
+                    "Embedding settles a stereocentre the SMILES leaves undefined, and "
+                    "two embeddings can settle it differently. Run 'molcascade stereo "
+                    "<run-id>' afterwards to see which molecules that happened to."
+                ),
+                evidence={
+                    "conformer_readers": list(conformer_readers),
+                    "own_geometry": list(own_geometry),
+                },
+            )
+        )
+    return tuple(advisories)
+
+
 __all__ = [
     "TARGET_RUN_TIME_HINT",
     "TARGET_SETTING_FLAGS",
+    "PreflightAdvisory",
     "copyleft_backends",
     "preflight_backends",
+    "preflight_docking_advisories",
     "preflight_docking_target",
     "preflight_engine_paths",
     "required_backends",

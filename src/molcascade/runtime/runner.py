@@ -12,6 +12,7 @@ from typing import Any
 
 from pydantic import JsonValue, ValidationError
 
+from molcascade import __version__
 from molcascade.artifacts import (
     ArtifactDatasetRef,
     ArtifactIntegrityError,
@@ -22,6 +23,7 @@ from molcascade.artifacts import (
 )
 from molcascade.config.models import PipelineConfig
 from molcascade.contracts import DEFAULT_CONTRACT_REGISTRY, ContractRegistry
+from molcascade.environment.models import HostEnvironment
 from molcascade.errors import (
     ExecutionError,
     MolCascadeError,
@@ -137,6 +139,7 @@ class LocalRunner:
         run_id_factory: Callable[[], str] | None = None,
         resources: StageResources | None = None,
         permitted_licenses: Mapping[str, str] | None = None,
+        environment: HostEnvironment | None = None,
     ) -> None:
         if not isinstance(plugins, PluginRegistry):
             raise TypeError("plugins must be a PluginRegistry")
@@ -150,6 +153,8 @@ class LocalRunner:
             raise TypeError("resources must be a StageResources")
         if permitted_licenses is not None and not isinstance(permitted_licenses, Mapping):
             raise TypeError("permitted_licenses must be a mapping of backend id to SPDX id")
+        if environment is not None and not isinstance(environment, HostEnvironment):
+            raise TypeError("environment must be a HostEnvironment")
 
         requested = Path(workspace).expanduser()
         if requested.is_symlink():
@@ -182,6 +187,20 @@ class LocalRunner:
         # section, and "the operator passed a flag" is not the same statement as
         # "this run executed GNINA under GPL-2.0-or-later".
         self.permitted_licenses = dict(permitted_licenses or {})
+        # The machine this run happened on, recorded rather than re-measured.
+        #
+        # A run already measures it: the caller's lane planning calls
+        # ``detect_environment``, which forks ``nvidia-smi``, and then keeps the
+        # worker count and the batch size. Everything else used to be dropped, so
+        # a finished run recorded which molecules it kept and nothing about the
+        # toolkit that decided that -- and the stage cache key does not hash any
+        # third-party library version, so the same configuration under a
+        # different RDKit is the same cache entry and a different answer.
+        #
+        # Optional, and absent rather than measured here when it is not supplied:
+        # a runner constructed inside a test should not fork a subprocess to
+        # inventory a machine nobody asked about.
+        self.environment = environment
         self._clock = clock
         self._run_id_factory = run_id_factory or (lambda: f"run-{uuid.uuid4().hex}")
         self._lock = threading.RLock()
@@ -991,6 +1010,12 @@ class LocalRunner:
                         details={
                             "force": force,
                             "permitted_licenses": dict(self.permitted_licenses),
+                            "molcascade_version": __version__,
+                            "environment": (
+                                None
+                                if self.environment is None
+                                else self.environment.provenance()
+                            ),
                         },
                     )
                 except Exception as raw_error:

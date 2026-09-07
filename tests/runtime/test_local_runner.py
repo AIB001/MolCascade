@@ -975,3 +975,58 @@ def test_explicit_bindings_retain_side_outputs_across_cache_hits(tmp_path: Path)
         ("decisions", DECISION_V1.id),
         ("primary", RAW_MOLECULE_V1.id),
     ]
+
+
+def test_the_run_records_the_machine_it_happened_on(tmp_path: Path) -> None:
+    """Provenance without an environment is provenance missing the interesting part.
+
+    A run already measures this machine -- lane planning calls
+    ``detect_environment``, which forks ``nvidia-smi`` -- and used to keep the
+    worker count and the batch size and drop the rest. That matters because
+    ``stage_cache_key`` hashes no third-party library version: the same
+    configuration under a different RDKit is the same cache entry and a
+    different answer, and nothing recorded which RDKit it was.
+
+    Written to the audit trail rather than to a manifest, following the
+    ``permitted_licenses`` precedent immediately above: ``AuditEvent.details`` is
+    a free-shape mapping that enters no hash, so this costs no contract and
+    leaves every run already on disk readable.
+    """
+
+    from molcascade.environment import detect_environment
+
+    registry = PluginRegistry([FakeSourcePlugin(), FakeGatePlugin()])
+    runner = LocalRunner(
+        tmp_path / "workspace",
+        plugins=registry,
+        environment=detect_environment(),
+    )
+
+    result = runner.run(_pipeline(), run_id="run-provenance")
+
+    assert result.status is RunStatus.SUCCEEDED
+    started = runner.read_events("run-provenance")[0]
+    assert started.event_type == "RUN_STARTED"
+    assert started.details["molcascade_version"]
+    recorded = started.details["environment"]
+    assert isinstance(recorded, dict)
+    assert recorded["platform"]["python_version"]
+    assert "usable_cores" in recorded["cpu"]
+    # GpuDevice excludes UUID and serial because this record is shared; that
+    # reasoning does not stop applying when it reaches an audit log.
+    for gpu in recorded["gpus"]:
+        assert "uuid" not in gpu
+        assert "serial" not in gpu
+
+
+def test_a_runner_given_no_environment_measures_none(tmp_path: Path) -> None:
+    """A runner built without one must not fork a subprocess to inventory a
+    machine nobody asked about, so absent is recorded as absent -- while the
+    package version, which costs nothing to know, is recorded either way."""
+
+    runner, _source, _gate = _runner(tmp_path)
+    runner.run(_pipeline(), run_id="run-bare")
+
+    details = runner.read_events("run-bare")[0].details
+    assert details["environment"] is None
+    assert details["molcascade_version"]

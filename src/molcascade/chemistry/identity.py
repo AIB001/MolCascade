@@ -711,17 +711,25 @@ def _coalesce_notices(
     )
 
 
-def _standardize_graph(
+def _prepared_graph(
     molecule: Chem.Mol,
-    policy: IdentityPolicy,
     *,
     input_notices: tuple[StandardizationNotice, ...],
     metal_disconnector: Any | None,
     normalizer: Any | None,
     reionizer: Any | None,
-    uncharger: Any | None,
-    tautomer_enumerator: Any | None,
-) -> tuple[_ProcessedCandidate, tuple[StandardizationNotice, ...]]:
+) -> tuple[Chem.Mol, list[StandardizationNotice]]:
+    """Everything done to the graph before it is cut into candidate fragments.
+
+    Extracted from :func:`_standardize_graph` unchanged, because where the cut
+    happens decides what "a component" means and a second implementation would
+    drift from this one silently.  Measured: sodium valproate
+    (``CCCC(CCC)C(=O)O[Na]``) and warfarin sodium parse as *one* fragment and
+    become two only after metal disconnection -- so anything that splits on
+    ``.`` before this prefix disagrees with what the run recorded, and would
+    report a fragment split the run never made.
+    """
+
     notices = list(input_notices)
     working = Chem.Mol(molecule)
     try:
@@ -749,6 +757,27 @@ def _standardize_graph(
             "STANDARDIZATION_ERROR",
             f"RDKit standardization failed: {error}",
         ) from error
+    return working, notices
+
+
+def _standardize_graph(
+    molecule: Chem.Mol,
+    policy: IdentityPolicy,
+    *,
+    input_notices: tuple[StandardizationNotice, ...],
+    metal_disconnector: Any | None,
+    normalizer: Any | None,
+    reionizer: Any | None,
+    uncharger: Any | None,
+    tautomer_enumerator: Any | None,
+) -> tuple[_ProcessedCandidate, tuple[StandardizationNotice, ...]]:
+    working, notices = _prepared_graph(
+        molecule,
+        input_notices=input_notices,
+        metal_disconnector=metal_disconnector,
+        normalizer=normalizer,
+        reionizer=reionizer,
+    )
 
     fragments, fragment_count = _candidate_fragments(working, policy)
     processed = tuple(
@@ -844,6 +873,47 @@ class ParentStandardizer:
             else None
         )
 
+    def components(
+        self,
+        *,
+        raw_format: str | None = None,
+        raw_structure: str | None = None,
+        raw_smiles: str | None = None,
+        raw_molblock: str | None = None,
+    ) -> RecordComponents:
+        """The components this record would be cut into, without choosing one.
+
+        Shares :func:`_prepared_graph` with :meth:`standardize` rather than
+        re-deriving the prefix, so the two can never disagree about where a
+        record splits.
+        """
+
+        formatted_mode = raw_format is not None or raw_structure is not None
+        legacy_mode = raw_smiles is not None or raw_molblock is not None
+        if formatted_mode and legacy_mode:
+            raise StandardizationFailure(
+                "RAW_INPUT_MODE_CONFLICT",
+                "formatted raw input cannot be mixed with legacy raw structure fields",
+            )
+        if formatted_mode:
+            molecule, input_notices = _parse_formatted_structure(
+                raw_format, raw_structure, self.policy
+            )
+        else:
+            molecule, input_notices = _parse_structure(raw_smiles, raw_molblock, self.policy)
+        working, _notices = _prepared_graph(
+            molecule,
+            input_notices=input_notices,
+            metal_disconnector=self._metal_disconnector,
+            normalizer=self._normalizer,
+            reionizer=self._reionizer,
+        )
+        pieces = Chem.GetMolFrags(working, asMols=True, sanitizeFrags=False)
+        return RecordComponents(
+            smiles=tuple(Chem.MolToSmiles(piece) for piece in pieces),
+            heavy_atoms=tuple(piece.GetNumHeavyAtoms() for piece in pieces),
+        )
+
     def standardize(
         self,
         *,
@@ -920,6 +990,52 @@ def _cached_standardizer(policy: IdentityPolicy) -> ParentStandardizer:
     return ParentStandardizer(policy)
 
 
+@dataclass(frozen=True, slots=True)
+class RecordComponents:
+    """The disconnected components one library record has, as the run sees them.
+
+    "As the run sees them" is the whole point.  A record is cut into components
+    only after ``RemoveHs``, metal disconnection, normalisation and reionisation
+    -- so sodium valproate, which parses as a single fragment, is two components
+    by the time the choice is made, and anything that split on ``.`` beforehand
+    would disagree with what the run recorded.
+
+    Exposed because de-salting keeps exactly one of these and the run records
+    only that it kept one: ``FRAGMENTS_REMOVED`` says "selected one parent
+    fragment from N components" and never says which N.  Recomputing them is the
+    only way a reader can answer "and what was thrown away".
+    """
+
+    smiles: tuple[str, ...]
+    heavy_atoms: tuple[int, ...]
+
+    @property
+    def count(self) -> int:
+        return len(self.smiles)
+
+
+def record_components(
+    *,
+    raw_format: str | None = None,
+    raw_structure: str | None = None,
+    raw_smiles: str | None = None,
+    raw_molblock: str | None = None,
+    policy: IdentityPolicy | None = None,
+) -> RecordComponents:
+    """Split one raw record the way registration would, without registering it.
+
+    Reuses the standardizer cached per policy, so a caller replaying many
+    records pays for the rule catalogues once.
+    """
+
+    return _cached_standardizer(policy or IdentityPolicy()).components(
+        raw_format=raw_format,
+        raw_structure=raw_structure,
+        raw_smiles=raw_smiles,
+        raw_molblock=raw_molblock,
+    )
+
+
 def standardize_parent(
     *,
     raw_format: str | None = None,
@@ -962,6 +1078,7 @@ __all__ = [
     "PARENT_HASH_SCHEME_VERSION",
     "REGISTRATION_IMPLEMENTATION",
     "ParentStandardizer",
+    "RecordComponents",
     "RegisteredParent",
     "StandardizationFailure",
     "StandardizationNotice",
@@ -969,6 +1086,7 @@ __all__ = [
     "identity_policy_id",
     "parent_id_from_registration",
     "rdkit_identity_metadata",
+    "record_components",
     "registration_scheme",
     "standardize_parent",
 ]

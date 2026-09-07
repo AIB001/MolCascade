@@ -194,6 +194,84 @@ _MODULE_SPECS: tuple[tuple[str, tuple[str, ...], dict[str, Any]], ...] = (
             },
         },
     ),
+    # The other three quarters of the clash check.
+    #
+    # Upstream's ``dock.yml`` runs ``intermolecular_distance`` four times, once
+    # per kind of thing a ligand can be placed inside: protein, organic
+    # cofactors, inorganic cofactors and waters.  This module used to carry only
+    # the protein branch -- along with that branch's own ``ignore_types``, which
+    # names the other three -- so nothing here ever checked whether a pose was
+    # sitting on top of a heme, a catalytic zinc or a bridging water.
+    #
+    # That gap lines up exactly with a decision made one module away.
+    # ``cascade/receptor.py`` keeps metals by default, and says why: "a catalytic
+    # zinc deleted as a 'non-standard residue' changes every score in the tier
+    # and shows up in none of them".  ``--receptor-keep-waters`` and
+    # ``--receptor-keep-heterogens`` keep the other two on request.  So the
+    # receptor that reaches an engine can contain all three, and until now the
+    # pose check ignored every one of them.
+    #
+    # The inorganic branch uses covalent radii rather than van der Waals, which
+    # is upstream's answer to the obvious objection: a ligand coordinating a zinc
+    # is *supposed* to be inside its van der Waals radius, and scored against vdW
+    # every metalloenzyme complex would read as a clash.  Only ``no_clashes`` is
+    # mapped: ``not_too_far_away`` is meaningful for the protein, which a ligand
+    # must be near, and meaningless for a cofactor it has no obligation to touch.
+    #
+    # Available, and deliberately not in :data:`DEFAULT_CHECKS`: turning them on
+    # by default would change what the shipped cascade rejects, on a receptor
+    # whose contents depend on flags the operator chose.  Name them in ``checks``.
+    (
+        "Distance to organic cofactors",
+        ("minimum_distance_to_organic_cofactors",),
+        {
+            "function": "intermolecular_distance",
+            "parameters": {
+                "radius_type": "vdw",
+                "radius_scale": 1.0,
+                "clash_cutoff": 0.75,
+                "ignore_types": ["hydrogens", "protein", "inorganic_cofactors", "waters"],
+                "max_distance": 5.0,
+            },
+            "outputs": {"no_clashes": "minimum_distance_to_organic_cofactors"},
+        },
+    ),
+    (
+        "Distance to inorganic cofactors",
+        ("minimum_distance_to_inorganic_cofactors",),
+        {
+            "function": "intermolecular_distance",
+            "parameters": {
+                # Covalent, not vdw -- see the note above.
+                "radius_type": "covalent",
+                "radius_scale": 1.0,
+                "clash_cutoff": 0.75,
+                "ignore_types": ["hydrogens", "protein", "organic_cofactors", "waters"],
+                "max_distance": 5.0,
+            },
+            "outputs": {"no_clashes": "minimum_distance_to_inorganic_cofactors"},
+        },
+    ),
+    (
+        "Distance to waters",
+        ("minimum_distance_to_waters",),
+        {
+            "function": "intermolecular_distance",
+            "parameters": {
+                "radius_type": "vdw",
+                "radius_scale": 1.0,
+                "clash_cutoff": 0.75,
+                "ignore_types": [
+                    "hydrogens",
+                    "protein",
+                    "organic_cofactors",
+                    "inorganic_cofactors",
+                ],
+                "max_distance": 5.0,
+            },
+            "outputs": {"no_clashes": "minimum_distance_to_waters"},
+        },
+    ),
     (
         "Volume overlap with protein",
         ("volume_overlap_with_protein",),

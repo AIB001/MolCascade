@@ -109,4 +109,74 @@
       notice.textContent = `Copy manually: ${command}`;
     }
   });
+
+  /* Why molecules left.  Placed last on purpose: this is diagnostic rendering,
+     and the IIFE aborts as a unit, so a throw here must not be able to leave
+     the download, restore and copy buttons unwired. */
+  const decisionsRoot = document.getElementById("decisions");
+  const decisions = payload.decisions;
+  const count = (value) => Number(value).toLocaleString("en-US");
+  if (!decisions || !Array.isArray(decisions.stages)) {
+    decisionsRoot.append(
+      text("p", "empty", "This report predates the decision summary."),
+    );
+  } else if (!decisions.stages.length) {
+    decisionsRoot.append(
+      text("p", "empty", "No stage in this run published a decision dataset."),
+    );
+  } else {
+    decisions.stages.forEach((stage) => {
+      const card = text("article", "reason-card", "");
+      card.append(text("h3", "", stage.stage_id));
+      if (stage.unavailable) {
+        card.append(text("p", "caveat", `Unreadable: ${stage.unavailable}`));
+        decisionsRoot.append(card);
+        return;
+      }
+      const facts = text("div", "stage-facts", "");
+      (stage.outcome_totals || []).forEach((total) => {
+        const pill = text(
+          "span",
+          `pill ${String(total.outcome).toLowerCase()}`,
+          `${total.entity_kind} ${total.outcome}: ${count(total.rows)}`,
+        );
+        facts.append(pill);
+      });
+      card.append(facts);
+      /* PASS buckets are the bulk of any healthy run and their totals are
+         already on the line above; itemising them would bury the two outcomes
+         somebody opened this section for. */
+      const removals = (stage.buckets || []).filter(
+        (bucket) => bucket.outcome === "REJECT" || bucket.outcome === "WARN",
+      );
+      if (removals.length) {
+        const table = text("table", "reason-table", "");
+        removals.forEach((bucket) => {
+          const row = text("tr", "", "");
+          row.append(
+            text("td", `outcome ${bucket.outcome.toLowerCase()}`, bucket.outcome),
+            text("td", "reason-code", bucket.reason_code),
+            text("td", "reason-kind", bucket.entity_kind),
+            text("td", "reason-rows", count(bucket.rows)),
+          );
+          table.append(row);
+        });
+        card.append(table);
+      } else if (stage.rows_total) {
+        card.append(text("p", "caveat", "Nothing was removed or warned about here."));
+      }
+      if (stage.untracked_rows) {
+        card.append(
+          text(
+            "p",
+            "caveat",
+            `${count(stage.untracked_rows)} further row(s) fell outside the ` +
+              `${count(decisions.reason_codes_per_stage)} reason codes this report carries; ` +
+              "the totals above still count them. Run molcascade decisions for the full table.",
+          ),
+        );
+      }
+      decisionsRoot.append(card);
+    });
+  }
 })();

@@ -129,15 +129,25 @@ class BackendOption:
     #: Kept as one formatted reference ending in a DOI or URL: the value is
     #: read by people writing a methods section, not parsed.
     citation: str = ""
-    #: Throughput in molecules per second on one lane, or ``None`` when nobody
-    #: has a figure.  ``None`` means unknown, *not* fast.
+    #: Throughput in molecules per second at the width recorded in
+    #: :attr:`throughput_lanes`, or ``None`` when nobody has a figure.  ``None``
+    #: means unknown, *not* fast.
     #:
     #: A lane is one core for the tools that run in this environment and one
     #: card for the isolated GPU engines, which is the unit the pool hands out
     #: in either case.  Those engine numbers are the ones their own papers
     #: report rather than something measured here -- measuring them needs the
     #: hardware and the licence, and the ``notes`` say which figure came from
-    #: where.  Everything else was timed on one core.
+    #: where.  Everything else was timed here, on the width its own note states.
+    #:
+    #: This used to say every figure was a one-core number, and one of them was
+    #: not: ADMET-AI's 7/s is a whole-machine measurement across sixteen cores,
+    #: as its own note has always said.  The prose had already noticed the
+    #: problem once -- the OpenADMET note warns that its figure "is not
+    #: comparable with the 7/s recorded for ADMET-AI two options up" -- and
+    #: fixing it in prose meant every consumer had to read the note to know
+    #: whether two numbers could be divided.  The width is a fact about the
+    #: measurement, so it is a field.
     #:
     #: This is here because tier position is the most consequential decision the
     #: builder lets someone make and the cost of getting it wrong is invisible
@@ -152,6 +162,17 @@ class BackendOption:
     #: consumer here reads as "unknown" -- silencing the warning on the most
     #: expensive tool in the catalogue.
     throughput_per_second: float | None = None
+    #: How many lanes :attr:`throughput_per_second` was measured across.
+    #:
+    #: One for every option but ADMET-AI, and the reason it exists is that the
+    #: exception is invisible without it: a reader comparing 7/s against the
+    #: ChEMBL checker's 100/s concludes ADMET-AI is fourteen times slower, when
+    #: per lane it is closer to two hundred.  Divide only when a per-lane figure
+    #: is what the question needs, and say that the result is an extrapolation
+    #: -- what was measured is the wall clock on the stated width, and a
+    #: sixteen-core measurement does not divide cleanly into sixteen one-core
+    #: ones.
+    throughput_lanes: int = 1
     recommended: bool = False
     #: Whether running this tool requires the operator to accept its licence
     #: terms explicitly, with ``--allow-copyleft``.
@@ -184,6 +205,7 @@ class BackendOption:
             "notes": self.notes,
             "citation": self.citation,
             "throughput_per_second": self.throughput_per_second,
+            "throughput_lanes": self.throughput_lanes,
             "recommended": self.recommended,
             "requires_license_optin": self.requires_license_optin,
             "executable": self.executable,
@@ -1829,7 +1851,13 @@ CRITERIA: tuple[CriterionSpec, ...] = (
                 # already cut, never near the top. A 4090 moves the number by
                 # roughly an order of magnitude; the CPU figure is the one
                 # recorded because it is the one that was measured.
+                #
+                # The only entry in this catalogue whose rate is not a one-lane
+                # figure, which is why 'throughput_lanes' exists: read against
+                # the per-lane numbers around it, 7 understates the cost of this
+                # block by more than an order of magnitude.
                 throughput_per_second=7,
+                throughput_lanes=16,
                 recommended=True,
                 defaults={
                     "schema_version": 1,

@@ -16,7 +16,7 @@ reported when a number could not be read, not a plausible default.
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -212,6 +212,67 @@ class HostEnvironment(_EnvModel):
     def total_gpu_memory_gib(self) -> float | None:
         values = [gpu.memory_total_mib for gpu in self.gpus if gpu.memory_total_mib is not None]
         return round(sum(values) / 1024, 2) if values else None
+
+    def provenance(self) -> dict[str, Any]:
+        """The subset of this measurement worth writing into a run's audit trail.
+
+        A run already measures this machine -- ``_stage_resources`` calls
+        :func:`~molcascade.environment.detect_environment`, which forks
+        ``nvidia-smi`` -- and then keeps only the lane count and the batch size.
+        Everything else was discarded, so a finished run recorded which molecules
+        it kept and nothing at all about the machine that decided that.  A score
+        is a function of the toolkit that computed it, so provenance without an
+        environment is provenance with the interesting part missing.
+
+        Deliberately a summary rather than the whole model.  The audit log is
+        append-only and read by people, and the fields left out -- per-disk
+        capacity, free GPU memory, the execution plan's own rationale -- describe
+        a moment rather than a run.  What is kept is what someone reproducing the
+        run would have to match: the interpreter, the toolkit versions, the
+        accelerator, and how much of the machine was usable.
+
+        The GPU entries carry no UUID or serial: :class:`GpuDevice` excludes them
+        precisely because this record gets shared, and that reasoning does not
+        stop being true here.
+        """
+
+        return {
+            "schema_version": self.schema_version,
+            "platform": {
+                "system": self.platform.system,
+                "release": self.platform.release,
+                "machine": self.platform.machine,
+                "python_version": self.platform.python_version,
+                "python_implementation": self.platform.python_implementation,
+                "in_container": self.platform.in_container,
+                "wsl": self.platform.wsl,
+            },
+            "cpu": {
+                "model_name": self.cpu.model_name,
+                "logical_cores": self.cpu.logical_cores,
+                "usable_cores": self.cpu.usable_cores,
+            },
+            "memory_total_gib": self.memory.total_gib,
+            "accelerator": self.accelerator.value,
+            "gpus": [
+                {
+                    "index": gpu.index,
+                    "name": gpu.name,
+                    "memory_total_mib": gpu.memory_total_mib,
+                    "compute_capability": gpu.compute_capability,
+                }
+                for gpu in self.gpus
+            ],
+            "frameworks": [
+                {
+                    "distribution": framework.distribution,
+                    "version": framework.version,
+                    "build": framework.build,
+                    "accelerated": framework.accelerated,
+                }
+                for framework in self.frameworks
+            ],
+        }
 
 
 __all__ = [

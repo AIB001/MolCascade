@@ -524,3 +524,80 @@ def test_only_the_requested_checks_are_computed(tmp_path: Path) -> None:
 
     verdicts = judge_poses([molecule], receptor=receptor, checks=checks)
     assert set(verdicts[0]) == set(checks)
+
+
+def test_the_clash_check_covers_what_receptor_preparation_keeps() -> None:
+    """A pose was only ever checked against a quarter of the receptor.
+
+    Upstream's ``dock`` configuration runs ``intermolecular_distance`` four
+    times -- protein, organic cofactors, inorganic cofactors, waters -- and this
+    module carried only the protein branch, together with that branch's own
+    ``ignore_types``, which names the other three. So a pose sitting on top of a
+    heme, a catalytic zinc or a bridging water passed.
+
+    That matters here specifically because ``cascade/receptor.py`` keeps metals
+    by default and says why, and offers ``--receptor-keep-waters`` and
+    ``--receptor-keep-heterogens`` for the other two. The receptor that reaches
+    an engine can contain all three.
+    """
+
+    from molcascade.plugins.builtin.docking.pose_quality import (
+        AVAILABLE_CHECKS,
+        DEFAULT_CHECKS,
+        OPTIONAL_CHECKS,
+    )
+
+    added = {
+        "minimum_distance_to_organic_cofactors",
+        "minimum_distance_to_inorganic_cofactors",
+        "minimum_distance_to_waters",
+    }
+    assert added <= set(AVAILABLE_CHECKS)
+    # Requestable, not required: turning them on by default would change what
+    # the shipped cascade rejects, and would do it on a receptor whose contents
+    # depend on flags the operator chose.
+    assert added <= set(OPTIONAL_CHECKS)
+    assert not (added & set(DEFAULT_CHECKS))
+
+
+def test_metal_coordination_is_measured_with_covalent_radii() -> None:
+    """A ligand coordinating a zinc is meant to be inside its vdW radius.
+
+    Scored against van der Waals every metalloenzyme complex would read as a
+    clash, so upstream uses covalent radii for the inorganic branch and only
+    that branch. Getting this backwards would turn the new check into a filter
+    that deletes exactly the complexes it was added to describe.
+    """
+
+    from molcascade.plugins.builtin.docking.pose_quality import _MODULE_SPECS
+
+    radii = {
+        names[0]: spec["parameters"]["radius_type"]
+        for _module, names, spec in _MODULE_SPECS
+        if spec["function"] == "intermolecular_distance"
+    }
+    assert radii["minimum_distance_to_inorganic_cofactors"] == "covalent"
+    assert radii["minimum_distance_to_organic_cofactors"] == "vdw"
+    assert radii["minimum_distance_to_waters"] == "vdw"
+    assert radii["minimum_distance_to_protein"] == "vdw"
+
+
+def test_the_new_branches_do_not_claim_a_maximum_distance() -> None:
+    """A ligand must be near the protein; it owes a cofactor nothing.
+
+    ``intermolecular_distance`` also yields ``not_too_far_away``, which is a
+    real question about the protein and a meaningless one about a water the
+    ligand has no obligation to touch. Mapping it would have added three checks
+    that fail on every correct pose.
+    """
+
+    from molcascade.plugins.builtin.docking.pose_quality import _MODULE_SPECS
+
+    for _module, names, spec in _MODULE_SPECS:
+        if spec["function"] != "intermolecular_distance":
+            continue
+        if names[0] == "minimum_distance_to_protein":
+            assert "not_too_far_away" in spec["outputs"]
+        else:
+            assert "not_too_far_away" not in spec["outputs"]
+            assert len(names) == 1

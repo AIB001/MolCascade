@@ -222,3 +222,49 @@ def test_every_criterion_resolves_to_a_default_backend() -> None:
         default = criterion.default_option
         assert default is not None, f"{criterion.id} has no default"
         assert default.executable, f"{criterion.id} defaults to an option that cannot run"
+
+
+def test_every_recorded_rate_declares_the_width_it_was_measured_at() -> None:
+    """A rate is only comparable against another rate at the same width.
+
+    The catalogue's rates are what decide where a block is placed, and a reader
+    comparing ADMET-AI's 7/s against the ChEMBL checker's 100/s concludes the
+    model is fourteen times slower. It is not: 7/s is a whole-machine figure
+    across sixteen cores, so per lane it is nearer 0.44/s and the model is two
+    hundred times slower. The field used to claim every figure was a one-core
+    number while that one was not, and the prose had already tripped over it --
+    the OpenADMET note warns its own figure is "not comparable with the 7/s
+    recorded for ADMET-AI two options up".
+
+    So the width is a field. This pins the one exception, because an exception
+    nobody can see is the failure mode being fixed.
+    """
+
+    from molcascade.cascade.catalog import CRITERIA
+
+    multi_lane = {
+        (spec.id, option.id): option.throughput_lanes
+        for spec in CRITERIA
+        for option in spec.options
+        if option.throughput_lanes != 1
+    }
+    assert multi_lane == {("admet_endpoint", "admet_ai_v2"): 16}
+
+    for spec in CRITERIA:
+        for option in spec.options:
+            assert option.throughput_lanes >= 1, (spec.id, option.id)
+            if option.throughput_per_second is None:
+                # Unknown must stay unknown: a width without a rate would read
+                # as a measurement nobody took.
+                assert option.throughput_lanes == 1, (spec.id, option.id)
+
+
+def test_the_width_travels_with_the_rate_into_the_builder_payload() -> None:
+    """Whoever renders the rate must be able to see what it was measured on."""
+
+    from molcascade.cascade.catalog import CRITERIA
+
+    for spec in CRITERIA:
+        for option, payload in zip(spec.options, spec.as_json()["options"], strict=True):
+            assert payload["throughput_lanes"] == option.throughput_lanes
+            assert payload["throughput_per_second"] == option.throughput_per_second

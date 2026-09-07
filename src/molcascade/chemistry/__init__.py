@@ -13,6 +13,7 @@ from molcascade.chemistry.identity import (
     PARENT_HASH_SCHEME_VERSION,
     REGISTRATION_IMPLEMENTATION,
     ParentStandardizer,
+    RecordComponents,
     RegisteredParent,
     StandardizationFailure,
     StandardizationNotice,
@@ -20,6 +21,7 @@ from molcascade.chemistry.identity import (
     identity_policy_id,
     parent_id_from_registration,
     rdkit_identity_metadata,
+    record_components,
     registration_scheme,
     standardize_parent,
 )
@@ -60,6 +62,7 @@ __all__ = [
     "IsotopePolicy",
     "MetalDisconnectionPolicy",
     "ParentStandardizer",
+    "RecordComponents",
     "RegisteredParent",
     "RegistrationHashVersion",
     "StandardizationFailure",
@@ -72,6 +75,7 @@ __all__ = [
     "identity_policy_id",
     "parent_id_from_registration",
     "rdkit_identity_metadata",
+    "record_components",
     "registration_scheme",
     "standardize_parent",
 ]

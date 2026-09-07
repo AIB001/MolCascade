@@ -641,3 +641,139 @@ def test_an_operator_supplied_pdbqt_is_used_instead_of_deriving_one(
     assert resolved is not None
     assert resolved.target.receptor_pdbqt_path == str(prepared)
     assert resolved.notes == ()
+
+
+def _dock_stage(stage_id: str, plugin: str, receptor: Path, *, enabled: bool = True) -> StageConfig:
+    return StageConfig(
+        id=stage_id,
+        slot="dock",
+        plugin=plugin,
+        enabled=enabled,
+        config={"receptor_path": str(receptor), **_box_settings()},  # type: ignore[arg-type]
+    )
+
+
+def _pdb(path: Path, *, hydrogens: bool) -> Path:
+    lines = [
+        "ATOM      1  N   ALA A   1      11.104  13.207  10.000  1.00  0.00           N",
+        "ATOM      2  CA  ALA A   1      12.560  13.207  10.000  1.00  0.00           C",
+    ]
+    if hydrogens:
+        lines.append(
+            "ATOM      3  H   ALA A   1      11.500  13.900  10.400  1.00  0.00           H"
+        )
+    path.write_text("\n".join(lines) + "\nEND\n", encoding="utf-8")
+    return path
+
+
+def test_a_receptor_without_hydrogens_is_reported_and_never_refused(tmp_path: Path) -> None:
+    """The engines each protonate by their own rule and none of them says so.
+
+    ``cascade/receptor.py`` repairs a structure and never calls
+    ``addMissingHydrogens``, while ``gnina.py`` states it wants a PDB with
+    hydrogens. Today that gap is silent. It must stay an advisory: this is the
+    ordinary state of a deposited structure, so a check that could block would
+    fire on nearly every run and teach people to silence it.
+    """
+
+    from molcascade.backends.preflight import preflight_docking_advisories
+
+    registry = create_builtin_registry()
+    bare = _pdb(tmp_path / "bare.pdb", hydrogens=False)
+    stages = [_dock_stage("dock", "docking.unidock@0.2.0", bare)]
+
+    advisories = preflight_docking_advisories(stages, registry=registry)
+    assert [a.code for a in advisories] == ["DOCKING_RECEPTOR_WITHOUT_HYDROGENS"]
+    assert advisories[0].stage_id == "dock"
+    assert advisories[0].evidence["receptor_path"] == str(bare)
+    # And the blocking check on the same stages still passes: an advisory is
+    # not a refusal wearing a different name. Uni-Dock also requires a prepared
+    # PDBQT, so it is supplied here and nowhere else -- the advisory itself does
+    # not care, which is the property under test.
+    complete = [
+        StageConfig(
+            id="dock",
+            slot="dock",
+            plugin="docking.unidock@0.2.0",
+            config={  # type: ignore[arg-type]
+                "receptor_path": str(bare),
+                "receptor_pdbqt_path": str(tmp_path / "rec.pdbqt"),
+                **_box_settings(),
+            },
+        )
+    ]
+    assert preflight_docking_target(complete, registry=registry) == ("dock",)
+
+
+def test_a_protonated_receptor_says_nothing(tmp_path: Path) -> None:
+    from molcascade.backends.preflight import preflight_docking_advisories
+
+    registry = create_builtin_registry()
+    stages = [
+        _dock_stage("dock", "docking.unidock@0.2.0", _pdb(tmp_path / "h.pdb", hydrogens=True))
+    ]
+    assert preflight_docking_advisories(stages, registry=registry) == ()
+
+
+def test_two_engines_with_independent_geometry_are_named(tmp_path: Path) -> None:
+    """The shipped docking tier's own shape, and the thing it does not say.
+
+    Uni-Dock declares ``ligand_conformer/v1`` and reads the tier's shared
+    conformers; KarmaDock declares only ``parent/v1`` and embeds its own. So a
+    molecule whose SMILES leaves a stereocentre undefined can be scored by the
+    two engines as two different stereoisomers, and the tier's consensus -- whose
+    stated purpose is to make disagreement visible -- would hide that one.
+    Judged by declared contract, not by engine name.
+    """
+
+    from molcascade.backends.preflight import preflight_docking_advisories
+
+    registry = create_builtin_registry()
+    receptor = _pdb(tmp_path / "h.pdb", hydrogens=True)
+    advisories = preflight_docking_advisories(
+        [
+            _dock_stage("docking_score", "docking.unidock@0.2.0", receptor),
+            _dock_stage("docking_score_2", "docking.karmadock@0.3.0", receptor),
+        ],
+        registry=registry,
+    )
+
+    assert [a.code for a in advisories] == ["DOCKING_MIXED_GEOMETRY_SOURCES"]
+    assert advisories[0].evidence["conformer_readers"] == ["docking_score"]
+    assert advisories[0].evidence["own_geometry"] == ["docking_score_2"]
+    assert "molcascade stereo" in advisories[0].detail
+
+
+def test_a_disabled_stage_produces_no_advisory(tmp_path: Path) -> None:
+    """Compilation drops disabled stages, so an advisory about one describes
+    something that will not happen -- worse than saying nothing."""
+
+    from molcascade.backends.preflight import preflight_docking_advisories
+
+    registry = create_builtin_registry()
+    receptor = _pdb(tmp_path / "h.pdb", hydrogens=True)
+    assert (
+        preflight_docking_advisories(
+            [
+                _dock_stage("d1", "docking.unidock@0.2.0", receptor),
+                _dock_stage("d2", "docking.karmadock@0.3.0", receptor, enabled=False),
+            ],
+            registry=registry,
+        )
+        == ()
+    )
+
+
+def test_an_unreadable_receptor_is_not_turned_into_a_verdict(tmp_path: Path) -> None:
+    """The blocking checks already read this file; a failure here is a race."""
+
+    from molcascade.backends.preflight import preflight_docking_advisories
+
+    registry = create_builtin_registry()
+    missing = tmp_path / "gone.pdb"
+    assert (
+        preflight_docking_advisories(
+            [_dock_stage("dock", "docking.unidock@0.2.0", missing)], registry=registry
+        )
+        == ()
+    )

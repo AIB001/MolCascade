@@ -18,7 +18,7 @@ import json
 import sys
 from collections import Counter
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -45,8 +45,10 @@ from molcascade.assets.fetch import fetch_asset, render_manifest
 from molcascade.backends import Availability, ProbePolicy, create_backend_registry
 from molcascade.backends.preflight import (
     TARGET_RUN_TIME_HINT,
+    PreflightAdvisory,
     copyleft_backends,
     preflight_backends,
+    preflight_docking_advisories,
     preflight_docking_target,
     preflight_engine_paths,
 )
@@ -65,7 +67,9 @@ from molcascade.cascade.funnel import build_funnel
 from molcascade.cascade.library import reader_settings
 from molcascade.cascade.target import docking_requirements, merge_target, resolve_target
 from molcascade.config import PipelineConfig
+from molcascade.decisions import build_decision_digest
 from molcascade.environment import detect_environment
+from molcascade.environment.models import HostEnvironment
 from molcascade.errors import (
     AssetError,
     ConfigError,
@@ -74,6 +78,7 @@ from molcascade.errors import (
     PipelineError,
     PluginError,
 )
+from molcascade.explain import explain_molecule
 from molcascade.handoff import materialize_shortlist
 from molcascade.io.atomic import DestinationExistsError, atomic_write_bytes
 from molcascade.parallel import StageResources, count_completed_shards, describe_lanes, plan_lanes
@@ -84,6 +89,7 @@ from molcascade.plugins.builtin.chemprop_model import (
 )
 from molcascade.plugins.builtin.chemprop_model import inspect_chemprop_bundle
 from molcascade.plugins.builtin.custom_model import inspect_model_bundle
+from molcascade.recall import measure_recall
 from molcascade.runtime import (
     AuditEvent,
     LocalRunner,
@@ -94,6 +100,7 @@ from molcascade.runtime import (
     stage_cache_key,
 )
 from molcascade.runtime.models import validate_run_id
+from molcascade.stereo import reconcile_stereo
 from molcascade.trace import trace_run
 from molcascade.ui import generate_cascade_builder, generate_config_builder
 from molcascade.ui.report import generate_run_report
@@ -730,6 +737,67 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument("--output", type=Path)
     report.add_argument("--overwrite", action="store_true")
     report.add_argument("--json", action="store_true", dest="json_output")
+
+    decisions = commands.add_parser(
+        "decisions",
+        help="Summarise why molecules left, from the reasons the run already recorded",
+    )
+    decisions.add_argument("run_id")
+    decisions.add_argument("--workspace", type=Path, default=_DEFAULT_WORKSPACE)
+    decisions.add_argument(
+        "--stage",
+        action="append",
+        dest="stages",
+        help="Limit to one stage id; repeatable. Default is every stage",
+    )
+    decisions.add_argument("--json", action="store_true", dest="json_output")
+
+    explain = commands.add_parser(
+        "explain",
+        help="Follow one molecule through a finished run and say what happened to it",
+    )
+    explain.add_argument("run_id")
+    explain.add_argument("--workspace", type=Path, default=_DEFAULT_WORKSPACE)
+    molecule = explain.add_mutually_exclusive_group(required=True)
+    molecule.add_argument(
+        "--smiles",
+        help=(
+            "Structure to look up. Resolved to a parent id under the identity "
+            "policy this run recorded, never under the default"
+        ),
+    )
+    molecule.add_argument(
+        "--parent-id",
+        dest="parent_id",
+        help="A parent id taken as given, for a run whose policy cannot be recovered",
+    )
+    explain.add_argument(
+        "--desalt-limit",
+        type=int,
+        default=200,
+        dest="desalt_limit",
+        help=(
+            "Library rows to re-split when looking for a molecule de-salting "
+            "discarded. About 6 ms each; 0 turns the search off"
+        ),
+    )
+    explain.add_argument("--json", action="store_true", dest="json_output")
+
+    stereo = commands.add_parser(
+        "stereo",
+        help="Report which molecules had a stereocentre chosen by 3D embedding",
+    )
+    stereo.add_argument("run_id")
+    stereo.add_argument("--workspace", type=Path, default=_DEFAULT_WORKSPACE)
+    stereo.add_argument("--json", action="store_true", dest="json_output")
+
+    recall = commands.add_parser(
+        "recall",
+        help="Measure what a finished run's funnel kept, using a panel of known molecules",
+    )
+    recall.add_argument("run_id")
+    recall.add_argument("--workspace", type=Path, default=_DEFAULT_WORKSPACE)
+    recall.add_argument("--json", action="store_true", dest="json_output")
     return parser
 
 
@@ -1523,23 +1591,33 @@ def _pins(backend: str, *, models_dir: str | None, as_json: bool) -> int:
     return 0
 
 
-def _stage_resources(*, workers: int | None, device: str) -> StageResources:
+def _stage_resources(
+    *, workers: int | None, device: str
+) -> tuple[StageResources, HostEnvironment]:
     """Turn one ``--device``/``--workers`` request into this run's lanes.
 
     Measured once, here, rather than per stage: ``detect_environment`` shells
     out to ``nvidia-smi``, and twenty tiers asking the same machine the same
     question twenty times would be twenty subprocesses for one answer.
+
+    The measurement is returned alongside the lanes rather than discarded. It
+    used to be thrown away after two fields were read off it, which left a
+    finished run with no record of the machine that produced it -- and since the
+    stage cache key hashes no third-party library version, the same
+    configuration under a different RDKit is the same cache entry and a
+    different answer. The run writes it into its own audit trail instead.
     """
 
     environment = detect_environment()
     plan = plan_lanes(environment, device=device, workers=workers)
-    return StageResources(
+    resources = StageResources(
         workers=plan.workers,
         devices=plan.devices,
         device_request=device,
         batch_size=environment.plan.recommended_batch_size,
         notes=plan.notes,
     )
+    return resources, environment
 
 
 def _report_lanes(resources: StageResources) -> None:
@@ -1630,6 +1708,7 @@ def _run_pipeline(
     # against its plugin's config model, so a docking stage with no receptor
     # already fails -- with a Pydantic report that never mentions '--receptor'.
     preflight_docking_target(config.stages, registry=registry)
+    advisories = preflight_docking_advisories(config.stages, registry=registry)
     # 'run' used to preflight neither assets nor packages, so the flat-graph
     # entry point could reach the fourth tier before discovering that a weight
     # file was never fetched -- the exact failure 'screen' refuses to ship.  The
@@ -1639,9 +1718,10 @@ def _run_pipeline(
     preflight_assets(compiled.stages)
     preflight_backends(compiled.stages, policy=_probe_policy(allow_copyleft=allow_copyleft))
     permitted = _permitted_licenses(compiled.stages, allow_copyleft=allow_copyleft)
-    resources = _stage_resources(workers=workers, device=device)
+    resources, environment = _stage_resources(workers=workers, device=device)
     if not as_json:
         _report_target(docking_target, target_notes)
+        _report_advisories(advisories)
         _report_licenses(permitted)
         _report_lanes(resources)
     runner = LocalRunner(
@@ -1649,6 +1729,7 @@ def _run_pipeline(
         plugins=registry,
         resources=resources,
         permitted_licenses=permitted,
+        environment=environment,
     )
     result = runner.run(
         config,
@@ -1782,6 +1863,19 @@ def _docking_target(
     return resolved.target, resolved.notes
 
 
+def _report_advisories(advisories: Sequence[PreflightAdvisory]) -> None:
+    """Say the things that are worth knowing but are not reasons to refuse.
+
+    Printed before the run rather than collected after it: both advisories are
+    about a decision the run is *about* to make on the operator's behalf, and an
+    observation delivered after the fact is a post-mortem rather than a choice.
+    """
+
+    for advisory in advisories:
+        print(f"Advisory [{advisory.code}]: {advisory.message}")
+        print(f"  {advisory.detail}")
+
+
 def _report_target(target: TargetConfig | None, notes: Sequence[str]) -> None:
     """Say which protein, and say which numbers were computed rather than typed."""
 
@@ -1875,6 +1969,7 @@ def _screen(
     # against its plugin's config model, so a docking stage with no receptor
     # already fails -- with a Pydantic report that never mentions '--receptor'.
     preflight_docking_target(pipeline.stages, registry=registry)
+    advisories = preflight_docking_advisories(pipeline.stages, registry=registry)
     compiled = PipelineCompiler(registry).compile(pipeline)
 
     # Where each out-of-process engine is installed, asked here because it is
@@ -1900,7 +1995,7 @@ def _screen(
     # Before the dry-run branch as well: '--dry-run --device cuda' on a machine
     # with no card is a question worth being able to ask, and the answer must be
     # the same refusal a real run would give.
-    resources = _stage_resources(workers=workers, device=device)
+    resources, environment = _stage_resources(workers=workers, device=device)
 
     if dry_run:
         payload = {
@@ -1915,6 +2010,7 @@ def _screen(
             "permitted_licenses": dict(permitted),
             "target": None if docking_target is None else docking_target.model_dump(mode="json"),
             "target_notes": list(target_notes),
+            "advisories": [advisory.as_dict() for advisory in advisories],
         }
         if as_json:
             _json_dump(payload, sys.stdout)
@@ -1923,6 +2019,7 @@ def _screen(
             print(f"Library: {library}")
             print(f"Revision: {compiled.revision_id}")
             _print_planned_funnel(lowered, screening)
+            _report_advisories(advisories)
             if provisioned:
                 print(f"Vendored assets ready: {', '.join(provisioned)}")
             if installed:
@@ -1941,6 +2038,7 @@ def _screen(
         plugins=registry,
         resources=resources,
         permitted_licenses=permitted,
+        environment=environment,
     )
     result = runner.run(pipeline, run_id=run_id, resume=resume, force=force)
 
@@ -2085,8 +2183,24 @@ def _read_existing_run(workspace: Path, run_id: str) -> tuple[Path, RunState]:
     return workspace_root, state
 
 
-def _runner_for_existing_run(workspace: Path, run_id: str) -> tuple[LocalRunner, RunState]:
-    """Verify an initialized workspace and exact state/revision before mutation."""
+def _runner_for_existing_run(
+    workspace: Path,
+    run_id: str,
+    *,
+    verify_checkpoints: bool = True,
+) -> tuple[LocalRunner, RunState]:
+    """Verify an initialized workspace and exact state/revision before mutation.
+
+    ``verify_checkpoints=False`` is for the read-only diagnostics.
+    :func:`_verify_compiled_checkpoints` re-derives every completed stage's cache
+    key *and* re-hashes every byte of every artifact behind it, which is what a
+    command that is about to publish a product should do -- and which for a run
+    that kept its poses is minutes of hashing to answer a question about four
+    narrow string columns.  The manifest's own identity is still checked on every
+    read, and ``resolve_dataset`` still refuses a reference that does not match
+    it or a path that escapes the artifact directory; what is skipped is proving
+    the bytes are reusable, and a diagnostic does not reuse them.
+    """
 
     workspace_root, state = _read_existing_run(workspace, run_id)
     required_directories = (
@@ -2122,7 +2236,8 @@ def _runner_for_existing_run(workspace: Path, run_id: str) -> tuple[LocalRunner,
             code="RUNTIME_STATE_INVALID",
             context={"run_id": state.run_id, "revision_id": state.revision_id},
         )
-    _verify_compiled_checkpoints(runner, state, compiled.stages)
+    if verify_checkpoints:
+        _verify_compiled_checkpoints(runner, state, compiled.stages)
     return runner, state
 
 
@@ -2328,6 +2443,89 @@ def _report(
         _json_dump({"path": str(generated), "run_id": run_id}, sys.stdout)
     else:
         print(f"Generated run report: {generated}")
+    return 0
+
+
+def _decisions(
+    run_id: str,
+    *,
+    workspace: Path,
+    stages: Sequence[str] | None,
+    as_json: bool,
+) -> int:
+    """Read back the reasons this run recorded for the molecules it removed."""
+
+    runner, _ = _runner_for_existing_run(workspace, run_id, verify_checkpoints=False)
+    digest = build_decision_digest(runner, run_id)
+    if stages:
+        wanted = set(stages)
+        known = {stage.stage_id for stage in digest.stages}
+        unknown = sorted(wanted - known)
+        if unknown:
+            raise PipelineError(
+                f"run {run_id} has no such stage: {', '.join(unknown)}",
+                code="DECISIONS_STAGE_UNKNOWN",
+                hint="Run without --stage to list every stage this run executed.",
+                context={"run_id": run_id, "unknown": unknown},
+            )
+        digest = replace(
+            digest,
+            stages=tuple(stage for stage in digest.stages if stage.stage_id in wanted),
+        )
+    if as_json:
+        _json_dump(digest.as_dict(), sys.stdout)
+    else:
+        print(digest.render())
+    return 0
+
+
+def _explain(
+    run_id: str,
+    *,
+    workspace: Path,
+    smiles: str | None,
+    parent_id: str | None,
+    desalt_limit: int,
+    as_json: bool,
+) -> int:
+    """Say what this run did about one molecule, and why."""
+
+    runner, _ = _runner_for_existing_run(workspace, run_id, verify_checkpoints=False)
+    verdict = explain_molecule(
+        runner, run_id, smiles=smiles, parent_id=parent_id, desalt_limit=desalt_limit
+    )
+    if as_json:
+        _json_dump(verdict.as_dict(), sys.stdout)
+    else:
+        print(verdict.render())
+    return 0
+
+
+def _stereo(run_id: str, *, workspace: Path, as_json: bool) -> int:
+    """Say which docked structures name stereochemistry their parent does not."""
+
+    runner, _ = _runner_for_existing_run(workspace, run_id, verify_checkpoints=False)
+    summary = reconcile_stereo(runner, run_id)
+    if as_json:
+        _json_dump(summary.as_dict(), sys.stdout)
+    else:
+        print(summary.render())
+    return 0
+
+
+def _recall(run_id: str, *, workspace: Path, as_json: bool) -> int:
+    """Report what this run's funnel kept of the panel it was given.
+
+    Reads only; it never writes a threshold back. A tool that retuned a cascade
+    from its own measurement would make the next measurement unfalsifiable.
+    """
+
+    runner, _ = _runner_for_existing_run(workspace, run_id, verify_checkpoints=False)
+    report = measure_recall(runner, run_id)
+    if as_json:
+        _json_dump(report.as_dict(), sys.stdout)
+    else:
+        print(report.render())
     return 0
 
 
@@ -2737,6 +2935,34 @@ def _dispatch_canonical(arguments: argparse.Namespace) -> int:
             workspace=arguments.workspace,
             output=arguments.output,
             overwrite=arguments.overwrite,
+            as_json=arguments.json_output,
+        )
+    if arguments.command == "decisions":
+        return _decisions(
+            arguments.run_id,
+            workspace=arguments.workspace,
+            stages=arguments.stages,
+            as_json=arguments.json_output,
+        )
+    if arguments.command == "explain":
+        return _explain(
+            arguments.run_id,
+            workspace=arguments.workspace,
+            smiles=arguments.smiles,
+            parent_id=arguments.parent_id,
+            desalt_limit=arguments.desalt_limit,
+            as_json=arguments.json_output,
+        )
+    if arguments.command == "stereo":
+        return _stereo(
+            arguments.run_id,
+            workspace=arguments.workspace,
+            as_json=arguments.json_output,
+        )
+    if arguments.command == "recall":
+        return _recall(
+            arguments.run_id,
+            workspace=arguments.workspace,
             as_json=arguments.json_output,
         )
     raise PipelineError("no command selected", code="CLI_COMMAND_REQUIRED")
