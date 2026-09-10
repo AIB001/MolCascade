@@ -1721,6 +1721,140 @@ CRITERIA: tuple[CriterionSpec, ...] = (
                     for name, label, help_text in _RD_FILTERS_SETS
                 ),
             ),
+            BackendOption(
+                id="lilly_medchem",
+                label="Lilly Medchem Rules (Bruns/Watson)",
+                engine="LillyMol",
+                summary=(
+                    "The 275 Lilly queries, which unlike every other collection here "
+                    "are graded: a nitro group earns 60 demerits, a hexyl chain 50, "
+                    "and the totals add up across motifs, so a molecule with no single "
+                    "disqualifying group can still be rejected for accumulating "
+                    "blemishes. The total is published as evidence."
+                ),
+                plugin_ref="chemistry.lilly_medchem@0.1.0",
+                license_spdx="Apache-2.0",
+                citation=(
+                    "Bruns RF, Watson IA. Rules for Identifying Potentially Reactive or "
+                    "Promiscuous Compounds. J Med Chem. 2012;55(22):9763-9772. "
+                    "doi:10.1021/jm301008n"
+                ),
+                # The rules are medchem data files; the four executables come from
+                # the conda package and are declared on the backend spec instead.
+                requires=("medchem",),
+                requires_assets=(),
+                # Measured on 2,000 molecules of a generated library: 0.4 s of
+                # RDKit kekulization plus 0.3 s in the C++ pipeline. The fastest
+                # alert backend here by an order of magnitude, because the
+                # matching is compiled and the process is paid for once a batch
+                # rather than once a molecule.
+                throughput_per_second=2900,
+                defaults={
+                    "schema_version": 1,
+                    "mode": "relaxed",
+                    "rejection_action": "warn",
+                    "demerit_action": "warn",
+                    "unreadable_action": "warn",
+                },
+                notes=(
+                    "Two separate installs, and neither implies the other. "
+                    "'conda install -c conda-forge lilly-medchem-rules' provides the "
+                    "four executables and no rules at all; the 275 queries ship as "
+                    "data inside medchem.\n\n"
+                    "Every action defaults to 'warn', and the measurement is the "
+                    "reason. Against the panel of approved oral drugs these rules "
+                    "reject 17 of 77 -- amoxicillin, aspirin, dexamethasone, "
+                    "metformin, ranitidine among them, and ibrutinib, lapatinib and "
+                    "sunitinib, which are marketed kinase inhibitors. A cascade aimed "
+                    "at a kinase cannot delete a fifth of the approved drugs in its "
+                    "own chemotype by default.\n\n"
+                    "That is not an argument against the rules, which enrich better "
+                    "than anything else in this catalogue when a project measures "
+                    "them on its own actives: on a panel of 231 molecules with "
+                    "measured STK17B affinity they reject 7.7% of those below 100 nM "
+                    "and 80.2% of the generated library screened beside it. It is an "
+                    "argument for reading the demerit total this stage publishes, "
+                    "deciding a cutoff against your own panel, and only then setting "
+                    "an action to 'reject'."
+                ),
+                thresholds=(
+                    ThresholdField(
+                        name="mode",
+                        label="Rule set mode",
+                        kind="choice",
+                        choices=(
+                            ("relaxed", "Relaxed: 7-50 heavy atoms, rejection at 160 demerits"),
+                            ("regular", "Regular: the published default, 7-40 atoms, rejection at 100"),
+                            ("rejections_only", "Outright rejections only, no demerit scoring"),
+                        ),
+                        help=(
+                            "Relaxed is the authors' own wider setting and loses two "
+                            "fewer approved drugs than regular; rejections_only "
+                            "produces no demerit total at all."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="rejection_action",
+                        label="When an outright rejection rule fires",
+                        kind="choice",
+                        choices=_ALERT_ACTIONS,
+                        help=(
+                            "The atom-count bounds and the two rejection query sets. "
+                            "Rejecting here costs 12 of 77 approved oral drugs."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="demerit_action",
+                        label="When the demerit total passes the cutoff",
+                        kind="choice",
+                        choices=_ALERT_ACTIONS,
+                        help=(
+                            "The accumulation case, which no boolean catalogue can "
+                            "find. Costs 5 further approved drugs at the default cutoff."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="demerit_cutoff",
+                        label="Demerit rejection cutoff",
+                        kind="integer",
+                        minimum=1,
+                        maximum=10_000,
+                        step=10,
+                        nullable=True,
+                        help=(
+                            "Blank leaves the mode's own cutoff: 100 for regular, the "
+                            "value the 2012 paper defines, and 160 for relaxed."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="soft_upper_atom_count",
+                        label="Heavy atoms above which size is demerited",
+                        kind="integer",
+                        minimum=1,
+                        maximum=1_000,
+                        step=1,
+                        nullable=True,
+                        help=(
+                            "Size demerits ramp from here to the hard bound. Blank "
+                            "uses the mode's value. Worth checking against your own "
+                            "actives: potent kinase inhibitors often sit inside the "
+                            "ramp, so they carry size demerits before any liability."
+                        ),
+                    ),
+                    ThresholdField(
+                        name="unreadable_action",
+                        label="When LillyMol cannot interpret the structure",
+                        kind="choice",
+                        choices=_ALERT_ACTIONS,
+                        help=(
+                            "LillyMol and RDKit disagree about aromaticity in some "
+                            "fused systems; about 3 in 1,000 of a generated library "
+                            "survive kekulization and still fail to parse. An engine "
+                            "that could not read a molecule has said nothing about it."
+                        ),
+                    ),
+                ),
+            ),
         ),
     ),
     CriterionSpec(

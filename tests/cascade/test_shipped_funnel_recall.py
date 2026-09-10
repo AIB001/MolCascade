@@ -95,7 +95,7 @@ _MEASURED_SHAPE: dict[str, tuple[str, tuple[str, ...]]] = {
     "t1_chemistry": ("all", ("structure_validity",)),
     "t2_physchem": ("all", ("physchem_window", "ring_topology", "aromatic_ring_count")),
     "t3_druglike": ("all", ("druglike_ro5_qed", "druglike_oral_consensus")),
-    "t4_alerts": ("all", ("alerts_rdkit", "alerts_medchem")),
+    "t4_alerts": ("all", ("alerts_rdkit", "alerts_medchem", "alerts_lilly_demerits")),
     "t5_synthesis": ("any", ("synthesis_sa_score", "synthesis_scscore")),
     "t7_structure_qc": ("all", ("structure_qc_chembl",)),
 }

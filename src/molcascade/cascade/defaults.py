@@ -716,6 +716,41 @@ def _alerts_tier(registry: PluginRegistry) -> TierConfig | None:
                     "nibr_compound_class_action": "warn",
                 },
             ),
+            _criterion_if_available(
+                "structural_alerts",
+                registry,
+                option_id="lilly_medchem",
+                config_id="alerts_lilly_demerits",
+                label="Graded demerits · Lilly Medchem Rules",
+                settings={
+                    # The only graded arm in this tier. The other two answer
+                    # "does it match"; this one answers "how much is wrong with
+                    # it", summing demerits across motifs so that a molecule
+                    # with no single disqualifying group can still be flagged for
+                    # accumulating blemishes. That total is published as
+                    # derived_metric evidence and travels to the report.
+                    #
+                    # Every action warns, and the panel is why. These 275 rules
+                    # reject 17 of the 77 approved oral drugs -- amoxicillin,
+                    # aspirin, dexamethasone, metformin, ranitidine, and
+                    # ibrutinib, lapatinib and sunitinib, which are marketed
+                    # kinase inhibitors. A default that deletes a fifth of known
+                    # drug space, concentrated in the chemotype most cascades are
+                    # aimed at, is not a default.
+                    #
+                    # The rules are still the best-enriching thing in the
+                    # catalogue once a project measures them on its own actives:
+                    # against 231 molecules with measured STK17B affinity they
+                    # reject 7.7% of those below 100 nM and 80.2% of the
+                    # generated library screened beside them. That is an argument
+                    # for reading the demerit total and choosing a cutoff, not
+                    # for inheriting one.
+                    "mode": "relaxed",
+                    "rejection_action": "warn",
+                    "demerit_action": "warn",
+                    "unreadable_action": "warn",
+                },
+            ),
         )
         if criterion is not None
     ]
@@ -731,9 +766,16 @@ def _alerts_tier(registry: PluginRegistry) -> TierConfig | None:
             "unstable groups, known assay-destroying functionality. Everything else "
             "-- interference hypotheses, screening-deck hygiene, medicinal-chemistry "
             "taste -- is recorded as a warning and travels with the molecule to the "
-            "report. Both arms use union rather than a vote, which is the right way "
+            "report. The arms use union rather than a vote, which is the right way "
             "round for hazards: one catalogue seeing a beta-lactam is enough, and "
-            "waiting for a second opinion would only let it through."
+            "waiting for a second opinion would only let it through.\n\n"
+            "The third arm answers a different question from the other two. They ask "
+            "whether a molecule matches something; it asks how much is wrong with the "
+            "molecule, summing graded demerits across motifs and publishing the total "
+            "as evidence. Nothing is rejected on that total by default -- on the "
+            "approved-drug panel it would cost a fifth of them, kinase inhibitors "
+            "included -- so it arrives as a number to threshold rather than a verdict "
+            "already taken."
         ),
     )
 

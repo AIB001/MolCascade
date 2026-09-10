@@ -37,6 +37,7 @@ from molcascade.plugins.builtin.features import (
     RDKitPropertyPlugin,
 )
 from molcascade.plugins.builtin.hard_gate import RDKitHardGatePlugin
+from molcascade.plugins.builtin.lilly_medchem import LillyMedchemPlugin
 from molcascade.plugins.builtin.medchem_alerts import MedchemAlertsPlugin
 from molcascade.plugins.builtin.medchem_rules import MedchemRulesPlugin
 from molcascade.plugins.builtin.mordred_gate import MordredDescriptorGatePlugin
@@ -79,6 +80,7 @@ BUILTIN_STAGE_PLUGINS: tuple[StagePlugin, ...] = (
     RDKitDrugLikenessPlugin(),
     MedchemRulesPlugin(),
     RDKitStructuralAlertPlugin(),
+    LillyMedchemPlugin(),
     MedchemAlertsPlugin(),
     RdFiltersAlertsPlugin(),
     NativeDecisionJoinPlugin(),
