@@ -624,6 +624,91 @@ SHORTLIST_EXPORT_V1 = DataContract(
     },
 )
 
+
+MD_SYSTEM_INPUT_V1 = DataContract(
+    id="md_system_input/v1",
+    schema=_schema(
+        "md_system_input/v1",
+        [
+            pa.field("parent_id", pa.string(), nullable=False),
+            pa.field("method_id", pa.string(), nullable=False),
+            # Nullable for the same reason derived_metric/v1's value is: a molecule
+            # whose geometry could not be produced keeps a row saying so, because a
+            # missing row is read downstream as a molecule that was fine.
+            pa.field("molblock", pa.large_string(), nullable=True),
+            pa.field("coordinate_source", pa.string(), nullable=False),
+            pa.field("hydrogens", pa.string(), nullable=False),
+            pa.field("heavy_atom_count", pa.int32(), nullable=True),
+            pa.field("hydrogen_count", pa.int32(), nullable=True),
+            pa.field("formal_charge", pa.int32(), nullable=True),
+            # The isomeric SMILES re-derived from the coordinates that are in this
+            # row, which is not the same string as the name the molecule is filed
+            # under whenever embedding settled an unspecified centre.
+            pa.field("stereo_smiles", pa.large_string(), nullable=True),
+            pa.field("parent_smiles", pa.large_string(), nullable=False),
+            pa.field("protonation_state_id", pa.string(), nullable=False),
+            # Null unless coordinate_source is DOCKED_POSE. A pose is only meaningful
+            # against the receptor it was scored in, so the digest travels with it.
+            pa.field("receptor_id", pa.string(), nullable=True),
+            pa.field("status", pa.string(), nullable=False),
+            pa.field("status_detail", pa.string(), nullable=True),
+        ],
+    ),
+    primary_key=("parent_id", "method_id"),
+    enums={
+        # TWO_D_DEPICTION is a legal value on purpose. A producer that has only a
+        # flat depiction must be able to say so; what it must not be able to do is
+        # stay silent, which is the state this contract exists to abolish.
+        "coordinate_source": (
+            "DOCKED_POSE",
+            "EMBEDDED_CONFORMER",
+            "TWO_D_DEPICTION",
+            "NONE",
+        ),
+        "hydrogens": ("EXPLICIT_ALL", "POLAR_ONLY", "IMPLICIT", "UNKNOWN"),
+        "status": ("OK", "NO_GEOMETRY", "UNREADABLE"),
+    },
+    invariants={
+        "declared_not_inferred": (
+            "every field here is a statement the producer had to make rather than a "
+            "property a consumer may infer from the molblock; a simulation stack "
+            "given a structure cannot tell a deliberate neutral form from an "
+            "accidental one, and a flat depiction parameterises and simulates as "
+            "readily as a docked pose"
+        ),
+        "two_d_is_not_a_structure": (
+            "TWO_D_DEPICTION means the coordinates are a drawing -- every z is zero "
+            "and the layout is arbitrary -- so a record carrying it is fit for "
+            "depiction and for nothing that integrates a force field; the value "
+            "exists so that the fact is recorded rather than discovered by reading "
+            "coordinates nobody thought to read"
+        ),
+        "implicit_hydrogens_are_not_a_molecule": (
+            "IMPLICIT means the record names heavy atoms only; a force-field build "
+            "from it produces a topology with no hydrogens, which is chemically "
+            "wrong and which every downstream validator accepts"
+        ),
+        "pose_is_bound_to_its_receptor": (
+            "receptor_id is non-null whenever coordinate_source is DOCKED_POSE, "
+            "because a pose re-used against different receptor bytes -- a "
+            "re-protonated site, a different chain, a repaired residue -- is a pose "
+            "in a different potential and the number computed from it is not "
+            "comparable to the one that selected it"
+        ),
+        "stereochemistry_is_what_was_built": (
+            "stereo_smiles describes the one isomer these coordinates are, while "
+            "parent_smiles may name a set of them; distance geometry settles "
+            "unspecified centres from a seeded hash, so the two strings disagreeing "
+            "is ordinary rather than exceptional and is the reason both are carried"
+        ),
+        "handoff_not_result": (
+            "this contract hands a structure to a simulation stack and asserts "
+            "nothing about binding; it records what will be simulated, not what the "
+            "simulation found"
+        ),
+    },
+)
+
 BUILTIN_CONTRACTS = (
     RAW_MOLECULE_V1,
     RAW_MOLECULE_V2,
@@ -643,6 +728,7 @@ BUILTIN_CONTRACTS = (
     CLUSTER_ASSIGNMENT_V1,
     SELECTION_DECISION_V1,
     SHORTLIST_EXPORT_V1,
+    MD_SYSTEM_INPUT_V1,
 )
 
 __all__ = [

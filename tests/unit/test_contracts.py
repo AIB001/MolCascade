@@ -67,6 +67,7 @@ def test_builtin_contracts_are_exact_versioned_and_toolkit_neutral() -> None:
         "drug_likeness/v1",
         "fingerprint/v1",
         "ligand_conformer/v1",
+        "md_system_input/v1",
         "prediction/v1",
         "property/v1",
         "scaffold_assignment/v1",

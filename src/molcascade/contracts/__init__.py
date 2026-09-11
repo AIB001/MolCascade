@@ -25,6 +25,7 @@ from molcascade.contracts.schemas import (
     RAW_MOLECULE_V2,
     SCAFFOLD_ASSIGNMENT_V1,
     SELECTION_DECISION_V1,
+    MD_SYSTEM_INPUT_V1,
     SHORTLIST_EXPORT_V1,
     SYNTHESIS_SCORE_V1,
 )
@@ -54,6 +55,7 @@ __all__ = [
     "RAW_MOLECULE_V2",
     "SCAFFOLD_ASSIGNMENT_V1",
     "SELECTION_DECISION_V1",
+    "MD_SYSTEM_INPUT_V1",
     "SHORTLIST_EXPORT_V1",
     "SYNTHESIS_SCORE_V1",
     "ContractRegistry",
