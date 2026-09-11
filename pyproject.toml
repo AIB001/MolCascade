@@ -74,6 +74,11 @@ all-backends = [
   "pdbfixer>=1.9,<2",
   "posebusters>=0.6,<1",
 ]
+# The agent interface, and the one extra here that is not a screening backend.
+# Kept optional because a screening run needs none of it: somebody driving
+# MolCascade from a terminal or a script should not be made to install a server
+# framework, and the adapter reports how to get it rather than failing on import.
+mcp = ["mcp[cli]>=1.2"]
 dev = [
   "hypothesis>=6.100,<7",
   "mypy>=1.13,<2",

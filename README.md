@@ -683,6 +683,67 @@ file, with its licence, its pip requirement, and its paper. It is generated from
 catalogue rather than maintained by hand, and a test fails if any option is added without a
 reference — so the bibliography cannot quietly fall behind the tools.
 
+## Driving it from an agent (MCP)
+
+MolCascade ships an MCP server so an agent can plan, run and audit a screen through
+structured tool calls instead of parsing terminal output. Same library, same contracts,
+same artifacts as the CLI; nothing about a run changes because an agent started it.
+
+**Where it lives**
+
+| Path | What it is |
+| --- | --- |
+| `src/molcascade/mcp_server.py` | Entry point. `python -m molcascade.mcp_server` |
+| `src/molcascade/mcp/__init__.py` | Builds the shared `FastMCP("molcascade")` instance and registers every submodule |
+| `src/molcascade/mcp/_common.py` | stdout guard, error envelope, absolute-path checks, workspace resolution |
+| `src/molcascade/mcp/environment.py` | `doctor`, `environment`, `plugins`, `citations`, `assets` |
+| `src/molcascade/mcp/configuration.py` | `validate_config`, `inspect_bundle`, `generate_builder` |
+| `src/molcascade/mcp/screening.py` | `plan_screen`, `screen`, `run_status` |
+| `src/molcascade/mcp/results.py` | `export_shortlist`, `trace_run_stages`, `generate_report` |
+| `src/molcascade/mcp/audit.py` | `summarise_decisions`, `explain_molecule`, `audit_stereochemistry`, `measure_recall` |
+| `src/molcascade/mcp/resources.py` | `molcascade://overview`, `molcascade://contracts`, and the `calibrate_a_funnel` prompt |
+
+Eighteen tools, grouped by the question they answer: *can this machine do it*, *is this
+configuration valid and what would it build*, *run it and how did it go*, *give me the
+product*, *why did it decide that*.
+
+**Installing and registering**
+
+```bash
+pip install -e '.[mcp]'          # the SDK is optional; a screening run needs none of it
+
+claude mcp add --transport stdio molcascade -- \
+  /path/to/env/bin/python -m molcascade.mcp_server
+```
+
+Name the interpreter explicitly. MolCascade's backends live in the environment it was
+installed into, and a bare `python` resolves to whatever is first on the client's PATH —
+which is how a server comes up reporting every backend unavailable.
+
+```bash
+mcp dev src/molcascade/mcp_server.py     # browser debug UI
+```
+
+**Two properties worth knowing before driving it in a loop**
+
+*The expensive tool is asynchronous.* `screen` runs the cascade on a worker thread, so a
+run that takes an hour does not take the session with it — the event loop stays free and
+the client can still be talked to. A synchronous tool function would be invoked inline on
+the event loop and would freeze the server for the duration, which is not a theoretical
+concern for a tool whose job is to screen a library.
+
+*A retry is safe, and that is the runner's property rather than the adapter's.* Artifacts
+are content-addressed and immutable, stage checkpoints are keyed by cache key rather than
+by run id, and resuming re-verifies every committed checkpoint's bytes and lineage before
+re-using it. So the correct response to a call your client gave up on is to call `screen`
+again with the same `run_id` and `resume=true`: completed stages are verified and re-used,
+and only unfinished work re-executes.
+
+Nothing in the server fetches an asset, installs a package, or reaches the network. A
+configuration naming an unprovisioned asset fails on the way in with the command to run.
+Read `molcascade://overview` before the first call; it carries the five properties of a
+screening result an agent is most likely to get wrong.
+
 ## Reproducibility and safety
 
 - Raw source records are never overwritten.
