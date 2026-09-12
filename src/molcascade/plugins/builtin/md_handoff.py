@@ -450,3 +450,48 @@ class MdHandoffPlugin:
 
 
 __all__ = ["MdHandoffConfig", "MdHandoffPlugin", "_describe"]
+
+
+class MdHandoffFromConformerPlugin(MdHandoffPlugin):
+    """The same handoff, for a run that has no receptor.
+
+    Two registrations of one implementation, because the difference between them is not
+    in the code -- it is in what the stage is allowed to require.
+
+    A pose is only meaningful against the receptor it was scored in, so the pose handoff
+    declares ``docking_score/v1`` as an input and a cascade without a docking tier is
+    refused before it starts. That refusal is correct where a pose is what the campaign
+    means, and wrong as the only option: a ligand's own embedded conformer is a
+    legitimate thing to simulate -- solvated on its own, or re-posed later by something
+    other than this run -- and demanding a docking score for it would refuse the whole
+    population for a dependency the science does not have.
+
+    There is no optional-input concept in a plugin descriptor, and inventing one would
+    change how every stage's inputs are wired for the sake of one case. Two descriptors
+    say the same thing in the vocabulary that already exists, and they say it where a
+    reader will see it: the two appear side by side in the catalogue as two answers to
+    one question, which is what they are.
+    """
+
+    descriptor = PluginDescriptor(
+        id="handoff.md_system_input_conformer",
+        version="0.1.0",
+        kind=PluginKind.EXPORTER,
+        # No docking score. Everything else is identical, including the outputs, so a
+        # consumer downstream cannot tell which mode produced the record -- and must not
+        # need to, because the record states its own coordinate_source.
+        inputs=(PARENT_V1.id, LIGAND_CONFORMER_V1.id),
+        outputs=(PARENT_V1.id, MD_SYSTEM_INPUT_V1.id),
+        output_ports={"primary": PARENT_V1.id, "handoff": MD_SYSTEM_INPUT_V1.id},
+        cardinality=Cardinality.ONE_TO_ONE,
+        determinism=Determinism.DETERMINISTIC,
+        display_name="MD system input handoff (conformer only)",
+        description=(
+            "Publish the embedded conformer a run already computed as "
+            "md_system_input/v1, for a campaign with no receptor. Identical to the "
+            "pose handoff except that it does not require a docking score, so it can "
+            "run in a cascade that never docked. A molecule RDKit could not embed "
+            "keeps a row saying so rather than being filled in from SMILES."
+        ),
+    )
+

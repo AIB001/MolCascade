@@ -4560,6 +4560,47 @@ CRITERIA: tuple[CriterionSpec, ...] = (
                     "require_receptor_for_pose": True,
                 },
             ),
+            BackendOption(
+                id="molcascade_handoff_conformer",
+                label="Declared handoff record (conformer only)",
+                engine="MolCascade",
+                summary=(
+                    "The same record, for a campaign with no receptor. It does not "
+                    "require a docking score, so it runs in a cascade that never "
+                    "docked -- a ligand simulated on its own geometry rather than in a "
+                    "pocket. The record still says which it was, so nothing downstream "
+                    "has to guess."
+                ),
+                plugin_ref="handoff.md_system_input_conformer@0.1.0",
+                gate_plugin="handoff.md_system_input_gate@0.1.0",
+                license_spdx="Apache-2.0",
+                citation=(
+                    "Buttenschoen M, Morris GM, Deane CM. PoseBusters: AI-based docking "
+                    "methods fail to generate physically valid poses or generalise to "
+                    "novel sequences. Chem Sci. 2024;15(9):3130-3139. "
+                    "doi:10.1039/D3SC04185A"
+                ),
+                requires=("rdkit",),
+                throughput_per_second=2000,
+                defaults={
+                    "schema_version": 1,
+                    "batch_size": 4096,
+                    "prefer": "embedded_conformer",
+                    "pose_rank": 0,
+                    "protonation_state_id": "INHERITED_FROM_STANDARDIZER",
+                },
+                gate_defaults={
+                    "schema_version": 1,
+                    "batch_size": 16384,
+                    "decision_buffer_size": 50000,
+                    # EMBEDDED_CONFORMER alone: this mode exists because there is no
+                    # pose, so accepting DOCKED_POSE here would describe a record it
+                    # cannot receive.
+                    "allowed_sources": ["EMBEDDED_CONFORMER"],
+                    "allowed_hydrogens": ["EXPLICIT_ALL", "POLAR_ONLY"],
+                    "require_receptor_for_pose": True,
+                },
+            ),
         ),
     ),
 )
