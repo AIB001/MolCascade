@@ -268,3 +268,38 @@ def test_the_width_travels_with_the_rate_into_the_builder_payload() -> None:
         for option, payload in zip(spec.options, spec.as_json()["options"], strict=True):
             assert payload["throughput_lanes"] == option.throughput_lanes
             assert payload["throughput_per_second"] == option.throughput_per_second
+
+
+def test_every_runnable_option_can_actually_be_built_into_a_criterion() -> None:
+    """The catalogue validates. Building a criterion from it is a different question.
+
+    An option's ``defaults`` and ``gate_defaults`` are serialised into the cascade file,
+    so every value in them has to be JSON. Nothing checked that. A tuple in
+    ``gate_defaults`` passes every catalogue test in this directory, renders in the
+    builder, appears in the bibliography -- and raises the first time a criterion is
+    constructed from it, which is the first time anyone tries to use the entry. That is
+    a long way from the typo.
+
+    So this walks the whole catalogue and builds one criterion per runnable option,
+    round-tripping it through JSON exactly as writing a cascade file would.
+    """
+
+    import json
+
+    from molcascade.cascade.defaults import build_criterion
+    from molcascade.plugins import create_builtin_registry
+
+    registry = create_builtin_registry()
+    built = 0
+    for spec in CRITERIA:
+        for option in spec.executable_options:
+            if option.plugin_ref is None:
+                continue
+            try:
+                registry.entry(option.plugin_ref)
+            except Exception:  # not installed here; the option cannot be selected either
+                continue
+            criterion = build_criterion(spec, option, registry=registry)
+            json.dumps(criterion.model_dump(mode="json"))
+            built += 1
+    assert built, "no option could be built, so this test proved nothing"

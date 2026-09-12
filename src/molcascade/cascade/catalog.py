@@ -4552,8 +4552,11 @@ CRITERIA: tuple[CriterionSpec, ...] = (
                     "schema_version": 1,
                     "batch_size": 16384,
                     "decision_buffer_size": 50000,
-                    "allowed_sources": ("DOCKED_POSE", "EMBEDDED_CONFORMER"),
-                    "allowed_hydrogens": ("EXPLICIT_ALL", "POLAR_ONLY"),
+                    # Lists, not tuples: a gate's settings are serialised into the
+                    # cascade file, so they must be JSON values. A tuple here validates
+                    # in the catalogue and fails the moment a criterion is built from it.
+                    "allowed_sources": ["DOCKED_POSE", "EMBEDDED_CONFORMER"],
+                    "allowed_hydrogens": ["EXPLICIT_ALL", "POLAR_ONLY"],
                     "require_receptor_for_pose": True,
                 },
             ),
