@@ -470,6 +470,23 @@ STAGE_GROUPS: tuple[StageGroup, ...] = (
             "sequence leaves the machine."
         ),
     ),
+    StageGroup(
+        id="md_handoff",
+        title="Handoff to simulation",
+        subtitle="What a force field is about to be given, stated in writing",
+        purpose=(
+            "Everything above produces evidence about a molecule. This states what a "
+            "simulation stack will actually receive: which coordinates, from where, "
+            "with or without hydrogens, against which receptor, in which protonation "
+            "state. It exists because a downstream build cannot tell a docked pose "
+            "from a flat drawing -- measured here, a structure rebuilt from SMILES "
+            "parameterises and simulates without a single warning, and the topology "
+            "carries no hydrogens at all. A tier that writes those facts down turns a "
+            "silent wrong answer into a refusal."
+        ),
+        default_mode="serial",
+        accent="#4f7d6b",
+    ),
 )
 
 
@@ -4476,6 +4493,69 @@ CRITERIA: tuple[CriterionSpec, ...] = (
                     "to the custom model bundle criterion, not a method of its own; "
                     "the bundle's own metadata is what a reader needs."
                 ),
+            ),
+        ),
+    ),
+    CriterionSpec(
+        id="md_system_handoff",
+        label="MD system input handoff",
+        question="What exactly is being handed to a force field, and is it usable?",
+        stage="md_handoff",
+        evidence="md_system_input",
+        summary=(
+            "Writes one md_system_input/v1 record per molecule from the geometry the "
+            "run already produced -- a docked pose by preference, an embedded "
+            "conformer otherwise -- and never rebuilds coordinates from a name. The "
+            "gate then refuses records a force field cannot use: a two-dimensional "
+            "depiction, a molecule with no explicit hydrogens, a pose that does not "
+            "say which receptor it was scored against."
+        ),
+        options=(
+            BackendOption(
+                id="molcascade_handoff",
+                label="Declared handoff record",
+                engine="MolCascade",
+                summary=(
+                    "Reads the conformer or pose table, counts the hydrogens actually "
+                    "present, detects a flat structure by its z range, and re-derives "
+                    "the stereochemistry of what was built so it can be compared with "
+                    "the name the molecule is filed under."
+                ),
+                plugin_ref="handoff.md_system_input@0.1.0",
+                gate_plugin="handoff.md_system_input_gate@0.1.0",
+                license_spdx="Apache-2.0",
+                # Not the method -- there is no method here beyond reading a table --
+                # but the finding that makes the tier worth its place: structures that
+                # satisfy the usual success criterion are routinely not physically
+                # valid, and nothing downstream notices.
+                citation=(
+                    "Buttenschoen M, Morris GM, Deane CM. PoseBusters: AI-based docking "
+                    "methods fail to generate physically valid poses or generalise to "
+                    "novel sequences. Chem Sci. 2024;15(9):3130-3139. "
+                    "doi:10.1039/D3SC04185A"
+                ),
+                requires=("rdkit",),
+                recommended=True,
+                # Reading a table and counting atoms; the cost is the parquet scan.
+                throughput_per_second=2000,
+                defaults={
+                    "schema_version": 1,
+                    "batch_size": 4096,
+                    "prefer": "docked_pose",
+                    "pose_rank": 0,
+                    # Honest rather than flattering: nothing in this project predicts a
+                    # protonation state, so the default records where the state came
+                    # from instead of claiming one was computed.
+                    "protonation_state_id": "INHERITED_FROM_STANDARDIZER",
+                },
+                gate_defaults={
+                    "schema_version": 1,
+                    "batch_size": 16384,
+                    "decision_buffer_size": 50000,
+                    "allowed_sources": ("DOCKED_POSE", "EMBEDDED_CONFORMER"),
+                    "allowed_hydrogens": ("EXPLICIT_ALL", "POLAR_ONLY"),
+                    "require_receptor_for_pose": True,
+                },
             ),
         ),
     ),

@@ -1040,19 +1040,33 @@ def test_a_tool_that_reads_evidence_it_does_not_compute_declares_it_and_can_be_f
         # leave the block that satisfied it wanting.  The browser walks the same
         # chain; stopping at one level would have this pass only for the tools
         # whose producer happens to need nothing.
-        pending = list(needs)
+        #
+        # Depth first, appending a producer only after everything it reads.  The
+        # obvious shortcut -- walk the needs in order and insert each producer at the
+        # front so "a producer's own producer ends up above it" -- is wrong in a way
+        # no criterion exposed until one needed two contracts where one producer
+        # reads the other.  There it yields the two producers in reverse, and the
+        # cascade is refused for the dependency the provisioning had just added.
+        # The browser does not have this bug: it recomputes the consumer's index on
+        # every insert, so each producer lands directly above it in needs order.
         provisioned: list[dict[str, Any]] = []
         seen: set[str] = set()
-        while pending:
-            contract = pending.pop(0)
+        placed: set[str] = set()
+
+        def provision(contract: str) -> None:
             if contract in seen:
-                continue
+                return
             seen.add(contract)
             producer = _producer_tier(payload, contract)
             assert producer is not None, f"nothing here produces {contract}"
-            # At the front, so a producer's own producer ends up above it.
-            provisioned.insert(0, producer)
-            pending.extend(_needs_of(payload, producer["criteria"][0]["backend"]))
+            for upstream in _needs_of(payload, producer["criteria"][0]["backend"]):
+                provision(upstream)
+            if producer["id"] not in placed:
+                placed.add(producer["id"])
+                provisioned.append(producer)
+
+        for contract in needs:
+            provision(contract)
         config["tiers"] = config["tiers"][:-1] + provisioned + config["tiers"][-1:]
         # Lowering only, not compiling: this cascade still owes a receptor, which
         # is the campaign's to name and is the subject of the test above.
