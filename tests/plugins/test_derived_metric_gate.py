@@ -397,3 +397,24 @@ def test_derived_metric_gate_vocabularies_track_the_contract() -> None:
         "direction"
     ]
     assert {item.value for item in DerivedMetricStatus} == DERIVED_METRIC_V1.enum_values["status"]
+
+
+def test_redock_angstrom_gate_is_strict_and_records_its_boundary(tmp_path: Path) -> None:
+    output, response = _run(
+        tmp_path,
+        [
+            _metric("p1", 1.999, metric_id="dock_redock_rmsd", units="ANGSTROM"),
+            _metric("p2", 2.0, metric_id="dock_redock_rmsd", units="ANGSTROM"),
+            _metric("p3", None, metric_id="dock_redock_rmsd", units="ANGSTROM",
+                    status="BACKEND_FAILED"),
+        ],
+        {"metric_id": "dock_redock_rmsd", "expected_units": "ANGSTROM",
+         "expected_direction": "LOWER_BETTER", "maximum": 2.0,
+         "maximum_exclusive": True, "on_unscorable": "reject"},
+    )
+    assert _read(output, response, "primary").column("parent_id").to_pylist() == ["p1"]
+    decisions = _read(output, response, "decisions").to_pylist()
+    detail = json.loads(decisions[1]["detail"])
+    assert detail["maximum_exclusive"] is True
+    assert detail["bounds_inclusive"] is False
+    assert decisions[2]["reason_code"] == "DERIVED_METRIC_BACKEND_FAILED"

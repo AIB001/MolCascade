@@ -83,6 +83,7 @@ _EXCUSED: dict[str, str] = {
     ),
     "t8_ligand_conformers": "embeds 3D geometry",
     "t9_docking": "needs a receptor and out-of-process engines",
+    "t9_redock": "needs retained target poses and independent GPU re-search; calibrate per target",
     "t10_docking_metrics": "reads docked poses",
     "t12_affinity": "needs Boltz-2, a target FASTA and a card",
 }

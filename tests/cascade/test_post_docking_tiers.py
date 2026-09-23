@@ -156,7 +156,8 @@ def test_the_shipped_cascade_puts_the_metrics_below_docking(registry: PluginRegi
     order = [tier.id for tier in default_cascade(registry=registry).tiers]
     if "t10_docking_metrics" not in order:
         pytest.skip("no post-docking metric is installed")
-    assert order.index("t10_docking_metrics") == order.index("t9_docking") + 1
+    assert order.index("t9_redock") == order.index("t9_docking") + 1
+    assert order.index("t10_docking_metrics") == order.index("t9_redock") + 1
 
 
 def test_lowering_binds_both_metrics_to_uni_docks_scores_and_not_karma_docks(
